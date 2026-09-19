@@ -60,6 +60,7 @@ jobs:
       story_key:    ${{ steps.resolve.outputs.story_key }}
       request_file: ${{ steps.resolve.outputs.request_file }}
       pdd_file:     ${{ steps.resolve.outputs.pdd_file }}
+      legacy_pdd:   ${{ steps.resolve.outputs.legacy_pdd }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -86,7 +87,15 @@ jobs:
 
           # Resolve strictly by this branch's key, so request details belonging to
           # another story or CR sitting in docs/ can never be picked up.
-          MATCHES=$(ls -1 "$DOCS_DIR/$FILE_KEY"-request-details* 2>/dev/null || true)
+          #
+          # CASE-INSENSITIVE on purpose. Branch names are lowercase (analysis-jactiv-611)
+          # while the uploaded document carries the Jira key as typed, which is uppercase
+          # (JACTIV-611-request-details.docx). The runner is Linux, so a literal glob on
+          # the lowercase key matches nothing and this step fails with "no request
+          # details found" while the file is sitting right there. `find -iname` removes
+          # the whole class of problem; the key still has to match, only its case is free.
+          MATCHES=$(find "$DOCS_DIR" -maxdepth 1 -type f \
+                      -iname "$FILE_KEY-request-details*" 2>/dev/null | sort || true)
           COUNT=$(printf '%s' "$MATCHES" | grep -c . || true)
           if [ "${COUNT:-0}" -eq 0 ]; then
             echo "::error::No $DOCS_DIR/$FILE_KEY-request-details* found on branch $BRANCH."
@@ -112,17 +121,19 @@ jobs:
           REPO_NAME="${GITHUB_REPOSITORY##*/}"
           PDD_FILE="$DOCS_DIR/pdd-$REPO_NAME.md"
 
-          # A PDD written under the old key-based convention is RENAMED rather than
-          # left behind, so a repo part-way through the migration converges on the
-          # new name instead of ending up with one of each.
+          # A PDD written under the old key-based convention is RENAMED onto the new
+          # name rather than left behind, so a repo part-way through the migration
+          # converges instead of ending up holding one of each.
+          #
+          # This job only REPORTS it: its checkout is discarded when the job ends, so
+          # a rename here would never reach a commit. The Commit PDD job does the
+          # actual `git mv` in the tree it pushes from.
+          LEGACY_PDD=""
           if [ ! -f "$PDD_FILE" ]; then
-            LEGACY=$(find "$DOCS_DIR" -maxdepth 1 -type f \
-                       \( -iname 'pdd-*.md' -o -iname '*-pdd.md' \) \
-                     ! -name "$(basename "$PDD_FILE")" | sort | head -1 || true)
-            if [ -n "$LEGACY" ]; then
-              echo "::notice::Adopting legacy PDD '$LEGACY' as '$PDD_FILE'."
-              mv "$LEGACY" "$PDD_FILE"
-            fi
+            LEGACY_PDD=$(find "$DOCS_DIR" -maxdepth 1 -type f \
+                           \( -iname 'pdd-*.md' -o -iname '*-pdd.md' \) \
+                         ! -name "$(basename "$PDD_FILE")" | sort | head -1 || true)
+            [ -n "$LEGACY_PDD" ] && echo "::notice::Legacy PDD '$LEGACY_PDD' will be renamed to '$PDD_FILE'."
           fi
 
           {
@@ -131,6 +142,7 @@ jobs:
             echo "story_key=$STORY_KEY"
             echo "request_file=$REQUEST_FILE"
             echo "pdd_file=$PDD_FILE"
+            echo "legacy_pdd=${LEGACY_PDD:-}"
           } >> "$GITHUB_OUTPUT"
 
           {
@@ -471,12 +483,22 @@ jobs:
           STORY_KEY: ${{ needs.identify.outputs.story_key }}
           BRANCH:    ${{ needs.identify.outputs.branch }}
           SOURCE:    ${{ needs.identify.outputs.request_file }}
+          LEGACY_PDD: ${{ needs.identify.outputs.legacy_pdd }}
         run: |
           set -euo pipefail
           git config user.name  "uipath-analyst[bot]"
           git config user.email "uipath-analyst[bot]@users.noreply.github.com"
 
+          # `git mv` rather than `mv` so the rename is staged as a rename and the old
+          # path cannot linger as an unstaged deletion the commit would miss.
+          if [ -n "${LEGACY_PDD:-}" ] && [ -f "$LEGACY_PDD" ] && [ "$LEGACY_PDD" != "$PDD_FILE" ] && [ ! -e "$PDD_FILE" ]; then
+            git mv "$LEGACY_PDD" "$PDD_FILE" 2>/dev/null || mv "$LEGACY_PDD" "$PDD_FILE"
+            echo "renamed $LEGACY_PDD -> $PDD_FILE"
+          fi
+
           git add "$PDD_FILE"
+          # -A so a rename above is staged as a deletion too, not just an add.
+          git add -A "$DOCS_DIR"
           if git diff --cached --quiet; then
             echo "No change to commit - PDD is already up to date."
           else
