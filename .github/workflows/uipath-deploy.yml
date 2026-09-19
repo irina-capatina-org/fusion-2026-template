@@ -66,8 +66,80 @@ jobs:
   # 1. Resolve target
   # The design decides the shipping path, not this file.
   # ═══════════════════════════════════════════════════════════════
+  # ═══════════════════════════════════════════════════════════════
+  # 0. Anything to deploy?
+  # Generating a repo from the template writes the template's files as an initial
+  # commit on main, and `on: push: branches: [main]` cannot tell that commit apart
+  # from a real release merge - so without this the very first thing a new repo does
+  # is fail a deploy. The old behaviour was a red X on a repo nobody had used yet.
+  #
+  # The test is for SUBSTANCE rather than for "is this the first commit": a repo is
+  # deployable when it has both a design contract and a real project to build. A
+  # freshly generated repo has neither - `code/` holds a README and nothing else -
+  # so it skips cleanly and stays green. `github.event.created` would also catch the
+  # generation commit, but it would miss every other empty-repo push (a README edit,
+  # a workflow tweak merged to main before any code exists), and those fail the same
+  # way for the same reason.
+  #
+  # A manual dispatch bypasses this on purpose: asking for a deploy explicitly should
+  # produce a real error when there is nothing to deploy, not a silent success.
+  # ═══════════════════════════════════════════════════════════════
+  guard:
+    name: Anything to deploy?
+    runs-on: ubuntu-latest
+    outputs:
+      deployable: ${{ steps.check.outputs.deployable }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Look for a design contract and a buildable project
+        id: check
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "deployable=true" >> "$GITHUB_OUTPUT"
+            echo "Manual dispatch - proceeding regardless."
+            exit 0
+          fi
+
+          ARCH=$(find "$DOCS_DIR" -maxdepth 1 -type f -name 'architecture-*.json' 2>/dev/null | head -1 || true)
+
+          # README.md alone is template scaffolding, not a build.
+          PROJECT=$(find "$CODE_DIR" -maxdepth 4 -type f \
+                      \( -name 'project.json' -o -name 'project.uiproj' -o -name 'Workflow.json' \
+                      -o -name '*.xaml' -o -name 'agent.json' -o -name 'uipath.json' \
+                      -o -name '*.flow' -o -name 'caseplan.json' -o -name 'entry-points.json' \) \
+                    2>/dev/null | head -1 || true)
+
+          if [ -n "$ARCH" ] && [ -n "$PROJECT" ]; then
+            echo "deployable=true" >> "$GITHUB_OUTPUT"
+            echo "Design: $ARCH"
+            echo "Project: $PROJECT"
+          else
+            echo "deployable=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Nothing to deploy yet - skipping."
+            {
+              echo "### Deploy skipped"
+              echo ""
+              echo "This branch has no release to ship yet, so the deploy stage stopped before doing any work."
+              echo ""
+              echo "| Needed | Found |"
+              echo "| --- | --- |"
+              echo "| \`$DOCS_DIR/architecture-*.json\` | ${ARCH:-**missing**} |"
+              echo "| a UiPath project under \`$CODE_DIR/\` | ${PROJECT:-**missing**} |"
+              echo ""
+              echo "This is the expected state for a repository just created from the template."
+              echo "The stage runs by itself once the Development and Docs PRs reach \`main\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   resolve:
     name: Resolve target
+    needs: guard
+    if: needs.guard.outputs.deployable == 'true'
     runs-on: ubuntu-latest
     outputs:
       scope:         ${{ steps.r.outputs.scope }}
