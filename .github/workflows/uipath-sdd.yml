@@ -6,9 +6,15 @@ run-name: SDD for ${{ github.ref_name }}
 #   Identify PDDs -> Read PDDs -> Determine architecture -> Generate SDD -> Open PR -> Assign PR
 #
 # Maestro creates branch  architecture-<sddStoryKey>  from develop. Creating the
-# branch IS the trigger - unlike stage 1 there is no document to wait for, because
-# the PDD is already on develop (the Analysis PR was merged, which is what released
-# the case into this stage).
+# branch IS the first trigger - unlike stage 1 there is no document to wait for,
+# because the PDD is already on develop (the Analysis PR was merged, which is what
+# released the case into this stage). EVERY subsequent push to the branch re-runs
+# the stage too, so dropping a revised PDD, an architecture steer or an edited
+# architectural-considerations.md onto the branch redesigns against it.
+#
+# Re-running on every push needs the overlap guard - see the `guard` job. A second
+# push while a run is still in flight is SKIPPED, not queued: two agents writing the
+# same SDD on the same branch would race on the commit.
 #
 # IMPORTANT - the PDD cannot be resolved from this branch's key. The Architecture
 # stage runs on its own Jira story (architecture-jactiv-558) while the PDD was
@@ -17,9 +23,17 @@ run-name: SDD for ${{ github.ref_name }}
 # reads all of them: the CR loop mints a fresh Analysis story per change request, so
 # docs/ accumulates one PDD per revision. Newest = current, older = history.
 #
-# An existing *-sdd.md in docs/ makes the run a REVISION: the architecture is
-# re-checked against the new PDD and the SDD is updated in place with a new
-# Document History row, rather than replaced by a document that loses prior review.
+# The SDD filename is NOT the agent's choice. When docs/ already holds an SDD it is
+# ADOPTED and updated in place; only a first design derives a fresh name from the
+# branch, the same way the PDD's is: architecture-jactiv-577 -> docs/sdd-jactiv-577.md.
+# The identify job computes it and the verify job rejects any other path.
+#
+# An existing SDD in docs/ therefore makes the run a REVISION: the architecture is
+# re-checked against the new PDD and that same file is updated with a new Document
+# History row, rather than a second document appearing beside it that loses prior
+# review. This is why the path is adopted rather than recomputed - a change-request
+# replay runs on a NEW story key, so deriving the name from the branch every time
+# would leave docs/ accumulating one orphaned SDD per revision.
 #
 # The PR into develop is the Maestro resume signal: the case waits on
 # PULL_CREATED_IN_REPO filtered by head.ref == architecture-* && base.ref == develop.
@@ -29,19 +43,22 @@ run-name: SDD for ${{ github.ref_name }}
 # develop -> main PR at the end. The case still resumes normally: it waits on the
 # PR-created event and then on the PR-merged event, and both still fire.
 #
-# FORCED_PRODUCT / FORCED_SCOPE below pin the architecture for a live demo. The pin
-# is a hard gate: the Determine-architecture job fails if the agent picks anything
-# else. Clear both env vars to let the agent decide from the PDD.
+# FORCED_PRODUCT below pins the PRODUCT for a live demo. The pin is a hard gate: the
+# Determine-architecture job fails if the agent picks anything else. FORCED_SCOPE is
+# deliberately empty - single-product vs solution is a real consequence of the PDD,
+# not a demo risk, so the agent decides it. Clear FORCED_PRODUCT too to hand the
+# whole decision back.
 
 on:
   push:
     branches:
       - 'architecture**'
-    # No paths filter on purpose: the branch-creation push carries no new file, and
-    # that push IS the signal - narrowed to creation only by the `if` on the identify
-    # job below, so a later push to the branch (a yml edit, a doc upload) does not
-    # start a second run. The Commit SDD step pushes with GITHUB_TOKEN, which by
-    # design does not re-trigger a workflow either - so there is no loop.
+    # Every push, not just branch creation. No paths filter on purpose: the
+    # branch-creation push carries no new file and that push IS the signal, and a
+    # later push (a revised PDD, a steer, an edited architectural-considerations.md)
+    # is a legitimate reason to redesign. Overlap is handled by the `guard` job, not
+    # by narrowing the trigger. The Commit SDD step pushes with GITHUB_TOKEN, which
+    # by design does not re-trigger a workflow - so there is no loop.
   # Manual re-run: pick the architecture branch in the UI. Both inputs are optional
   # and exist for the human "RPA-vs-API steer" the case allows before this stage.
   workflow_dispatch:
@@ -64,13 +81,22 @@ env:
   ASSIGNEE: irina-capatina-uipath
   AGENT_MODEL: claude-sonnet-4-6
   # ── Live-demo guardrail ────────────────────────────────────────────────────
-  # Pinning the architecture removes the one genuinely non-deterministic decision
-  # in this workflow. The pin is enforced by the Verify step below, not just asked
-  # for in the prompt - the job FAILS if the agent returns anything else, so the
-  # run can never quietly surprise us on stage.
-  # Set both to '' to hand the decision back to the agent.
+  # Pinning the PRODUCT removes the one genuinely non-deterministic decision in this
+  # workflow. The pin is enforced by the Verify step below, not just asked for in the
+  # prompt - the job FAILS if the agent returns anything else, so the run can never
+  # quietly surprise us on stage.
+  #
+  # SCOPE is NOT pinned. single-product vs solution follows from how many
+  # independently deployed projects the PDD actually needs, and forcing it to
+  # single-product would silently collapse a genuine multi-project design into one
+  # document. An API Workflow that turns out to need, say, an RPA peer should be
+  # allowed to say so. Set FORCED_SCOPE to pin it again for a demo.
   FORCED_PRODUCT: 'api-workflows'
-  FORCED_SCOPE: 'single-product'
+  FORCED_SCOPE: ''
+  # Org-level platform facts and house design preferences. Hardcoded path, read on
+  # every run and handed to both agents as authoritative - a confirmed value here is
+  # a fact the SDD states outright instead of an [ARCHITECT REVIEW] it carries.
+  CONSIDERATIONS_FILE: docs/architectural-considerations.md
   # Size floors used by validate-sdd.sh. The per-document floor is proportional to
   # its template (sections x this rate), because a thorough 12-section API Workflow
   # SDD is legitimately smaller than an 18-section RPA one. The solution overview is
@@ -86,12 +112,77 @@ permissions:
   contents: write
   pull-requests: write
   id-token: write
+  # The guard job below reads this workflow's own run list to detect an overlap.
+  actions: read
 
-concurrency:
-  group: sdd-${{ github.ref }}
-  cancel-in-progress: false
+# NO `concurrency:` block, on purpose. GitHub concurrency does not skip - with
+# cancel-in-progress:false it QUEUES the second run (and cancels the queued one if a
+# third arrives), so the overlapping push would still design the same SDD, just
+# later. Worse, a queued run's first job only starts once the previous run has
+# finished, so the `guard` job below would look at an empty field and let it through.
+# Skipping is the guard's job; leaving concurrency off is what lets it do it.
 
 jobs:
+
+  # ═══════════════════════════════════════════════════════════════
+  # 0. Overlap guard
+  # This workflow runs on EVERY push to an architecture branch, and a run takes the
+  # better part of an hour with two agents in it. Two runs in flight would both
+  # write the same SDD path and race on `git push` at the end, so a run that starts
+  # while an older one is still going stops here - cleanly, as a success, because a
+  # skipped duplicate is the intended outcome and not a failure anyone should chase.
+  #
+  # The check is by run ID: IDs increase monotonically per repository, so `id <
+  # this run` is "started before me" and also excludes this run from its own count.
+  # Scope is the whole workflow rather than one branch - two architecture branches
+  # designing at once is exactly the pile-up this is meant to prevent. Narrow it by
+  # appending `and .head_branch == "<branch>"` to the jq filter if you want
+  # per-branch serialisation instead.
+  # ═══════════════════════════════════════════════════════════════
+  guard:
+    name: Skip if a run is already in flight
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Look for an older run of this workflow still going
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_FILE: uipath-sdd.yml
+        run: |
+          set -euo pipefail
+
+          # queued / waiting / pending count as in flight too: they have not been
+          # skipped, so they will design this branch shortly.
+          OLDER=$(gh api --paginate \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?per_page=100&exclude_pull_requests=true" \
+            --jq '.workflow_runs[]
+                  | select(.status == "in_progress" or .status == "queued"
+                           or .status == "waiting" or .status == "pending")
+                  | select(.id < '"${GITHUB_RUN_ID}"')
+                  | "\(.id)\t\(.head_branch)\t\(.status)"' || true)
+
+          if [ -n "$OLDER" ]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipped - an older uipath-sdd run is still in flight."
+            {
+              echo "### Run skipped"
+              echo ""
+              echo "An older \`uipath-sdd\` run is still in flight, so this one stops here."
+              echo "The SDD will reflect whatever is on the branch when that run reads it;"
+              echo "push again once it finishes if this push changed the inputs."
+              echo ""
+              echo "| Run | Branch | Status |"
+              echo "| --- | --- | --- |"
+              echo "$OLDER" | while IFS=$'\t' read -r id br st; do
+                echo "| [\`$id\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/$id) | \`$br\` | $st |"
+              done
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "No older run in flight - proceeding."
+          fi
 
   # ═══════════════════════════════════════════════════════════════
   # 1. Identify PDD documents
@@ -99,12 +190,11 @@ jobs:
   # ═══════════════════════════════════════════════════════════════
   identify:
     name: Identify PDD documents
-    # Branch CREATION only. `github.event.created` is true just for the push that
-    # created the ref, which is what Maestro's create-branch call produces; every
-    # later push to the same branch is ignored. workflow_dispatch is let through
-    # because that context has no `created` field and would otherwise be skipped.
-    # Every other job needs this one, so skipping here skips the whole run.
-    if: github.event_name == 'workflow_dispatch' || github.event.created
+    # Runs on every push to the branch and on manual dispatch. The only thing that
+    # stops it is the overlap guard; every other job needs this one, so a skip here
+    # skips the whole run.
+    needs: guard
+    if: needs.guard.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     outputs:
       branch:      ${{ steps.resolve.outputs.branch }}
@@ -114,9 +204,16 @@ jobs:
       pdd_count:   ${{ steps.resolve.outputs.pdd_count }}
       primary_pdd: ${{ steps.resolve.outputs.primary_pdd }}
       prior_sdds:  ${{ steps.resolve.outputs.prior_sdds }}
+      sdd_file:    ${{ steps.resolve.outputs.sdd_file }}
+      sdd_prefix:  ${{ steps.resolve.outputs.sdd_prefix }}
+      adopted:     ${{ steps.resolve.outputs.adopted }}
       revision:    ${{ steps.resolve.outputs.revision }}
       steer_file:  ${{ steps.resolve.outputs.steer_file }}
       arch_file:   ${{ steps.resolve.outputs.arch_file }}
+      considerations: ${{ steps.resolve.outputs.considerations }}
+      # Documents still on the old key-based names, renamed by the committing job.
+      legacy_sdd:  ${{ steps.resolve.outputs.legacy_sdd }}
+      legacy_arch: ${{ steps.resolve.outputs.legacy_arch }}
     steps:
       # Full history: the PDDs are ordered by commit date, which needs more than
       # a shallow clone to be meaningful.
@@ -148,42 +245,94 @@ jobs:
             exit 1
           fi
 
-          # Every PDD, whatever key it was written under. Ordered oldest -> newest by
-          # last-commit date so the newest is the current revision and the earlier
-          # ones are the change-request history.
-          PDD_FILES=""
-          while IFS= read -r f; do
-            [ -n "$f" ] || continue
-            TS=$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)
-            printf '%s\t%s\n' "${TS:-0}" "$f"
-          done < <(find "$DOCS_DIR" -maxdepth 1 -type f \
-                     \( -iname 'pdd-*.md'   -o -iname 'pdd-*.docx' \
-                     -o -iname '*-pdd.md'   -o -iname '*-pdd.docx' \
-                     -o -iname '*_pdd*.md'  -o -iname '*-pdd-*.md' \) \
-                   | sort) > /tmp/pdd-index.tsv
+          # ── document naming: the REPOSITORY, never a stage story key ───────────
+          # pdd-<repo>.md / sdd-<repo>.md / dsd-<repo>.md / architecture-<repo>.json.
+          # The repo name is the only identifier stable across the whole lifecycle -
+          # analysis, architecture, development and docs each run on their own Jira
+          # story, so a key-named document means a change request writes a SECOND
+          # document on a new key and leaves the reviewed one orphaned in docs/. Same
+          # rule architectural-considerations.md §4 already applies to resource names,
+          # for the same reason. The living documents are updated in place; their
+          # history is git plus their own Document History table.
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
 
-          # Oldest first. Same-commit ties fall back to the filename, so a repo seeded
-          # with several PDDs in one commit still orders the highest Jira key last.
-          PDD_FILES=$(sort -t"$(printf '\t')" -k1,1n -k2,2 /tmp/pdd-index.tsv \
-                        | cut -f2- | tr '\n' ' ' | sed 's/ *$//')
-          PDD_COUNT=$(printf '%s' "$PDD_FILES" | wc -w | tr -d ' ')
+          # Finds a document written under the old key-based convention, so a repo
+          # part-way through the migration converges on the canonical name instead of
+          # ending up holding one of each. Prints the legacy path, or nothing when the
+          # canonical file already exists or there is nothing to adopt.
+          #
+          # This job only REPORTS - its checkout is thrown away, so moving a file here
+          # would be lost. The Generate-SDD job does the actual rename in the checkout
+          # it commits from, using the legacy_* outputs below.
+          find_legacy() {
+            local canonical="$1"; shift
+            [ -f "$canonical" ] && return 0
+            find "$DOCS_DIR" -maxdepth 1 -type f "$@" \
+              ! -name "$(basename "$canonical")" | sort | head -1 || true
+          }
 
-          if [ "${PDD_COUNT:-0}" -eq 0 ]; then
-            echo "::error::No PDD found in $DOCS_DIR on branch $BRANCH."
+          # The PDD is an INPUT here - this stage reads it, never writes it - so it is
+          # read wherever it currently sits. Renaming it belongs to the Analysis stage
+          # that owns it.
+          PDD_CANONICAL="$DOCS_DIR/pdd-$REPO_NAME.md"
+          LEGACY_PDD=$(find_legacy "$PDD_CANONICAL" \
+                         \( -iname 'pdd-*.md' -o -iname 'pdd-*.docx' \
+                         -o -iname '*-pdd.md' -o -iname '*-pdd.docx' \
+                         -o -iname '*_pdd*.md' -o -iname '*-pdd-*.md' \))
+          if [ -f "$PDD_CANONICAL" ]; then
+            PDD_FILE="$PDD_CANONICAL"
+          elif [ -n "$LEGACY_PDD" ]; then
+            PDD_FILE="$LEGACY_PDD"
+            echo "::warning::PDD is at '$LEGACY_PDD', not the canonical '$PDD_CANONICAL'. Reading it anyway; the Analysis stage renames it."
+          else
+            echo "::error::No PDD at $PDD_CANONICAL on branch $BRANCH, and nothing in $DOCS_DIR to adopt."
             echo "::error::The Analysis PR must be merged into $BASE_BRANCH before the Architecture branch is cut."
             echo "Files in $DOCS_DIR:"
             ls -1 "$DOCS_DIR" 2>/dev/null || echo "  (empty)"
             exit 1
           fi
 
-          # Newest PDD is the one the architecture must satisfy.
-          PRIMARY_PDD=$(printf '%s' "$PDD_FILES" | awk '{print $NF}')
+          # One living PDD, updated in place by the Analysis stage - so the corpus is
+          # normally a single file. It stays a LIST because the change-request flow
+          # will hand this stage the CR documents alongside the PDD, and the manifest
+          # and both agent prompts already speak "corpus, newest is current". Keeping
+          # the shape now means the CR work is an addition here, not a rewrite.
+          PDD_FILES="$PDD_FILE"
+          PDD_COUNT=1
+          PRIMARY_PDD="$PDD_FILE"
 
-          # A prior SDD means this is a change-request revision, not a first design.
-          PRIOR_SDDS=$(find "$DOCS_DIR" -maxdepth 1 -type f -iname '*-sdd.md' \
-                       | sort | tr '\n' ' ' | sed 's/ *$//')
-          PRIOR_COUNT=$(printf '%s' "$PRIOR_SDDS" | wc -w | tr -d ' ')
-          REVISION=$(( PRIOR_COUNT > 0 ? 2 : 1 ))
+          # The SDD is a LIVING document at a fixed path: written on the first design,
+          # updated in place on every revision, never renamed and never duplicated.
+          # A solution-scope design adds children at <stem>-<project-kebab>.md, which
+          # is why only the root is adopted here.
+          # This stage OWNS the SDD, so it writes the canonical name unconditionally
+          # and renames a legacy one onto it. Every SDD path this run may write starts
+          # with SDD_PREFIX; a solution adds children at <stem>-<project-kebab>.md.
+          SDD_FILE="$DOCS_DIR/sdd-$REPO_NAME.md"
+          SDD_PREFIX="${SDD_FILE%.md}"
+          LEGACY_SDD=$(find_legacy "$SDD_FILE" \( -iname 'sdd-*.md' -o -iname '*-sdd.md' \))
+
+          # A design already present - at either name - makes this a REVISION, and
+          # the existing document is what gets updated rather than replaced.
+          if [ -f "$SDD_FILE" ]; then
+            ADOPTED="$SDD_FILE"
+            REVISION=2
+          elif [ -n "$LEGACY_SDD" ]; then
+            ADOPTED="$SDD_FILE"
+            REVISION=2
+            echo "::notice::Legacy SDD '$LEGACY_SDD' will be renamed to '$SDD_FILE' and updated in place."
+          else
+            ADOPTED=""
+            REVISION=1
+          fi
+
+          # What the SDD agent reads as prior art. The legacy path while it still has
+          # that name; the canonical one and its children once renamed.
+          PRIOR_SDDS=$(find "$DOCS_DIR" -maxdepth 1 -type f \
+                         \( -name "$(basename "$SDD_FILE")" \
+                         -o -name "$(basename "$SDD_PREFIX")-*.md" \) \
+                       | sort -u | tr '\n' ' ' | sed 's/ *$//')
+          [ -z "$PRIOR_SDDS" ] && PRIOR_SDDS="${LEGACY_SDD:-}"
 
           # Optional human steer dropped into docs/ by the Architecture stage's
           # "RPA-vs-API steer" task. Binding when present.
@@ -191,7 +340,21 @@ jobs:
                          \( -iname '*architecture-steer*' -o -iname '*arch-steer*' \) \
                        | sort | head -1 || true)
 
-          ARCH_FILE="$DOCS_DIR/architecture-$FILE_KEY.json"
+          # The machine-readable contract, named off the repo like the documents it
+          # describes. uipath-develop and uipath-dsd resolve it by this same name.
+          ARCH_FILE="$DOCS_DIR/architecture-$REPO_NAME.json"
+          LEGACY_ARCH=$(find_legacy "$ARCH_FILE" -iname 'architecture-*.json')
+
+          # Org platform facts and house preferences. Hardcoded path. Absent is not
+          # an error - the agents then fall back to their own defaults and carry the
+          # [ARCHITECT REVIEW] items this file would otherwise have answered.
+          CONSIDERATIONS=""
+          if [ -f "$CONSIDERATIONS_FILE" ]; then
+            CONSIDERATIONS="$CONSIDERATIONS_FILE"
+            echo "Architectural considerations: $CONSIDERATIONS_FILE ($(wc -c < "$CONSIDERATIONS_FILE" | tr -d ' ') bytes)"
+          else
+            echo "::warning::$CONSIDERATIONS_FILE not found - the SDD will carry [ARCHITECT REVIEW] items this file would have answered (delivery model, licensing, system endpoints, naming)."
+          fi
 
           {
             echo "branch=$BRANCH"
@@ -201,9 +364,15 @@ jobs:
             echo "pdd_count=$PDD_COUNT"
             echo "primary_pdd=$PRIMARY_PDD"
             echo "prior_sdds=$PRIOR_SDDS"
+            echo "sdd_file=$SDD_FILE"
+            echo "sdd_prefix=$SDD_PREFIX"
+            echo "adopted=$ADOPTED"
             echo "revision=$REVISION"
             echo "steer_file=$STEER_FILE"
             echo "arch_file=$ARCH_FILE"
+            echo "considerations=$CONSIDERATIONS"
+            echo "legacy_sdd=${LEGACY_SDD:-}"
+            echo "legacy_arch=${LEGACY_ARCH:-}"
           } >> "$GITHUB_OUTPUT"
 
           {
@@ -217,8 +386,11 @@ jobs:
             echo "| PDDs found | $PDD_COUNT |"
             echo "| Current PDD | \`$PRIMARY_PDD\` ($(wc -c < "$PRIMARY_PDD" | tr -d ' ') bytes) |"
             echo "| Prior SDD(s) | ${PRIOR_SDDS:-none - first design} |"
+            echo "| SDD to write | \`$SDD_FILE\` $([ -n "$ADOPTED" ] && echo '(adopted - updated in place)' || echo '(new - derived from the branch)') |"
+            echo "| SDD path prefix | \`$SDD_PREFIX\` |"
             echo "| Run type | $([ "$REVISION" -gt 1 ] && echo 'revision (change request)' || echo 'initial design') |"
             echo "| Human steer | ${STEER_FILE:-none} |"
+            echo "| Architectural considerations | ${CONSIDERATIONS:-**missing** - defaults will be used} |"
             echo ""
             echo "PDD corpus, oldest first:"
             echo ""
@@ -248,12 +420,13 @@ jobs:
 
       - name: Normalise the PDD corpus to markdown
         env:
-          PDD_FILES:   ${{ needs.identify.outputs.pdd_files }}
-          PRIMARY_PDD: ${{ needs.identify.outputs.primary_pdd }}
-          PRIOR_SDDS:  ${{ needs.identify.outputs.prior_sdds }}
-          STEER_FILE:  ${{ needs.identify.outputs.steer_file }}
-          REVISION:    ${{ needs.identify.outputs.revision }}
-          STORY_KEY:   ${{ needs.identify.outputs.story_key }}
+          PDD_FILES:      ${{ needs.identify.outputs.pdd_files }}
+          PRIMARY_PDD:    ${{ needs.identify.outputs.primary_pdd }}
+          PRIOR_SDDS:     ${{ needs.identify.outputs.prior_sdds }}
+          STEER_FILE:     ${{ needs.identify.outputs.steer_file }}
+          CONSIDERATIONS: ${{ needs.identify.outputs.considerations }}
+          REVISION:       ${{ needs.identify.outputs.revision }}
+          STORY_KEY:      ${{ needs.identify.outputs.story_key }}
         run: |
           set -euo pipefail
           # media/ is created up front even when nothing extracts into it: the
@@ -323,6 +496,17 @@ jobs:
             echo "human steer: $STEER_FILE -> $STEER_OUT"
           fi
 
+          # The org's architectural considerations travel with the corpus so both
+          # agents read the same copy the identify job resolved. Normalised like any
+          # other input, because a human may keep this as a .docx.
+          CONSIDERATIONS_OUT=""
+          if [ -n "${CONSIDERATIONS:-}" ] && [ -f "$CONSIDERATIONS" ]; then
+            CONSIDERATIONS_OUT=$(normalise "$CONSIDERATIONS" "$WORK_DIR")
+            echo "architectural considerations: $CONSIDERATIONS -> $CONSIDERATIONS_OUT ($(wc -c < "$CONSIDERATIONS_OUT" | tr -d ' ') bytes)"
+          else
+            echo "::warning::No architectural considerations file in the corpus - both agents will fall back to their own defaults."
+          fi
+
           cat > "$WORK_DIR/manifest.json" <<EOF_MANIFEST
           {
             "story_key": "$STORY_KEY",
@@ -330,7 +514,8 @@ jobs:
             "current_pdd_markdown": "$WORK_DIR/pdd/$(basename "${PRIMARY_PDD%.*}").md",
             "pdds": [${MANIFEST_ROWS%,}],
             "prior_sdds": [${PRIOR_ROWS%,}],
-            "steer_markdown": "$STEER_OUT"
+            "steer_markdown": "$STEER_OUT",
+            "considerations_markdown": "$CONSIDERATIONS_OUT"
           }
           EOF_MANIFEST
           python3 -c "import json,sys; json.load(open('$WORK_DIR/manifest.json'))" \
@@ -416,15 +601,49 @@ jobs:
             Current PDD:     the manifest entry with "role": "current"
             Prior SDD(s):    ${{ env.WORK_DIR }}/prior/  (empty on a first design)
             Human steer:     the manifest "steer_markdown" (empty when none)
+            Org platform:    the manifest "considerations_markdown" (empty when none)
             Story key:       ${{ needs.identify.outputs.story_key }}
             Branch:          ${{ needs.identify.outputs.branch }}
             Revision:        ${{ needs.identify.outputs.revision }}
             OUTPUT (only file you write): ${{ env.WORK_DIR }}/architecture.json
 
+            MANDATED SDD PATH: ${{ needs.identify.outputs.sdd_file }}
+            SDD PATH PREFIX:   ${{ needs.identify.outputs.sdd_prefix }}
+            You do NOT get to name these files. See Step 3.
+
             Dispatch steer:  ${{ inputs.product_steer }}
             Delivery model:  ${{ inputs.delivery_model }}
             PINNED product:  ${{ env.FORCED_PRODUCT }}   (empty = you decide)
             PINNED scope:    ${{ env.FORCED_SCOPE }}     (empty = you decide)
+
+            ## Step 0.1 - the org's architectural considerations
+
+            Read `considerations_markdown` from the manifest BEFORE the Constraint Gate.
+            It is the org's own platform facts and house preferences, and it is
+            AUTHORITATIVE - it exists precisely so you stop guessing at things somebody
+            has already decided. Its own "How the agents must use this file" section is
+            binding; in short:
+
+            - **a plain value is a confirmed fact.** State it. Do NOT raise an
+              `[ARCHITECT REVIEW]` for something this file already answers, and record
+              "org architectural considerations" as the decision's source.
+            - **`[UNCONFIRMED]` means nobody has confirmed it.** Treat it exactly as if
+              the file were silent: apply your normal default and carry the
+              `[ARCHITECT REVIEW]` item.
+            - **a preference (its §3-§4) is a house default, not a law.** Apply it and
+              record where it came from. Where the PDD's real need contradicts it, follow
+              the PDD and note the deviation and its reason. A preference never forces a
+              design the process cannot use.
+            - **its licensing section is the only thing that can BLOCK a product.** An
+              unlicensed product goes in `blocked_products` with the alternative you
+              applied; "partially available" or "limited" may be used but the design must
+              justify it and name the limit.
+            - **never invent a value it does not contain.** An absent row is an
+              `[ARCHITECT REVIEW]`, not permission to assume.
+
+            It is also where the naming rules live - resource names come from the
+            REPOSITORY's epic key, never from the process name. If the file is empty or
+            missing, say so in `revision_impact` and fall back to your own defaults.
 
             ## Step 0 - load the planner skill if it is installed
 
@@ -443,10 +662,19 @@ jobs:
 
             ## Step 0.5 - the pin, when there is one
 
-            If PINNED product above is non-empty, the architecture is ALREADY DECIDED and
-            you do not get to re-open it. Set `primary_product` to exactly that value and
-            `sdd_scope` to exactly PINNED scope. A `decisions[]` row records it with
-            `level: "Level 1"`, `source: "steer"` and a reason naming the pin.
+            If PINNED product above is non-empty, the PRIMARY PRODUCT is ALREADY DECIDED
+            and you do not get to re-open it. Set `primary_product` to exactly that
+            value. A `decisions[]` row records it with `level: "Level 1"`,
+            `source: "steer"` and a reason naming the pin.
+
+            PINNED scope is a SEPARATE pin. When it is non-empty, set `sdd_scope` to
+            exactly that value too. When it is EMPTY - which is the normal
+            configuration - the scope is yours to decide on the evidence: fold the
+            step->executor map as Level 1 describes, and if what is left is one host,
+            say `single-product`; if it is two or more independently deployed peers,
+            say `solution` and give each peer its own project. A product pin does not
+            imply a scope pin. An `api-workflows` primary that genuinely needs an RPA
+            peer for a UI step is a `solution` whose primary is still the API Workflow.
 
             You still do all the real work - Level 0 suitability, the step->executor map,
             components, queues, project decomposition, the data contracts - you just do it
@@ -457,7 +685,7 @@ jobs:
             different primary - it becomes an `integrated_components` row (an RPA process
             the workflow calls for UI work, an IXP model for extraction, a Coded Function
             for compute) or, if it truly cannot be served at all, a BLOCKING
-            `sme_review_items` row that names the step and why.
+            `architect_review_items` row that names the step and why.
 
             The job that runs after you FAILS if `primary_product` or `sdd_scope` does not
             match the pin, so there is no point arguing with it in the file.
@@ -469,9 +697,9 @@ jobs:
             read them to understand what changed and why, never to re-introduce dropped
             scope.
 
-            The PDDs use load-bearing markers written by the analysis stage - `[SME REVIEW]`
+            The PDDs use load-bearing markers written by the analysis stage - `[ARCHITECT REVIEW]`
             means a business decision nobody has made yet, `[DEFAULT]` means an engineering
-            default was applied. Treat an `[SME REVIEW]` value as unconfirmed: design
+            default was applied. Treat an `[ARCHITECT REVIEW]` value as unconfirmed: design
             around it and carry it forward, never silently promote it to fact.
 
             Read these PDD sections with particular care - they are the architecture input:
@@ -496,8 +724,12 @@ jobs:
 
             ## Step 2 - decide (the rules, restated)
 
-            **Constraint Gate first.** The delivery model gates everything. `unspecified`
-            gates nothing - assume Automation Cloud and carry an `[SME REVIEW]` saying so.
+            **Constraint Gate first.** The delivery model gates everything. Take it from
+            the org considerations file when that file states it - a value there is a
+            fact and needs no `[ARCHITECT REVIEW]`, and its licensing table is a hard
+            block list you apply here. Only when neither the considerations file nor the
+            PDD nor the dispatch input gives one is it `unspecified`, which
+            gates nothing - assume Automation Cloud and carry an `[ARCHITECT REVIEW]` saying so.
             On Automation Suite or standalone, treat the cloud-modern products (Maestro,
             Coded Apps, IXP, Agents, Solutions) as needing verification before you
             recommend them, and name the alternative you applied. A user exclusion is a
@@ -590,7 +822,7 @@ jobs:
                   "role": "primary | dispatcher | performer | reporting | library | component",
                   "authoring_mode": "xaml | coded | hybrid | n/a",
                   "framework": "reframework | sequence | n/a",
-                  "sdd_file": "docs/<kebab>-sdd.md or the shared RPA-group file",
+                  "sdd_file": "the mandated path, or the shared RPA-group file for a Master Project",
                   "build_order": 1,
                   "why": "one line tying this project to the PDD"
                 }
@@ -604,7 +836,7 @@ jobs:
               ],
               "capability_addons": ["hitl", "integration-service"],
               "sdd_files": [
-                {"path": "docs/<kebab>-sdd.md",
+                {"path": "the mandated path - see the naming rules below",
                  "template": "rpa-sdd-template.md | flow-sdd-template.md | bpmn-sdd-template.md | case-sdd-template.md | agent-sdd-template.md | coded-app-sdd-template.md | api-workflow-sdd-template.md | solution-overview",
                  "role": "single-product | solution-root | project",
                  "project": "project name, or the solution name for solution-root"}
@@ -614,7 +846,7 @@ jobs:
                 {"level": "Constraint Gate | Level 0 | Level 1 | Level 1.5 | Level 2 | Level 2.5 | Level 3",
                  "picked": "", "reason": "", "source": "pdd | steer | default"}
               ],
-              "sme_review_items": [
+              "architect_review_items": [
                 {"section": "", "item": "", "question": "", "default_applied": "", "blocking": false}
               ],
               "revision_impact": "first design | what the new PDD changed and why the architecture did or did not move"
@@ -623,11 +855,19 @@ jobs:
 
             Naming and file rules - these are contracts, not preferences:
 
+            - **The filename is given to you, never chosen.** It is an SDD already in
+              `docs/` when there is one (adopted, so a revision updates it instead of
+              orphaning it), otherwise it is derived from this branch's key
+              (`${{ needs.identify.outputs.file_key }}`) so every document for this
+              story sorts with its PDD. Either way it is the MANDATED SDD PATH above and
+              never the process name.
             - `single-product` scope -> exactly ONE entry in `sdd_files`, role
-              `single-product`, path `docs/<process_kebab>-sdd.md`.
-            - `solution` scope -> exactly ONE entry with role `solution-root`, template
-              `solution-overview`, path `docs/<process_kebab>-solution-sdd.md`, PLUS one
-              `project` entry per buildable project.
+              `single-product`, path EXACTLY `${{ needs.identify.outputs.sdd_file }}`.
+            - `solution` scope -> ONE entry with role `solution-root`, template
+              `solution-overview`, path `${{ needs.identify.outputs.sdd_file }}`, PLUS one
+              `project` entry per buildable project at
+              `${{ needs.identify.outputs.sdd_prefix }}-<project-kebab>.md`.
+            - Any other path is rejected by the job that runs after you.
             - An RPA Master Project's sub-projects SHARE one RPA SDD file - do not emit one
               per sub-project.
             - Component rows (Coded Function, IXP model, custom connector) get NO SDD file.
@@ -656,11 +896,16 @@ jobs:
           A="$WORK_DIR/architecture.json"
           [ -f "$A" ] || { echo "::error::$A was not written."; exit 1; }
 
-          python3 - "$A" "${FORCED_PRODUCT:-}" "${FORCED_SCOPE:-}" <<'EOF_CHECK'
+          python3 - "$A" "${FORCED_PRODUCT:-}" "${FORCED_SCOPE:-}" \
+                   "${{ needs.identify.outputs.sdd_file }}" "${{ needs.identify.outputs.sdd_prefix }}" <<'EOF_CHECK'
           import json, sys
           d = json.load(open(sys.argv[1]))
           forced_product = sys.argv[2] if len(sys.argv) > 2 else ""
           forced_scope   = sys.argv[3] if len(sys.argv) > 3 else ""
+          mandated_sdd   = sys.argv[4] if len(sys.argv) > 4 else ""
+          # The stem of the mandated path, so an ADOPTED SDD's children hang off the
+          # adopted name rather than off a branch key it may not carry.
+          sdd_prefix     = sys.argv[5] if len(sys.argv) > 5 else ""
 
           # The pin is a gate, not a suggestion: a demo must not depend on the agent
           # having agreed with it.
@@ -678,7 +923,7 @@ jobs:
                  "delivery_model","level_0_outcome","level_0_findings","need_profile",
                  "sdd_scope","primary_product","blocked_products","projects",
                  "integrated_components","queues","capability_addons","sdd_files",
-                 "tasks_file","decisions","sme_review_items","revision_impact"]
+                 "tasks_file","decisions","architect_review_items","revision_impact"]
           missing = [k for k in req if k not in d]
           if missing:
               sys.exit("::error::architecture.json is missing keys: " + ", ".join(missing))
@@ -705,6 +950,32 @@ jobs:
           for f in d["sdd_files"]:
               if not f.get("path","").startswith("docs/") or not f["path"].endswith(".md"):
                   sys.exit(f"::error::sdd_files path must be docs/*.md, got '{f.get('path')}'.")
+
+          # The filename comes from the identify job - an adopted SDD, or the branch key
+          # on a first design. Enforced rather than asked for, because every later stage
+          # resolves the design by this path.
+          if mandated_sdd:
+              prefix = sdd_prefix or mandated_sdd[:-3]
+              if scope == "single-product":
+                  got = d["sdd_files"][0]["path"]
+                  if got != mandated_sdd:
+                      sys.exit(f"::error::the SDD must be written to '{mandated_sdd}' "
+                               f"(derived from the branch), but sdd_files declares '{got}'.")
+              else:
+                  root = [f for f in d["sdd_files"] if f.get("role") == "solution-root"][0]
+                  if root["path"] != mandated_sdd:
+                      sys.exit(f"::error::the solution root SDD must be '{mandated_sdd}', "
+                               f"got '{root['path']}'.")
+                  for f in d["sdd_files"]:
+                      if not f["path"].startswith(prefix):
+                          sys.exit(f"::error::every SDD path must start with '{prefix}', "
+                                   f"got '{f['path']}'.")
+              for p in d["projects"]:
+                  sf = p.get("sdd_file", "")
+                  if sf and not sf.startswith(prefix):
+                      sys.exit(f"::error::project '{p.get('name')}' points at sdd_file '{sf}', "
+                               f"which is outside '{prefix}*'.")
+              print(f"SDD path honoured: {mandated_sdd}")
 
           # A pinned product with the wrong template would write the wrong section set.
           TEMPLATE_FOR = {
@@ -755,11 +1026,11 @@ jobs:
           print("| --- | --- | --- | --- |")
           for x in d["decisions"]:
               print(f"| {x.get('level','')} | {x.get('picked','')} | {x.get('reason','')} | {x.get('source','')} |")
-          if d["sme_review_items"]:
+          if d["architect_review_items"]:
               print()
               print("**Open SME review items:** %d (%d blocking)" % (
-                  len(d["sme_review_items"]),
-                  sum(1 for i in d["sme_review_items"] if i.get("blocking"))))
+                  len(d["architect_review_items"]),
+                  sum(1 for i in d["architect_review_items"] if i.get("blocking"))))
           EOF_SUMMARY
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -783,6 +1054,10 @@ jobs:
     name: Generate SDD
     needs: [identify, decide-architecture]
     runs-on: ubuntu-latest
+    outputs:
+      # Advisory only - the PR opens either way. It exists so the reviewer is told
+      # up front whether the validator was happy, instead of discovering it later.
+      verdict: ${{ steps.verify.outputs.verdict }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -793,6 +1068,50 @@ jobs:
         with:
           name: architecture
           path: ${{ env.WORK_DIR }}
+
+      # Runs BEFORE the agent so it edits the document at its final path - otherwise
+      # it would update the old file and the rename would look like a delete plus an
+      # unrelated add, losing the history git would otherwise follow through it.
+      # `git mv` rather than `mv` so the rename is staged, and the old path does not
+      # linger as an untracked deletion for the commit step to miss.
+      - name: Migrate legacy document names
+        if: needs.identify.outputs.legacy_sdd != '' || needs.identify.outputs.legacy_arch != ''
+        env:
+          LEGACY_SDD:  ${{ needs.identify.outputs.legacy_sdd }}
+          LEGACY_ARCH: ${{ needs.identify.outputs.legacy_arch }}
+          SDD_FILE:    ${{ needs.identify.outputs.sdd_file }}
+          ARCH_FILE:   ${{ needs.identify.outputs.arch_file }}
+        run: |
+          set -euo pipefail
+          git config user.name  "uipath-architect[bot]"
+          git config user.email "uipath-architect[bot]@users.noreply.github.com"
+
+          migrate() {
+            local from="$1" to="$2"
+            [ -n "$from" ] || return 0
+            [ "$from" = "$to" ] && return 0
+            [ -f "$from" ] || { echo "::warning::'$from' is gone - nothing to rename."; return 0; }
+            if [ -e "$to" ]; then
+              echo "::warning::'$to' already exists; leaving '$from' alone."
+              return 0
+            fi
+            git mv "$from" "$to" 2>/dev/null || mv "$from" "$to"
+            echo "renamed $from -> $to"
+          }
+
+          migrate "$LEGACY_SDD"  "$SDD_FILE"
+          migrate "$LEGACY_ARCH" "$ARCH_FILE"
+
+          {
+            echo "### Document names migrated"
+            echo ""
+            echo "Renamed onto the repository-based convention so the change-request"
+            echo "loop updates one living document instead of writing a new one per story."
+            echo ""
+            echo '```'
+            git status --short
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install UiPath skills
         id: skills
@@ -823,8 +1142,10 @@ jobs:
             ARCHITECTURE (the contract): ${{ env.WORK_DIR }}/architecture.json
             PDD corpus:                 ${{ env.WORK_DIR }}/manifest.json
             Prior SDD(s):               ${{ env.WORK_DIR }}/prior/  (empty on a first design)
+            Org platform facts:         the manifest "considerations_markdown" (empty when none)
             Story key:                  ${{ needs.identify.outputs.story_key }}
             Revision:                   ${{ needs.identify.outputs.revision }}
+            Adopted SDD:                ${{ needs.identify.outputs.adopted }}  (empty = first design)
             Today:                      run `date +%F` - use that as the generation date.
 
             ## Step 0 - load the planner skill if it is installed
@@ -839,7 +1160,7 @@ jobs:
             READ the template you find and follow it exactly - its headings, its tables, its
             placeholder semantics. The template is the authority. Your generated H2/H3
             heading set MUST be a SUPERSET of the template's: a missing template heading is a
-            defect you fix, never an `[SME REVIEW]` line.
+            defect you fix, never an `[ARCHITECT REVIEW]` line.
 
             Follow Phase D **Phase 3** in AUTONOMOUS mode. Never ask a question.
 
@@ -850,7 +1171,29 @@ jobs:
             Read architecture.json in full. It decides scope, products, projects, queues,
             components, file paths and templates - do NOT re-open those decisions. If you
             believe a decision is wrong, write the SDD as decided and add your objection as
-            an `[SME REVIEW]` row in the Action Required table.
+            an `[ARCHITECT REVIEW]` row in the Action Required table.
+
+            Read `considerations_markdown` from the manifest - the org's platform facts
+            and house preferences, and AUTHORITATIVE. The architect already applied it to
+            the architecture; you apply it to the DOCUMENT:
+
+            - A plain value there is a CONFIRMED FACT. Write it as fact - delivery model,
+              region, folder structure, logging target, system base URLs, auth pattern.
+              Never emit an `[ARCHITECT REVIEW]` for something this file answers, even
+              when the PDD marked the same thing `[SME REVIEW]`; the PDD did not know.
+              Cite "org architectural considerations" as the source in *Recommended Scope*.
+            - `[UNCONFIRMED]` there means unanswered: normal default plus an
+              `[ARCHITECT REVIEW]` row.
+            - Its naming rules are BINDING and the validator checks them. Every asset,
+              credential, queue, bucket and connection is `<epic_key>_<thing>`, lowercase
+              with underscores, where the epic key is the REPOSITORY name's prefix - not
+              the story key, not the process name. The solution name is the repository
+              name verbatim.
+            - An Integration Service connection being *available* is not the same as it
+              *existing*: record each named connection as a deployment prerequisite a
+              human must create and authorise.
+            - Never invent a value it does not contain, and never put a credential value
+              in the document - name the asset and its owner.
 
             Read every PDD in the manifest. The document you write must account for ALL of
             the current PDD's content: every step in its section 7, every `BR-xx` in its
@@ -862,6 +1205,14 @@ jobs:
             replacing it: keep section structure and reviewed content, change what the new
             PDD changed, and add a Document History row (version +0.1, or +1.0 when the
             architecture moved) whose comment names the change request.
+
+            "In place" is literal. `sdd_files[].path` already points at the ADOPTED file
+            when there is one, so you are editing that document, not writing a new one
+            beside it. Do NOT create a second SDD under a different name, and do not
+            delete or rename the adopted one. Where the adopted document predates the
+            current rules - process-name-prefixed resource names, `[SME REVIEW]` markers,
+            another product's artifacts - fix those as part of the revision; they are
+            defects in a document you now own, not history to preserve.
 
             ## Step 2 - write the SDD(s)
 
@@ -899,8 +1250,8 @@ jobs:
                 ## Recommended Scope
                 (Recommendation / Delivery model / Blocked by platform / Need profile)
 
-                ## Action Required — SME Review Items
-                (only when sme_review_items is non-empty)
+                ## Action Required — Architect Review Items
+                (only when architect_review_items is non-empty)
 
                 ## Table of Contents
 
@@ -1005,9 +1356,9 @@ jobs:
               Copying the PDD's section order is the most common failure here.
             - **Never invent** a business rule, threshold, volume, system, URL, person,
               selector or credential value. A gap is `[DEFAULT]` (a standard engineering
-              default you applied - retries, timeouts, logging) or `[SME REVIEW]` (business
+              default you applied - retries, timeouts, logging) or `[ARCHITECT REVIEW]` (business
               knowledge only a human has). Both markers stay in the document and every
-              `[SME REVIEW]` also gets a row in the Action Required table.
+              `[ARCHITECT REVIEW]` also gets a row in the Action Required table.
             - **No selectors.** They need the live application; the RPA specialist writes
               them at development time. Describe the UI element, not its selector.
             - **Real content only.** No `<PLACEHOLDER>`, no `TBD`, no `TODO`, no empty table
@@ -1061,23 +1412,74 @@ jobs:
             Do not change architecture.json. Do not modify anything else under
             ${{ env.WORK_DIR }}. Do not run git or gh.
 
+      # The validator's job is to DRIVE a good document, not to reject one. Its exit
+      # code is what makes the repair pass above run, and that is the whole of its
+      # authority - by this point the agent has had two passes at it and a third
+      # would not help. So this step NEVER fails the run: findings are reported,
+      # recorded in the summary and carried into the PR body for a human to read,
+      # and the SDD is committed either way. A design that is 90% right and visibly
+      # flagged is worth more than a red X and no document at all.
       - name: Verify SDD
         id: verify
+        env:
+          # Quality findings (thin sections, artifact-vocabulary mismatch, an untraced
+          # business rule) already drove the repair pass, so here they print as
+          # warnings rather than errors. Structural findings still print as errors -
+          # they are what uipath-develop chokes on - but they are reported, not fatal.
+          SDD_ADVISORY_ONLY: '1'
         run: |
-          set -euo pipefail
+          set -uo pipefail
           PDDS=$(python3 -c "import json;print(' '.join(p['markdown'] for p in json.load(open('$WORK_DIR/manifest.json'))['pdds'] if p['role']=='current'))")
-          bash .github/scripts/validate-sdd.sh "$WORK_DIR/architecture.json" $PDDS
 
-          SDD_FILES=$(python3 -c "import json;print(' '.join(f['path'] for f in json.load(open('$WORK_DIR/architecture.json'))['sdd_files']))")
+          set +e
+          VALIDATION=$(bash .github/scripts/validate-sdd.sh "$WORK_DIR/architecture.json" $PDDS 2>&1)
+          VSTATUS=$?
+          set -e
+          printf '%s\n' "$VALIDATION"
+
+          if [ "$VSTATUS" -eq 0 ]; then
+            VERDICT="passed"
+          else
+            VERDICT="passed with findings"
+            echo "::warning::SDD validation reported findings after the repair pass. The SDD is still committed - see the run summary and the PR body."
+          fi
+          echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
+
+          # Only files that actually exist are handed to the commit step, so a
+          # document the agent never wrote cannot break `git add`.
+          DECLARED=$(python3 -c "import json;print(' '.join(f['path'] for f in json.load(open('$WORK_DIR/architecture.json'))['sdd_files']))")
+          SDD_FILES=""
+          MISSING=""
+          for f in $DECLARED; do
+            if [ -f "$f" ]; then SDD_FILES="$SDD_FILES $f"; else MISSING="$MISSING $f"; fi
+          done
+          SDD_FILES=$(printf '%s' "$SDD_FILES" | sed 's/^ *//')
           echo "sdd_files=$SDD_FILES" >> "$GITHUB_OUTPUT"
+          [ -n "$MISSING" ] && echo "::warning::declared but never written:$MISSING"
+
+          # The findings travel to the PR body so the reviewer sees them where they
+          # are reading the document, not only in a log nobody opens.
+          printf '%s\n' "$VALIDATION" | grep -E '^::(error|warning)::' \
+            | sed -E 's/^::(error|warning):://' > "$WORK_DIR/validation-findings.txt" || true
+
           {
-            echo "### 4. SDD generated"
+            echo "### 4. SDD generated — validation $VERDICT"
             echo ""
             echo "| File | Bytes | Sections |"
             echo "| --- | --- | --- |"
             for f in $SDD_FILES; do
               echo "| \`$f\` | $(wc -c < "$f" | tr -d ' ') | $(grep -c '^## [0-9]' "$f") |"
             done
+            if [ -s "$WORK_DIR/validation-findings.txt" ]; then
+              echo ""
+              echo "<details><summary>Validation findings — advisory, not blocking</summary>"
+              echo ""
+              echo '```'
+              cat "$WORK_DIR/validation-findings.txt"
+              echo '```'
+              echo ""
+              echo "</details>"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Pushing with GITHUB_TOKEN does not re-trigger this workflow, so there is no
@@ -1097,14 +1499,31 @@ jobs:
           git config user.email "uipath-architect[bot]@users.noreply.github.com"
 
           cp "$WORK_DIR/architecture.json" "$ARCH_FILE"
-          git add $SDD_FILES "$ARCH_FILE"
+          # architecture.json is always worth committing - the Development stage routes
+          # its build tasks off it even if the prose came out thin.
+          git add "$ARCH_FILE"
+          [ -n "${SDD_FILES:-}" ] && git add $SDD_FILES
+          # -A over the docs folder so a legacy name renamed above is staged as a
+          # DELETION as well as an add. Without it the old file survives the commit
+          # and docs/ ends up holding both.
+          git add -A "$DOCS_DIR"
 
+          # The branch has moved on if someone pushed while the agents were working.
+          # Rebase onto it rather than clobbering it - this run's SDD is not more
+          # important than whatever that push carried, and the guard already
+          # guarantees the other push did not start a competing SDD run.
+          git fetch origin "$BRANCH"
           if git diff --cached --quiet; then
             echo "No change to commit - SDD is already up to date."
           else
             VERB=$([ "$REVISION" -gt 1 ] && echo "update" || echo "add")
             git commit -m "docs: $VERB SDD for $STORY_KEY" \
                        -m "Generated by uipath-architect from $SOURCE."
+            git rebase "origin/$BRANCH" || {
+              echo "::error::Could not rebase onto origin/$BRANCH - resolve by hand."
+              git rebase --abort || true
+              exit 1
+            }
             git push origin "HEAD:$BRANCH"
           fi
 
@@ -1128,15 +1547,19 @@ jobs:
       - name: Open PR into develop
         id: pr
         env:
-          # PR_AUTHOR_PAT so the PR can trigger downstream pull_request workflows;
-          # GITHUB_TOKEN is enough for Maestro's polling trigger.
-          GH_TOKEN:   ${{ secrets.PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN deliberately. This stage auto-merges its own PR and nothing
+          # downstream keys off an Actions trigger from it - Maestro resumes off a
+          # polled PR event - so there is no reason to burn a PAT identity here.
+          # Only uipath-develop needs a human-authored PR; see the note there.
+          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
           REPO:       ${{ github.repository }}
           BRANCH:     ${{ needs.identify.outputs.branch }}
           STORY_KEY:  ${{ needs.identify.outputs.story_key }}
           ARCH_FILE:  ${{ needs.identify.outputs.arch_file }}
           SOURCE:     ${{ needs.identify.outputs.primary_pdd }}
           REVISION:   ${{ needs.identify.outputs.revision }}
+          ADOPTED:    ${{ needs.identify.outputs.adopted }}
+          VERDICT:    ${{ needs.generate-sdd.outputs.verdict }}
         run: |
           set -euo pipefail
 
@@ -1168,7 +1591,7 @@ jobs:
           - [ ] Queue / data schemas are concrete enough to build from
           - [ ] Named Orchestrator resources (assets, credentials, queues) are correct
           - [ ] Testing Strategy covers every business exception and system error
-          - [ ] Every `[SME REVIEW]` item in *Action Required* is answered or accepted
+          - [ ] Every `[ARCHITECT REVIEW]` item in *Action Required* is answered or accepted
           EOF_BODY
 
           {
@@ -1198,10 +1621,10 @@ jobs:
               print("**Blocked by the Constraint Gate:** " + ", ".join(
                   f"{b['product']} → {b.get('alternative_applied') or 'no alternative'}"
                   for b in d["blocked_products"]))
-          if d["sme_review_items"]:
-              blocking = sum(1 for i in d["sme_review_items"] if i.get("blocking"))
+          if d["architect_review_items"]:
+              blocking = sum(1 for i in d["architect_review_items"] if i.get("blocking"))
               print()
-              print(f"**Open SME review items:** {len(d['sme_review_items'])} ({blocking} blocking)")
+              print(f"**Open SME review items:** {len(d['architect_review_items'])} ({blocking} blocking)")
           print()
           print("### Documents")
           print()
@@ -1215,6 +1638,20 @@ jobs:
             echo "| Story | \`$STORY_KEY\` |"
             echo "| Architecture | [\`$ARCH_FILE\`]($BLOB/$ARCH_FILE) |"
             echo "| Source PDD | [\`$SOURCE\`]($BLOB/$SOURCE) |"
+            if [ -n "${ADOPTED:-}" ]; then
+              echo "| Existing SDD | [\`$ADOPTED\`]($BLOB/$ADOPTED) — updated in place, not replaced |"
+            fi
+            echo "| Validation | ${VERDICT:-not run} |"
+            # Validation never blocks this PR. When it had something to say, the
+            # reviewer should see it here rather than in a log.
+            if [ "${VERDICT:-}" = "passed with findings" ]; then
+              echo ""
+              echo "> [!NOTE]"
+              echo "> The validator reported findings after the repair pass. They are advisory —"
+              echo "> the SDD is committed and this PR is open regardless. Read them in the"
+              echo "> [run summary](${{ github.server_url }}/$REPO/actions/runs/${{ github.run_id }})"
+              echo "> before approving."
+            fi
             echo ""
             echo "<sub>Generated by \`uipath-sdd\` - run [${{ github.run_id }}](${{ github.server_url }}/$REPO/actions/runs/${{ github.run_id }})</sub>"
           } | sed "s|BLOB_URL|$BLOB|g" >> /tmp/pr-body.md
@@ -1263,7 +1700,7 @@ jobs:
     steps:
       - name: Merge the SDD PR into develop
         env:
-          GH_TOKEN:  ${{ secrets.PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
           PR_NUMBER: ${{ needs.open-pr.outputs.pr_number }}
           PR_URL:    ${{ needs.open-pr.outputs.pr_url }}

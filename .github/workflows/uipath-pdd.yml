@@ -100,7 +100,30 @@ jobs:
           fi
           REQUEST_FILE=$(printf '%s\n' "$MATCHES" | head -1)
 
-          PDD_FILE="$DOCS_DIR/pdd-$FILE_KEY.md"
+          # ── document naming: the REPOSITORY, never a stage story key ───────────
+          # pdd-<repo>.md / sdd-<repo>.md / dsd-<repo>.md / architecture-<repo>.json.
+          # The repo name is the only identifier stable across the whole lifecycle -
+          # analysis, architecture, development and docs each run on their own Jira
+          # story, so a key-named document means a change request writes a SECOND
+          # document on a new key and leaves the reviewed one orphaned in docs/.
+          # Same rule architectural-considerations.md §4 already applies to resource
+          # names, for the same reason. The living documents are updated in place;
+          # their history is git plus their own Document History table.
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          PDD_FILE="$DOCS_DIR/pdd-$REPO_NAME.md"
+
+          # A PDD written under the old key-based convention is RENAMED rather than
+          # left behind, so a repo part-way through the migration converges on the
+          # new name instead of ending up with one of each.
+          if [ ! -f "$PDD_FILE" ]; then
+            LEGACY=$(find "$DOCS_DIR" -maxdepth 1 -type f \
+                       \( -iname 'pdd-*.md' -o -iname '*-pdd.md' \) \
+                     ! -name "$(basename "$PDD_FILE")" | sort | head -1 || true)
+            if [ -n "$LEGACY" ]; then
+              echo "::notice::Adopting legacy PDD '$LEGACY' as '$PDD_FILE'."
+              mv "$LEGACY" "$PDD_FILE"
+            fi
+          fi
 
           {
             echo "branch=$BRANCH"
@@ -148,7 +171,11 @@ jobs:
           REQUEST_FILE: ${{ needs.identify.outputs.request_file }}
         run: |
           set -euo pipefail
-          mkdir -p "$WORK_DIR"
+          # media/ is created up front even when nothing extracts into it: the IMAGES
+          # count further down pipes `find` under `pipefail`, and find on a missing
+          # directory fails the whole step. The md/txt branch never creates it, and a
+          # .docx with no images may not either.
+          mkdir -p "$WORK_DIR" "$WORK_DIR/media"
           TARGET="$WORK_DIR/request-details.md"
 
           EXT=$(echo "${REQUEST_FILE##*.}" | tr '[:upper:]' '[:lower:]')
@@ -266,6 +293,7 @@ jobs:
 
                 # PDD - <process title>
 
+                ## Document History
                 ## 1. Document Control
                 ## 2. Introduction
                 ## 3. Process Overview
@@ -286,6 +314,16 @@ jobs:
                 ## 18. Benefits and Success Criteria
 
             What each section must contain:
+
+            Document History (unnumbered, directly under the H1) - a markdown table with
+            columns `Date | Version | Author | Role | Comments`, newest row last. This PDD
+            is a LIVING document: it is never renamed and never superseded by a second
+            file, so this table is the only human-readable record of what changed and
+            why. On a first analysis write exactly one row - today's date, version 0.1,
+            `uipath-analyst`, `Analyst`, and a comment naming the source request document
+            you worked from. On a revision add a row rather than editing the last one, and
+            its comment must NAME the change-request document that caused the change.
+            Never leave the table empty and never write a row with an empty comment.
 
             1. Document Control - markdown table: Document, Story key, Epic key, Source file,
                Branch, Author (uipath-analyst), Status (Draft - pending SME approval), Version 0.1.
@@ -467,9 +505,16 @@ jobs:
       - name: Open PR into develop
         id: pr
         env:
-          # PR_AUTHOR_PAT so the PR can trigger downstream pull_request workflows;
-          # GITHUB_TOKEN is enough for Maestro's polling trigger.
-          GH_TOKEN:  ${{ secrets.PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN deliberately, NOT a PAT. This PR is the one human gate in
+          # the chain: it must be approvable BY the assignee, and GitHub does not let
+          # anyone approve their own pull request. A PAT would make the assignee the
+          # author and disable the Approve button on the very PR they are meant to
+          # approve. Bot authorship keeps that gate usable.
+          #
+          # Nothing downstream needs this PR to trigger a workflow - Maestro resumes
+          # off a polled PR event, not an Actions run - so the usual reason to reach
+          # for a PAT does not apply here.
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
           BRANCH:    ${{ needs.identify.outputs.branch }}
           STORY_KEY: ${{ needs.identify.outputs.story_key }}
@@ -558,7 +603,7 @@ jobs:
     steps:
       - name: Assign and request review
         env:
-          GH_TOKEN:  ${{ secrets.PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
           PR_NUMBER: ${{ needs.open-pr.outputs.pr_number }}
           PR_URL:    ${{ needs.open-pr.outputs.pr_url }}
@@ -569,7 +614,8 @@ jobs:
           echo "Assigned PR #$PR_NUMBER to $ASSIGNEE."
 
           # Best effort: GitHub rejects a review request when the target is the PR
-          # author, which happens whenever PR_AUTHOR_PAT belongs to the assignee.
+          # author. With the bot authoring this PR that should not happen, but the
+          # fallback stays - it costs nothing and covers a token swap made later.
           if gh pr edit "$PR_NUMBER" --repo "$REPO" --add-reviewer "$ASSIGNEE" 2>/dev/null; then
             echo "Requested review from $ASSIGNEE."
           else

@@ -115,14 +115,23 @@ jobs:
             exit 1
           fi
 
-          # The architecture decision is the build contract. Newest wins: the CR loop
-          # writes a fresh architecture-<key>.json per revision.
-          while IFS= read -r f; do
-            [ -n "$f" ] || continue
-            printf '%s\t%s\n' "$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)" "$f"
-          done < <(find "$DOCS_DIR" -maxdepth 1 -type f -name 'architecture-*.json' | sort) \
-            > /tmp/arch-index.tsv
-          ARCH_FILE=$(sort -t"$(printf '\t')" -k1,1n -k2,2 /tmp/arch-index.tsv | cut -f2- | tail -1)
+          # The architecture decision is the build contract, and it lives at a fixed
+          # repository-based name - architecture-<repo>.json - because the lifecycle
+          # updates ONE contract in place rather than writing a new one per story key.
+          # See the naming note in uipath-sdd.yml.
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          ARCH_FILE="$DOCS_DIR/architecture-$REPO_NAME.json"
+
+          # Fallback for a repo not yet migrated: newest key-named file wins, as before.
+          if [ ! -f "$ARCH_FILE" ]; then
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              printf '%s\t%s\n' "$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)" "$f"
+            done < <(find "$DOCS_DIR" -maxdepth 1 -type f -name 'architecture-*.json' | sort) \
+              > /tmp/arch-index.tsv
+            ARCH_FILE=$(sort -t"$(printf '\t')" -k1,1n -k2,2 /tmp/arch-index.tsv | cut -f2- | tail -1)
+            [ -n "${ARCH_FILE:-}" ] && echo "::warning::Using legacy '$ARCH_FILE'; the canonical name is $DOCS_DIR/architecture-$REPO_NAME.json."
+          fi
 
           if [ -z "${ARCH_FILE:-}" ]; then
             echo "::error::No $DOCS_DIR/architecture-*.json on branch $BRANCH."
@@ -719,7 +728,16 @@ jobs:
       - name: Open PR into develop
         id: pr
         env:
-          GH_TOKEN:  ${{ secrets.PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          # The ONE place a PAT is required. GitHub refuses to start a workflow from
+          # an event raised by GITHUB_TOKEN, so a bot-authored PR never triggers
+          # uipath-review - the run is either not created or parked behind an
+          # approval gate that expires unapproved. A PAT makes this PR human-authored
+          # and the review fires normally.
+          #
+          # The fallback is intentional: with the secret unset the chain still runs,
+          # it just stops reviewing itself. That is a degraded mode, not a failure,
+          # so it must not break the build - but check the secret if reviews go quiet.
+          GH_TOKEN:  ${{ secrets.DEV_PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
           BRANCH:    ${{ needs.identify.outputs.branch }}
           STORY_KEY: ${{ needs.identify.outputs.story_key }}
@@ -813,7 +831,7 @@ jobs:
     steps:
       - name: Assign and request review
         env:
-          GH_TOKEN:  ${{ secrets.PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          GH_TOKEN:  ${{ secrets.DEV_PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
           PR_NUMBER: ${{ needs.open-pr.outputs.pr_number }}
           PR_URL:    ${{ needs.open-pr.outputs.pr_url }}

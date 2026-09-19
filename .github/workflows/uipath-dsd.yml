@@ -130,13 +130,22 @@ jobs:
             exit 1
           fi
 
-          # Newest architecture json wins: the CR loop writes a fresh one per revision.
-          while IFS= read -r f; do
-            [ -n "$f" ] || continue
-            printf '%s\t%s\n' "$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)" "$f"
-          done < <(find "$DOCS_DIR" -maxdepth 1 -type f -name 'architecture-*.json' 2>/dev/null | sort) \
-            > /tmp/arch-index.tsv
-          ARCH_FILE=$(sort -t"$(printf '\t')" -k1,1n -k2,2 /tmp/arch-index.tsv | cut -f2- | tail -1 || true)
+          # The architecture contract lives at a fixed repository-based name -
+          # architecture-<repo>.json - because the lifecycle updates ONE contract in
+          # place rather than writing a new one per story key. See uipath-sdd.yml.
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          ARCH_FILE="$DOCS_DIR/architecture-$REPO_NAME.json"
+
+          # Fallback for a repo not yet migrated: newest key-named file wins, as before.
+          if [ ! -f "$ARCH_FILE" ]; then
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              printf '%s\t%s\n' "$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)" "$f"
+            done < <(find "$DOCS_DIR" -maxdepth 1 -type f -name 'architecture-*.json' 2>/dev/null | sort) \
+              > /tmp/arch-index.tsv
+            ARCH_FILE=$(sort -t"$(printf '\t')" -k1,1n -k2,2 /tmp/arch-index.tsv | cut -f2- | tail -1 || true)
+            [ -n "${ARCH_FILE:-}" ] && echo "::warning::Using legacy '$ARCH_FILE'; the canonical name is $DOCS_DIR/architecture-$REPO_NAME.json."
+          fi
           if [ -z "${ARCH_FILE:-}" ]; then
             echo "::error::No $DOCS_DIR/architecture-*.json on branch $BRANCH."
             exit 1
@@ -160,9 +169,15 @@ jobs:
           done
 
           # One DSD per buildable project; component rows are documented inside their host.
-          DSD_PLAN=$(python3 - "$ARCH_FILE" <<'EOF_PLAN'
+          # DSD names come from the REPOSITORY, never the process name - dsd-<repo>.md
+          # for a single product, dsd-<repo>-<project-kebab>.md per project for a
+          # solution. Same rule as the PDD and SDD: the process name is not unique
+          # across the estate and changes when the process is renamed, whereas the
+          # repository name is stable for the whole lifecycle.
+          DSD_PLAN=$(python3 - "$ARCH_FILE" "$REPO_NAME" <<'EOF_PLAN'
           import json, sys
           d = json.load(open(sys.argv[1]))
+          repo = sys.argv[2]
           rows, seen = [], set()
           for p in sorted(d["projects"], key=lambda x: x.get("build_order", 99)):
               if p.get("role") == "component":
@@ -173,8 +188,8 @@ jobs:
               if key in seen:
                   continue
               seen.add(key)
-              path = (f"docs/{d['process_kebab']}-dsd.md" if d["sdd_scope"] == "single-product"
-                      else f"docs/{kebab}-dsd.md")
+              path = (f"docs/dsd-{repo}.md" if d["sdd_scope"] == "single-product"
+                      else f"docs/dsd-{repo}-{kebab}.md")
               rows.append("\t".join([path, sdd, p.get("product", ""), p.get("skill", ""), p["name"]]))
           print("\n".join(rows))
           EOF_PLAN
@@ -183,8 +198,11 @@ jobs:
           printf '%s\n' "$DSD_PLAN" > /tmp/dsd-plan.tsv
           DSD_FILES=$(cut -f1 /tmp/dsd-plan.tsv | tr '\n' ' ' | sed 's/ *$//')
 
-          PRIOR_DSDS=$(find "$DOCS_DIR" -maxdepth 1 -type f -iname '*-dsd.md' 2>/dev/null \
-                       | sort | tr '\n' ' ' | sed 's/ *$//' || true)
+          # Both name shapes, so a repo mid-migration still finds its existing DSD and
+          # updates it rather than writing a second one under the new name.
+          PRIOR_DSDS=$(find "$DOCS_DIR" -maxdepth 1 -type f \
+                         \( -iname 'dsd-*.md' -o -iname '*-dsd.md' \) 2>/dev/null \
+                       | sort -u | tr '\n' ' ' | sed 's/ *$//' || true)
           PRIOR_COUNT=$(printf '%s' "${PRIOR_DSDS:-}" | wc -w | tr -d ' ')
           REVISION=$(( PRIOR_COUNT > 0 ? 2 : 1 ))
 
@@ -612,7 +630,7 @@ jobs:
       - name: Open PR into develop
         id: pr
         env:
-          GH_TOKEN:  ${{ secrets.PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
           BRANCH:    ${{ needs.identify.outputs.branch }}
           STORY_KEY: ${{ needs.identify.outputs.story_key }}
@@ -691,7 +709,7 @@ jobs:
     steps:
       - name: Merge the DSD PR into develop
         env:
-          GH_TOKEN:  ${{ secrets.PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
           PR_NUMBER: ${{ needs.open-pr.outputs.pr_number }}
           PR_URL:    ${{ needs.open-pr.outputs.pr_url }}
@@ -732,7 +750,7 @@ jobs:
 
       - name: Open the release PR
         env:
-          GH_TOKEN:  ${{ secrets.PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
           STORY_KEY: ${{ needs.identify.outputs.story_key }}
           ARCH_FILE: ${{ needs.identify.outputs.arch_file }}
@@ -788,7 +806,7 @@ jobs:
             echo ""
             echo "**Documents in this release**"
             echo ""
-            for f in $(find "$DOCS_DIR" -maxdepth 1 -type f \( -iname 'pdd-*.md' -o -iname '*-sdd.md' -o -iname '*-dsd.md' \) 2>/dev/null | sort); do
+            for f in $(find "$DOCS_DIR" -maxdepth 1 -type f \( -iname 'pdd-*.md' -o -iname 'sdd-*.md' -o -iname '*-sdd.md' -o -iname '*-dsd.md' \) 2>/dev/null | sort); do
               echo "- [\`$f\`](${{ github.server_url }}/$REPO/blob/$BASE_BRANCH/$f)"
             done
             echo ""

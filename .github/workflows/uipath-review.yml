@@ -26,13 +26,32 @@ name: uipath-review
 # Jira is NOT touched from here - Flow owns every Jira transition in this chain.
 
 # A pull_request trigger can only filter the BASE branch, never the head - GitHub
-# has no head-branches filter - so the head-ref test lives on the validate job's `if`
-# below. That skips every job immediately, which is the closest thing to "this
-# workflow does not apply to that PR".
+# has no head-branches filter. So the head is filtered twice, at two different
+# levels, because neither alone does the whole job:
+#
+#   `paths: code/**` (here)   stops the RUN from being created at all. A document PR
+#                             - analysis-* writing docs/pdd-*.md, architecture-*
+#                             writing docs/sdd-*.md - touches no code, so GitHub
+#                             never starts this workflow and nothing appears in the
+#                             PR's checks or the Actions tab. `branches` and `paths`
+#                             are ANDed, so this means "into develop AND touches
+#                             code". An implementation PR always touches code/** by
+#                             definition, so it always fires.
+#
+#   head-ref `if:` (below)    still needed: paths describe what a PR CHANGED, not
+#                             where it came from. Someone pushing a stray code file
+#                             on a docs branch would create a run that this catches.
+#
+# Only the first is cosmetic; a skipped job already costs nothing. The point of the
+# paths filter is that a document PR no longer shows a review entry it will never
+# act on. workflow_dispatch is unaffected by paths, so a manual re-run still works
+# on any PR.
 on:
   pull_request:
     branches: [develop]
     types: [opened, synchronize, reopened]
+    paths:
+      - 'code/**'
   workflow_dispatch:
     inputs:
       pr_number:
@@ -73,14 +92,30 @@ jobs:
   # ═══════════════════════════════════════════════════════════════
   validate:
     name: Run checks
-    # The real filter. Everything else into develop - analysis-*, architecture-*,
+    # The real filter, in two parts.
+    #
+    # SAME REPO: the PR's branch must live here, not in a fork. On a public repo
+    # anyone can fork, and a fork PR into develop touching code/** clears both the
+    # paths filter and the branch-name test below - the author controls their own
+    # branch names. Nothing leaks, because GitHub hands fork PRs no secrets, but
+    # CLAUDE_CODE_OAUTH_TOKEN then arrives empty and the agent dies on an auth
+    # error that reads like a broken pipeline rather than a stranger's PR. On a
+    # private repo this can never be false; it earns its place the day we go public.
+    #
+    # BRANCH NAME: everything else into develop - analysis-*, architecture-*,
     # docs-* - is a document PR, so no job runs and no run does any work.
+    #
+    # The inner parentheses are load-bearing: without them the `||` chain would let
+    # a fork PR through on the branch-name test alone, which is the case this is
+    # here to block.
+    #
     # A manual dispatch is let through so a PR can be force-reviewed; the shell
     # check inside still guards that path.
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      startsWith(github.event.pull_request.head.ref, 'dev-') ||
-      startsWith(github.event.pull_request.head.ref, 'development-')
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       (startsWith(github.event.pull_request.head.ref, 'dev-') ||
+        startsWith(github.event.pull_request.head.ref, 'development-')))
     runs-on: ubuntu-latest
     outputs:
       pr_number: ${{ steps.pr.outputs.pr_number }}
@@ -255,7 +290,7 @@ jobs:
         env:
           # A PAT is preferred: GitHub refuses an approving review from the token that
           # authored the PR, which is exactly the case when the bot opened it.
-          GH_TOKEN:  ${{ secrets.PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ needs.validate.outputs.pr_number }}
           BASE_SHA:  ${{ needs.validate.outputs.base_sha }}
           HEAD_SHA:  ${{ needs.validate.outputs.head_sha }}
@@ -388,7 +423,7 @@ jobs:
       - name: Read back the verdict
         id: verdict
         env:
-          GH_TOKEN:  ${{ secrets.PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
           PR_NUMBER: ${{ needs.validate.outputs.pr_number }}
         run: |
@@ -421,9 +456,12 @@ jobs:
     if: needs.validate.outputs.reviewable == 'true'
     runs-on: ubuntu-latest
     steps:
+      # GITHUB_TOKEN, never the dev PAT: this job posts the agent's review on a PR
+      # the PAT now authors, and GitHub rejects a review submitted by the PR's own
+      # author. Reviewing as the bot is also what puts it in the Reviewers sidebar.
       - name: Merge on approval, assign a human otherwise
         env:
-          GH_TOKEN:  ${{ secrets.PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
           PR_NUMBER: ${{ needs.validate.outputs.pr_number }}
           VERDICT:   ${{ needs.review.outputs.verdict }}

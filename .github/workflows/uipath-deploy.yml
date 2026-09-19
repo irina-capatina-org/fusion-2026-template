@@ -18,8 +18,16 @@ name: uipath-deploy
 # Jira is NOT touched from here - Flow owns every Jira transition in this chain.
 #
 # Required repo configuration:
-#   secrets: UIPATH_CLIENT_ID, UIPATH_CLIENT_SECRET
-#   vars:    UIPATH_ORGANIZATION, UIPATH_TENANT, UIPATH_AUTHORITY, UIPATH_FOLDER_PATH
+#   secrets: UIPATH_STAGING_CLIENT_ID, UIPATH_STAGING_CLIENT_SECRET
+#   vars:    UIPATH_STAGING_ORGANIZATION, UIPATH_STAGING_TENANT,
+#            UIPATH_STAGING_AUTHORITY, UIPATH_STAGING_FOLDER_PATH_FUSION
+#
+# All eight are ORGANIZATION-level, so a repo generated from the template inherits
+# them with no per-repo setup. Their visibility is "Public repositories" - a
+# PRIVATE repo in the same org resolves every one of them to an empty string and
+# fails at the presence check below, which is the intended tripwire rather than a
+# bug. The STAGING_ prefix is deliberate: it keeps a production credential from
+# ever being picked up by a workflow that means to target staging.
 
 on:
   push:
@@ -27,7 +35,7 @@ on:
   workflow_dispatch:
     inputs:
       folder_path:
-        description: 'Orchestrator folder path to deploy into (blank = the UIPATH_FOLDER_PATH repo variable)'
+        description: 'Orchestrator folder path to deploy into (blank = the UIPATH_STAGING_FOLDER_PATH_FUSION variable)'
         required: false
         default: ''
       dry_run:
@@ -94,9 +102,9 @@ jobs:
           VERSION="1.0.${{ github.run_number }}"
 
           FOLDER_PATH="${{ inputs.folder_path }}"
-          [ -n "$FOLDER_PATH" ] || FOLDER_PATH="${{ vars.UIPATH_FOLDER_PATH }}"
+          [ -n "$FOLDER_PATH" ] || FOLDER_PATH="${{ vars.UIPATH_STAGING_FOLDER_PATH_FUSION }}"
           if [ -z "$FOLDER_PATH" ]; then
-            echo "::error::No Orchestrator folder. Set the UIPATH_FOLDER_PATH repo variable or pass folder_path."
+            echo "::error::No Orchestrator folder. Set the UIPATH_STAGING_FOLDER_PATH_FUSION variable (org or repo level) or pass folder_path."
             exit 1
           fi
 
@@ -288,11 +296,11 @@ jobs:
 
       - name: Authenticate
         env:
-          UIPATH_CLIENT_ID:     ${{ secrets.UIPATH_CLIENT_ID }}
-          UIPATH_CLIENT_SECRET: ${{ secrets.UIPATH_CLIENT_SECRET }}
-          UIPATH_TENANT:        ${{ vars.UIPATH_TENANT }}
-          UIPATH_AUTHORITY:     ${{ vars.UIPATH_AUTHORITY }}
-          UIPATH_ORGANIZATION:  ${{ vars.UIPATH_ORGANIZATION }}
+          UIPATH_CLIENT_ID:     ${{ secrets.UIPATH_STAGING_CLIENT_ID }}
+          UIPATH_CLIENT_SECRET: ${{ secrets.UIPATH_STAGING_CLIENT_SECRET }}
+          UIPATH_TENANT:        ${{ vars.UIPATH_STAGING_TENANT }}
+          UIPATH_AUTHORITY:     ${{ vars.UIPATH_STAGING_AUTHORITY }}
+          UIPATH_ORGANIZATION:  ${{ vars.UIPATH_STAGING_ORGANIZATION }}
         run: |
           set -euo pipefail
           for v in UIPATH_CLIENT_ID UIPATH_CLIENT_SECRET UIPATH_TENANT UIPATH_AUTHORITY UIPATH_ORGANIZATION; do
@@ -415,11 +423,11 @@ jobs:
 
       - name: Authenticate
         env:
-          UIPATH_CLIENT_ID:     ${{ secrets.UIPATH_CLIENT_ID }}
-          UIPATH_CLIENT_SECRET: ${{ secrets.UIPATH_CLIENT_SECRET }}
-          UIPATH_TENANT:        ${{ vars.UIPATH_TENANT }}
-          UIPATH_AUTHORITY:     ${{ vars.UIPATH_AUTHORITY }}
-          UIPATH_ORGANIZATION:  ${{ vars.UIPATH_ORGANIZATION }}
+          UIPATH_CLIENT_ID:     ${{ secrets.UIPATH_STAGING_CLIENT_ID }}
+          UIPATH_CLIENT_SECRET: ${{ secrets.UIPATH_STAGING_CLIENT_SECRET }}
+          UIPATH_TENANT:        ${{ vars.UIPATH_STAGING_TENANT }}
+          UIPATH_AUTHORITY:     ${{ vars.UIPATH_STAGING_AUTHORITY }}
+          UIPATH_ORGANIZATION:  ${{ vars.UIPATH_STAGING_ORGANIZATION }}
         run: |
           set -euo pipefail
           uip login --client-id "$UIPATH_CLIENT_ID" --client-secret "$UIPATH_CLIENT_SECRET" \
