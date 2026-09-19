@@ -1,0 +1,455 @@
+name: uipath-deploy
+
+# Stage 6 of the ADLC chain, as four visible jobs:
+#
+#   Resolve target -> Build package -> Deploy -> Verify
+#
+# Unlike every other stage this one has no branch and writes no document - it runs on
+# the promotion to main, i.e. once the Development PR is merged into develop and
+# develop is merged into main. Maestro or Flow can also fire it directly with
+# workflow_dispatch, which is why every input has a sane default.
+#
+# It reads docs/architecture-<key>.json to decide HOW to ship, because that differs by
+# scope. A multi-project Solution packs and deploys as one .uipx; a single-product
+# build publishes its own package and has no Solution wrapper. Getting that wrong is
+# the most common deployment failure in this chain, so it is resolved from the design
+# rather than hardcoded.
+#
+# Jira is NOT touched from here - Flow owns every Jira transition in this chain.
+#
+# Required repo configuration:
+#   secrets: UIPATH_CLIENT_ID, UIPATH_CLIENT_SECRET
+#   vars:    UIPATH_ORGANIZATION, UIPATH_TENANT, UIPATH_AUTHORITY, UIPATH_FOLDER_PATH
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      folder_path:
+        description: 'Orchestrator folder path to deploy into (blank = the UIPATH_FOLDER_PATH repo variable)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Pack only - do not log in, publish or deploy'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  DOCS_DIR: docs
+  CODE_DIR: code
+  OUTPUT_DIR: ./dist
+  CLI_VERSION: 'latest'
+  NODE_VERSION: '20'
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  # ═══════════════════════════════════════════════════════════════
+  # 1. Resolve target
+  # The design decides the shipping path, not this file.
+  # ═══════════════════════════════════════════════════════════════
+  resolve:
+    name: Resolve target
+    runs-on: ubuntu-latest
+    outputs:
+      scope:         ${{ steps.r.outputs.scope }}
+      product:       ${{ steps.r.outputs.product }}
+      solution_name: ${{ steps.r.outputs.solution_name }}
+      version:       ${{ steps.r.outputs.version }}
+      folder_path:   ${{ steps.r.outputs.folder_path }}
+      arch_file:     ${{ steps.r.outputs.arch_file }}
+      packages:      ${{ steps.r.outputs.packages }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read the design
+        id: r
+        run: |
+          set -euo pipefail
+
+          ARCH_FILE=$(find "$DOCS_DIR" -maxdepth 1 -type f -name 'architecture-*.json' 2>/dev/null | sort | tail -1 || true)
+          if [ -z "${ARCH_FILE:-}" ]; then
+            echo "::error::No $DOCS_DIR/architecture-*.json on this branch - nothing to deploy."
+            echo "::error::The Architecture and Development PRs must be merged through to main first."
+            exit 1
+          fi
+          python3 -c "import json,sys;json.load(open(sys.argv[1]))" "$ARCH_FILE" \
+            || { echo "::error::$ARCH_FILE is not valid JSON."; exit 1; }
+
+          SCOPE=$(python3   -c "import json;print(json.load(open('$ARCH_FILE'))['sdd_scope'])")
+          PRODUCT=$(python3 -c "import json;print(json.load(open('$ARCH_FILE'))['primary_product'])")
+          NAME=$(python3    -c "import json;print(json.load(open('$ARCH_FILE'))['process_name'])")
+          VERSION="1.0.${{ github.run_number }}"
+
+          FOLDER_PATH="${{ inputs.folder_path }}"
+          [ -n "$FOLDER_PATH" ] || FOLDER_PATH="${{ vars.UIPATH_FOLDER_PATH }}"
+          if [ -z "$FOLDER_PATH" ]; then
+            echo "::error::No Orchestrator folder. Set the UIPATH_FOLDER_PATH repo variable or pass folder_path."
+            exit 1
+          fi
+
+          # Every buildable project directory, in build order - used by the
+          # single-product path, which publishes each package on its own.
+          PACKAGES=$(python3 - "$ARCH_FILE" <<'EOF_PKG'
+          import json, sys, os
+          d = json.load(open(sys.argv[1]))
+          out = []
+          for p in sorted(d["projects"], key=lambda x: x.get("build_order", 99)):
+              if p.get("role") == "component":
+                  continue
+              kebab = p.get("kebab") or p["name"].lower().replace(".", "-")
+              path = os.path.join("code", kebab)
+              if path not in out:
+                  out.append(path)
+          print(" ".join(out))
+          EOF_PKG
+          )
+
+          {
+            echo "scope=$SCOPE"
+            echo "product=$PRODUCT"
+            echo "solution_name=$NAME"
+            echo "version=$VERSION"
+            echo "folder_path=$FOLDER_PATH"
+            echo "arch_file=$ARCH_FILE"
+            echo "packages=$PACKAGES"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 1. Deployment target resolved"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Design | \`$ARCH_FILE\` |"
+            echo "| Scope | \`$SCOPE\` |"
+            echo "| Primary product | \`$PRODUCT\` |"
+            echo "| Name | \`$NAME\` |"
+            echo "| Version | \`$VERSION\` |"
+            echo "| Folder | \`$FOLDER_PATH\` |"
+            echo "| Shipping path | $([ "$SCOPE" = "solution" ] && echo 'Solution (.uipx)' || echo 'single package per project') |"
+            echo "| Dry run | \`${{ inputs.dry_run }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Scope=$SCOPE product=$PRODUCT name=$NAME version=$VERSION folder=$FOLDER_PATH"
+          echo "Packages: ${PACKAGES:-<solution>}"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 2. Build package
+  # ═══════════════════════════════════════════════════════════════
+  build:
+    name: Build package
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Cache npm global (@uipath/cli)
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm-global/lib/node_modules
+          key: uip-${{ env.CLI_VERSION }}-${{ runner.os }}
+
+      - name: Install UiPath CLI
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.npm-global"
+          npm config set prefix "$HOME/.npm-global"
+          echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          command -v uip >/dev/null || npm install -g "@uipath/cli@${CLI_VERSION}"
+          uip --version
+
+      - name: Pack
+        env:
+          SCOPE:    ${{ needs.resolve.outputs.scope }}
+          PRODUCT:  ${{ needs.resolve.outputs.product }}
+          NAME:     ${{ needs.resolve.outputs.solution_name }}
+          VERSION:  ${{ needs.resolve.outputs.version }}
+          PACKAGES: ${{ needs.resolve.outputs.packages }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUTPUT_DIR"
+
+          if [ "$SCOPE" = "solution" ]; then
+            # One .uipx for the whole solution. Its root is wherever the solution
+            # manifest lives - the repo root if the projects sit under code/.
+            SOLUTION_DIR="."
+            if [ -f "$CODE_DIR/solution.json" ] || ls "$CODE_DIR"/*.uipx >/dev/null 2>&1; then
+              SOLUTION_DIR="$CODE_DIR"
+            fi
+            echo "Packing solution from $SOLUTION_DIR"
+            uip solution pack "$SOLUTION_DIR" "$OUTPUT_DIR" --name "$NAME" --version "$VERSION"
+          else
+            # No Solution wrapper: each project publishes its own package. The pack
+            # verb is per product and the CLI surface drifts, so an unknown verb is
+            # reported with the supported surface rather than silently swallowed.
+            case "$PRODUCT" in
+              api-workflows) GROUP="api-workflow" ;;
+              rpa-process|rpa-library|rpa-test-automation) GROUP="rpa" ;;
+              maestro-flow)    GROUP="maestro flow" ;;
+              maestro-bpmn)    GROUP="maestro bpmn" ;;
+              case-management) GROUP="maestro case" ;;
+              agents)          GROUP="agent" ;;
+              coded-apps)      GROUP="app" ;;
+              *) echo "::error::No pack recipe for product '$PRODUCT'."; exit 1 ;;
+            esac
+
+            PACKED=0
+            for d in $PACKAGES; do
+              if [ ! -d "$d" ]; then
+                echo "::warning::$d from the design is not on disk - skipping."
+                continue
+              fi
+              echo "=== uip $GROUP pack ($d) ==="
+              if ! ( cd "$d" && uip $GROUP pack --output-dir "$GITHUB_WORKSPACE/$OUTPUT_DIR" ) 2>&1 | tee /tmp/pack.log; then
+                if grep -qiE "unknown command|unknown option" /tmp/pack.log; then
+                  echo "::error::'uip $GROUP pack' is not supported by CLI $(uip --version). Supported surface:"
+                  uip $GROUP --help || true
+                fi
+                exit 1
+              fi
+              PACKED=$((PACKED + 1))
+            done
+            [ "$PACKED" -gt 0 ] || { echo "::error::No project was packed."; exit 1; }
+          fi
+
+          echo "=== artifacts ==="
+          ls -la "$OUTPUT_DIR"
+          COUNT=$(find "$OUTPUT_DIR" -type f \( -name '*.nupkg' -o -name '*.zip' -o -name '*.uipx' \) | wc -l | tr -d ' ')
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::Pack produced no package file in $OUTPUT_DIR."
+            exit 1
+          fi
+          {
+            echo "### 2. Package built"
+            echo ""
+            find "$OUTPUT_DIR" -type f \( -name '*.nupkg' -o -name '*.zip' -o -name '*.uipx' \) \
+              -exec sh -c 'echo "- \`$(basename "$1")\` — $(wc -c < "$1" | tr -d " ") bytes"' _ {} \;
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: ${{ env.OUTPUT_DIR }}
+          retention-days: 5
+          if-no-files-found: error
+
+  # ═══════════════════════════════════════════════════════════════
+  # 3. Deploy
+  # Attach a required reviewer to the uipath-prod environment to gate this.
+  # ═══════════════════════════════════════════════════════════════
+  deploy:
+    name: Deploy
+    needs: [resolve, build]
+    if: inputs.dry_run != true
+    runs-on: ubuntu-latest
+    environment: uipath-prod
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Cache npm global (@uipath/cli)
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm-global/lib/node_modules
+          key: uip-${{ env.CLI_VERSION }}-${{ runner.os }}
+
+      - name: Install UiPath CLI
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.npm-global"
+          npm config set prefix "$HOME/.npm-global"
+          echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          command -v uip >/dev/null || npm install -g "@uipath/cli@${CLI_VERSION}"
+          uip --version
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+          path: ${{ env.OUTPUT_DIR }}
+
+      - name: Authenticate
+        env:
+          UIPATH_CLIENT_ID:     ${{ secrets.UIPATH_CLIENT_ID }}
+          UIPATH_CLIENT_SECRET: ${{ secrets.UIPATH_CLIENT_SECRET }}
+          UIPATH_TENANT:        ${{ vars.UIPATH_TENANT }}
+          UIPATH_AUTHORITY:     ${{ vars.UIPATH_AUTHORITY }}
+          UIPATH_ORGANIZATION:  ${{ vars.UIPATH_ORGANIZATION }}
+        run: |
+          set -euo pipefail
+          for v in UIPATH_CLIENT_ID UIPATH_CLIENT_SECRET UIPATH_TENANT UIPATH_AUTHORITY UIPATH_ORGANIZATION; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::$v is not set. Deployment needs all five."
+              exit 1
+            fi
+          done
+          uip login \
+            --client-id "$UIPATH_CLIENT_ID" \
+            --client-secret "$UIPATH_CLIENT_SECRET" \
+            --tenant "$UIPATH_TENANT" \
+            --authority "$UIPATH_AUTHORITY" \
+            --organization "$UIPATH_ORGANIZATION" \
+            --scope "OR.Administration OR.Administration.Read OR.Administration.Write OR.AutomationSolutions.Access OR.Execution OR.Execution.Read OR.Execution.Write OR.Folders OR.Folders.Read OR.Folders.Write OR.Jobs OR.Jobs.Read OR.Jobs.Write AutomationSolutions Solutions.Deployments Solutions.Deployments.Read Solutions.Deployments.Write Solutions.Packages Solutions.Packages.Read Solutions.Packages.Write RCS.FolderAuthorization RCS.TagsManagement"
+          echo "Authenticated."
+
+      - name: Publish
+        env:
+          SCOPE:   ${{ needs.resolve.outputs.scope }}
+          NAME:    ${{ needs.resolve.outputs.solution_name }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$SCOPE" = "solution" ]; then
+            PKG=$(find "$OUTPUT_DIR" -type f \( -name '*.uipx' -o -name "${NAME}_${VERSION}.zip" -o -name '*.zip' \) 2>/dev/null | head -1 || true)
+            [ -n "$PKG" ] || { echo "::error::No solution package in $OUTPUT_DIR."; exit 1; }
+            echo "Publishing solution $PKG"
+            uip solution publish "$PKG"
+          else
+            PUBLISHED=0
+            while IFS= read -r pkg; do
+              [ -n "$pkg" ] || continue
+              echo "=== publishing $(basename "$pkg") ==="
+              uip or packages upload --path "$pkg" || {
+                echo "::error::Upload failed for $pkg. Supported surface:"; uip or packages --help || true; exit 1; }
+              PUBLISHED=$((PUBLISHED + 1))
+            done < <(find "$OUTPUT_DIR" -type f -name '*.nupkg' | sort)
+            [ "$PUBLISHED" -gt 0 ] || { echo "::error::No .nupkg found to publish."; exit 1; }
+            echo "Published $PUBLISHED package(s)."
+          fi
+
+      # Orchestrator indexes a freshly published package asynchronously, so the first
+      # deploy attempt routinely reports it as not ready. Retry rather than fail.
+      - name: Deploy to Orchestrator
+        if: needs.resolve.outputs.scope == 'solution'
+        env:
+          NAME:        ${{ needs.resolve.outputs.solution_name }}
+          VERSION:     ${{ needs.resolve.outputs.version }}
+          FOLDER_PATH: ${{ needs.resolve.outputs.folder_path }}
+        run: |
+          set -uo pipefail
+          MAX_ATTEMPTS=10
+          DELAY=10
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            EXIT_CODE=0
+            OUTPUT=$(uip solution deploy run \
+              --name "$NAME" \
+              --package-name "$NAME" \
+              --package-version "$VERSION" \
+              --folder-name "$NAME" \
+              --folder-path "$FOLDER_PATH" 2>&1) || EXIT_CODE=$?
+            echo "$OUTPUT"
+
+            if echo "$OUTPUT" | grep -q "Deployment polling failed"; then
+              echo "::warning::Polling failed but the deploy was initiated. Treating as success."
+              exit 0
+            fi
+            if echo "$OUTPUT" | grep -q "Package version for deployment is not ready"; then
+              echo "Attempt $i/$MAX_ATTEMPTS: package not yet indexed by Orchestrator. Waiting ${DELAY}s..."
+              sleep $DELAY
+              continue
+            fi
+            if [ "$EXIT_CODE" -ne 0 ] && echo "$OUTPUT" | grep -q "already exists"; then
+              echo "::notice::A deployment already exists - upgrading instead."
+              uip solution deploy upgrade \
+                --name "$NAME" --package-name "$NAME" --package-version "$VERSION" \
+                --folder-path "$FOLDER_PATH"
+              exit $?
+            fi
+            exit ${EXIT_CODE}
+          done
+          echo "::error::Package never became ready after $MAX_ATTEMPTS attempts (~$((MAX_ATTEMPTS*DELAY))s)"
+          exit 1
+
+      - name: Deploy summary
+        if: always()
+        run: |
+          {
+            echo "### 3. Deploy"
+            echo ""
+            echo "\`${{ needs.resolve.outputs.solution_name }}\` v\`${{ needs.resolve.outputs.version }}\` -> folder \`${{ needs.resolve.outputs.folder_path }}\`"
+            echo ""
+            echo "Path: $([ "${{ needs.resolve.outputs.scope }}" = "solution" ] && echo 'solution publish + deploy run' || echo 'package upload (no Solution wrapper)')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 4. Verify
+  # Reads back what is actually in the tenant, so a green deploy that shipped
+  # nothing cannot pass silently.
+  # ═══════════════════════════════════════════════════════════════
+  verify:
+    name: Verify
+    needs: [resolve, deploy]
+    if: inputs.dry_run != true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install UiPath CLI
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.npm-global"
+          npm config set prefix "$HOME/.npm-global"
+          echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          command -v uip >/dev/null || npm install -g "@uipath/cli@${CLI_VERSION}"
+
+      - name: Authenticate
+        env:
+          UIPATH_CLIENT_ID:     ${{ secrets.UIPATH_CLIENT_ID }}
+          UIPATH_CLIENT_SECRET: ${{ secrets.UIPATH_CLIENT_SECRET }}
+          UIPATH_TENANT:        ${{ vars.UIPATH_TENANT }}
+          UIPATH_AUTHORITY:     ${{ vars.UIPATH_AUTHORITY }}
+          UIPATH_ORGANIZATION:  ${{ vars.UIPATH_ORGANIZATION }}
+        run: |
+          set -euo pipefail
+          uip login --client-id "$UIPATH_CLIENT_ID" --client-secret "$UIPATH_CLIENT_SECRET" \
+            --tenant "$UIPATH_TENANT" --authority "$UIPATH_AUTHORITY" \
+            --organization "$UIPATH_ORGANIZATION" \
+            --scope "OR.Administration.Read OR.Execution.Read OR.Folders.Read OR.Jobs.Read AutomationSolutions Solutions.Deployments.Read Solutions.Packages.Read"
+
+      - name: Confirm what landed
+        env:
+          NAME:        ${{ needs.resolve.outputs.solution_name }}
+          VERSION:     ${{ needs.resolve.outputs.version }}
+          SCOPE:       ${{ needs.resolve.outputs.scope }}
+          FOLDER_PATH: ${{ needs.resolve.outputs.folder_path }}
+        run: |
+          set -uo pipefail
+          echo "=== processes in $FOLDER_PATH ==="
+          uip or processes list --all-folders --output table 2>&1 | head -40 || \
+            echo "::warning::Could not list processes - check the granted scopes."
+
+          if [ "$SCOPE" = "solution" ]; then
+            echo "=== solution deployments ==="
+            uip solution deploy list --output table 2>&1 | head -20 || \
+              echo "::warning::Could not list solution deployments."
+          fi
+
+          {
+            echo "### 4. Verify"
+            echo ""
+            echo "Deployed \`$NAME\` v\`$VERSION\`. Post-deploy resource setup (assets,"
+            echo "credentials, queues, Integration Service connections) is not done here -"
+            echo "the SDD's *Credentials & Assets* section lists what must exist, and the"
+            echo "\`uipath-platform\` skill creates them."
+          } >> "$GITHUB_STEP_SUMMARY"

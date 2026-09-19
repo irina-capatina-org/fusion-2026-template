@@ -1,0 +1,1292 @@
+name: uipath-sdd
+run-name: SDD for ${{ github.ref_name }}
+
+# Stage 2 of the ADLC chain, as six visible jobs:
+#
+#   Identify PDDs -> Read PDDs -> Determine architecture -> Generate SDD -> Open PR -> Assign PR
+#
+# Maestro creates branch  architecture-<sddStoryKey>  from develop. Creating the
+# branch IS the trigger - unlike stage 1 there is no document to wait for, because
+# the PDD is already on develop (the Analysis PR was merged, which is what released
+# the case into this stage).
+#
+# IMPORTANT - the PDD cannot be resolved from this branch's key. The Architecture
+# stage runs on its own Jira story (architecture-jactiv-558) while the PDD was
+# written on the Analysis story (docs/pdd-jactiv-557.md). So this workflow
+# identifies PDDs by *shape* - every pdd-*.md / *-pdd.* in docs/ - not by key, and
+# reads all of them: the CR loop mints a fresh Analysis story per change request, so
+# docs/ accumulates one PDD per revision. Newest = current, older = history.
+#
+# An existing *-sdd.md in docs/ makes the run a REVISION: the architecture is
+# re-checked against the new PDD and the SDD is updated in place with a new
+# Document History row, rather than replaced by a document that loses prior review.
+#
+# The PR into develop is the Maestro resume signal: the case waits on
+# PULL_CREATED_IN_REPO filtered by head.ref == architecture-* && base.ref == develop.
+#
+# This stage AUTO-MERGES its own PR. There is no human gate on the architecture - the
+# product is pinned below, and the human gates for the release are the PDD PR and the
+# develop -> main PR at the end. The case still resumes normally: it waits on the
+# PR-created event and then on the PR-merged event, and both still fire.
+#
+# FORCED_PRODUCT / FORCED_SCOPE below pin the architecture for a live demo. The pin
+# is a hard gate: the Determine-architecture job fails if the agent picks anything
+# else. Clear both env vars to let the agent decide from the PDD.
+
+on:
+  push:
+    branches:
+      - 'architecture**'
+    # No paths filter on purpose: the branch-creation push carries no new file, and
+    # that push IS the signal - narrowed to creation only by the `if` on the identify
+    # job below, so a later push to the branch (a yml edit, a doc upload) does not
+    # start a second run. The Commit SDD step pushes with GITHUB_TOKEN, which by
+    # design does not re-trigger a workflow either - so there is no loop.
+  # Manual re-run: pick the architecture branch in the UI. Both inputs are optional
+  # and exist for the human "RPA-vs-API steer" the case allows before this stage.
+  workflow_dispatch:
+    inputs:
+      product_steer:
+        description: 'Force / exclude products, e.g. "force: rpa-process" or "exclude: maestro-flow, agents"'
+        required: false
+        default: ''
+      delivery_model:
+        description: 'Delivery model gate'
+        required: false
+        default: 'unspecified'
+        type: choice
+        options: [unspecified, cloud, automation-suite, standalone]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  DOCS_DIR: docs
+  BASE_BRANCH: develop
+  ASSIGNEE: irina-capatina-uipath
+  AGENT_MODEL: claude-sonnet-4-6
+  # ── Live-demo guardrail ────────────────────────────────────────────────────
+  # Pinning the architecture removes the one genuinely non-deterministic decision
+  # in this workflow. The pin is enforced by the Verify step below, not just asked
+  # for in the prompt - the job FAILS if the agent returns anything else, so the
+  # run can never quietly surprise us on stage.
+  # Set both to '' to hand the decision back to the agent.
+  FORCED_PRODUCT: 'api-workflows'
+  FORCED_SCOPE: 'single-product'
+  # Size floors used by validate-sdd.sh. The per-document floor is proportional to
+  # its template (sections x this rate), because a thorough 12-section API Workflow
+  # SDD is legitimately smaller than an 18-section RPA one. The solution overview is
+  # a thin index by design, so it gets a flat floor.
+  MIN_SDD_BYTES_PER_SECTION: '650'
+  MIN_SOLUTION_SDD_BYTES: '3000'
+  # Where the PDD corpus and the architecture decision live inside the workspace.
+  # Only the SDD(s) and architecture json are committed. Must NOT start with a dot:
+  # actions/upload-artifact@v4 silently skips hidden files.
+  WORK_DIR: pdd-work
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: sdd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  # ═══════════════════════════════════════════════════════════════
+  # 1. Identify PDD documents
+  # Resolved by shape, not by this branch's key - see the header note.
+  # ═══════════════════════════════════════════════════════════════
+  identify:
+    name: Identify PDD documents
+    # Branch CREATION only. `github.event.created` is true just for the push that
+    # created the ref, which is what Maestro's create-branch call produces; every
+    # later push to the same branch is ignored. workflow_dispatch is let through
+    # because that context has no `created` field and would otherwise be skipped.
+    # Every other job needs this one, so skipping here skips the whole run.
+    if: github.event_name == 'workflow_dispatch' || github.event.created
+    runs-on: ubuntu-latest
+    outputs:
+      branch:      ${{ steps.resolve.outputs.branch }}
+      file_key:    ${{ steps.resolve.outputs.file_key }}
+      story_key:   ${{ steps.resolve.outputs.story_key }}
+      pdd_files:   ${{ steps.resolve.outputs.pdd_files }}
+      pdd_count:   ${{ steps.resolve.outputs.pdd_count }}
+      primary_pdd: ${{ steps.resolve.outputs.primary_pdd }}
+      prior_sdds:  ${{ steps.resolve.outputs.prior_sdds }}
+      revision:    ${{ steps.resolve.outputs.revision }}
+      steer_file:  ${{ steps.resolve.outputs.steer_file }}
+      arch_file:   ${{ steps.resolve.outputs.arch_file }}
+    steps:
+      # Full history: the PDDs are ordered by commit date, which needs more than
+      # a shallow clone to be meaningful.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Resolve the PDD corpus for this branch
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          BRANCH="${GITHUB_REF#refs/heads/}"
+
+          # Same rule Maestro uses to name the branch: everything after the first
+          # dash. architecture-jactiv-558 -> jactiv-558
+          FILE_KEY="${BRANCH#*-}"
+          if [ -z "$FILE_KEY" ] || [ "$FILE_KEY" = "$BRANCH" ]; then
+            echo "::error::Branch '$BRANCH' has no key after an 'architecture-' prefix."
+            exit 1
+          fi
+
+          # Branches are lowercase; Jira keys are uppercase.
+          STORY_KEY=$(echo "$FILE_KEY" | tr '[:lower:]' '[:upper:]')
+
+          if [ ! -d "$DOCS_DIR" ]; then
+            echo "::error::No $DOCS_DIR folder on branch $BRANCH - nothing to design from."
+            exit 1
+          fi
+
+          # Every PDD, whatever key it was written under. Ordered oldest -> newest by
+          # last-commit date so the newest is the current revision and the earlier
+          # ones are the change-request history.
+          PDD_FILES=""
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            TS=$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)
+            printf '%s\t%s\n' "${TS:-0}" "$f"
+          done < <(find "$DOCS_DIR" -maxdepth 1 -type f \
+                     \( -iname 'pdd-*.md'   -o -iname 'pdd-*.docx' \
+                     -o -iname '*-pdd.md'   -o -iname '*-pdd.docx' \
+                     -o -iname '*_pdd*.md'  -o -iname '*-pdd-*.md' \) \
+                   | sort) > /tmp/pdd-index.tsv
+
+          # Oldest first. Same-commit ties fall back to the filename, so a repo seeded
+          # with several PDDs in one commit still orders the highest Jira key last.
+          PDD_FILES=$(sort -t"$(printf '\t')" -k1,1n -k2,2 /tmp/pdd-index.tsv \
+                        | cut -f2- | tr '\n' ' ' | sed 's/ *$//')
+          PDD_COUNT=$(printf '%s' "$PDD_FILES" | wc -w | tr -d ' ')
+
+          if [ "${PDD_COUNT:-0}" -eq 0 ]; then
+            echo "::error::No PDD found in $DOCS_DIR on branch $BRANCH."
+            echo "::error::The Analysis PR must be merged into $BASE_BRANCH before the Architecture branch is cut."
+            echo "Files in $DOCS_DIR:"
+            ls -1 "$DOCS_DIR" 2>/dev/null || echo "  (empty)"
+            exit 1
+          fi
+
+          # Newest PDD is the one the architecture must satisfy.
+          PRIMARY_PDD=$(printf '%s' "$PDD_FILES" | awk '{print $NF}')
+
+          # A prior SDD means this is a change-request revision, not a first design.
+          PRIOR_SDDS=$(find "$DOCS_DIR" -maxdepth 1 -type f -iname '*-sdd.md' \
+                       | sort | tr '\n' ' ' | sed 's/ *$//')
+          PRIOR_COUNT=$(printf '%s' "$PRIOR_SDDS" | wc -w | tr -d ' ')
+          REVISION=$(( PRIOR_COUNT > 0 ? 2 : 1 ))
+
+          # Optional human steer dropped into docs/ by the Architecture stage's
+          # "RPA-vs-API steer" task. Binding when present.
+          STEER_FILE=$(find "$DOCS_DIR" -maxdepth 1 -type f \
+                         \( -iname '*architecture-steer*' -o -iname '*arch-steer*' \) \
+                       | sort | head -1 || true)
+
+          ARCH_FILE="$DOCS_DIR/architecture-$FILE_KEY.json"
+
+          {
+            echo "branch=$BRANCH"
+            echo "file_key=$FILE_KEY"
+            echo "story_key=$STORY_KEY"
+            echo "pdd_files=$PDD_FILES"
+            echo "pdd_count=$PDD_COUNT"
+            echo "primary_pdd=$PRIMARY_PDD"
+            echo "prior_sdds=$PRIOR_SDDS"
+            echo "revision=$REVISION"
+            echo "steer_file=$STEER_FILE"
+            echo "arch_file=$ARCH_FILE"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 1. PDD documents identified"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Branch | \`$BRANCH\` |"
+            echo "| Key | \`$FILE_KEY\` |"
+            echo "| Story key | \`$STORY_KEY\` |"
+            echo "| PDDs found | $PDD_COUNT |"
+            echo "| Current PDD | \`$PRIMARY_PDD\` ($(wc -c < "$PRIMARY_PDD" | tr -d ' ') bytes) |"
+            echo "| Prior SDD(s) | ${PRIOR_SDDS:-none - first design} |"
+            echo "| Run type | $([ "$REVISION" -gt 1 ] && echo 'revision (change request)' || echo 'initial design') |"
+            echo "| Human steer | ${STEER_FILE:-none} |"
+            echo ""
+            echo "PDD corpus, oldest first:"
+            echo ""
+            for f in $PDD_FILES; do echo "- \`$f\`"; done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Branch:      $BRANCH"
+          echo "PDD corpus:  $PDD_FILES"
+          echo "Current PDD: $PRIMARY_PDD"
+          echo "Prior SDDs:  ${PRIOR_SDDS:-none}"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 2. Read PDDs
+  # Stage 1 writes markdown, but a human can drop a Word PDD into docs/ instead -
+  # so the corpus is normalised to markdown here and passed on as an artifact.
+  # Nothing in here is ever committed.
+  # ═══════════════════════════════════════════════════════════════
+  read-pdd:
+    name: Read PDDs
+    needs: identify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.identify.outputs.branch }}
+          fetch-depth: 1
+
+      - name: Normalise the PDD corpus to markdown
+        env:
+          PDD_FILES:   ${{ needs.identify.outputs.pdd_files }}
+          PRIMARY_PDD: ${{ needs.identify.outputs.primary_pdd }}
+          PRIOR_SDDS:  ${{ needs.identify.outputs.prior_sdds }}
+          STEER_FILE:  ${{ needs.identify.outputs.steer_file }}
+          REVISION:    ${{ needs.identify.outputs.revision }}
+          STORY_KEY:   ${{ needs.identify.outputs.story_key }}
+        run: |
+          set -euo pipefail
+          # media/ is created up front even when nothing extracts into it: the
+          # IMAGES count below pipes `find` under `pipefail`, and find on a missing
+          # directory would fail the whole step.
+          mkdir -p "$WORK_DIR/pdd" "$WORK_DIR/prior" "$WORK_DIR/media"
+
+          need_pandoc() {
+            command -v pandoc >/dev/null 2>&1 \
+              || { sudo apt-get update -qq && sudo apt-get install -y -qq pandoc; }
+          }
+
+          # -> prints the normalised path
+          normalise() {
+            local src="$1" dest_dir="$2"
+            local base ext target
+            base=$(basename "$src"); base="${base%.*}"
+            ext=$(echo "${src##*.}" | tr '[:upper:]' '[:lower:]')
+            target="$dest_dir/$base.md"
+            case "$ext" in
+              md|markdown|txt)
+                cp "$src" "$target" ;;
+              docx)
+                need_pandoc
+                pandoc -f docx -t gfm --wrap=none \
+                       --extract-media="$WORK_DIR/media/$base" \
+                       -o "$target" "$src" ;;
+              doc)
+                echo "::error::Legacy binary .doc cannot be converted ($src). Push .docx or markdown."
+                return 1 ;;
+              *)
+                echo "::error::Unsupported PDD format '.$ext' ($src)."
+                return 1 ;;
+            esac
+            printf '%s' "$target"
+          }
+
+          MANIFEST_ROWS=""
+          for f in $PDD_FILES; do
+            OUT=$(normalise "$f" "$WORK_DIR/pdd")
+            BYTES=$(wc -c < "$OUT" | tr -d ' ')
+            # A PDD that extracts to almost nothing means a failed conversion or an
+            # image-only document. Fail here rather than design against nothing.
+            if [ "$BYTES" -lt 500 ]; then
+              echo "::error::$f extracted to only ${BYTES} bytes - not a usable PDD."
+              exit 1
+            fi
+            ROLE="history"
+            [ "$f" = "$PRIMARY_PDD" ] && ROLE="current"
+            SECTIONS=$(grep -c '^## [0-9]' "$OUT" || true)
+            MANIFEST_ROWS="$MANIFEST_ROWS{\"source\":\"$f\",\"markdown\":\"$OUT\",\"role\":\"$ROLE\",\"bytes\":$BYTES,\"pdd_sections\":${SECTIONS:-0}},"
+            echo "$f -> $OUT (${BYTES} bytes, ${SECTIONS:-0} numbered sections, $ROLE)"
+          done
+
+          # Prior SDDs travel along unchanged - the SDD job edits them in place on a
+          # revision run, so it needs to read them as they are on the branch.
+          PRIOR_ROWS=""
+          for f in ${PRIOR_SDDS:-}; do
+            cp "$f" "$WORK_DIR/prior/$(basename "$f")"
+            PRIOR_ROWS="$PRIOR_ROWS\"$f\","
+            echo "prior SDD: $f"
+          done
+
+          STEER_OUT=""
+          if [ -n "${STEER_FILE:-}" ]; then
+            STEER_OUT=$(normalise "$STEER_FILE" "$WORK_DIR")
+            echo "human steer: $STEER_FILE -> $STEER_OUT"
+          fi
+
+          cat > "$WORK_DIR/manifest.json" <<EOF_MANIFEST
+          {
+            "story_key": "$STORY_KEY",
+            "revision": $REVISION,
+            "current_pdd_markdown": "$WORK_DIR/pdd/$(basename "${PRIMARY_PDD%.*}").md",
+            "pdds": [${MANIFEST_ROWS%,}],
+            "prior_sdds": [${PRIOR_ROWS%,}],
+            "steer_markdown": "$STEER_OUT"
+          }
+          EOF_MANIFEST
+          python3 -c "import json,sys; json.load(open('$WORK_DIR/manifest.json'))" \
+            || { echo "::error::manifest.json is not valid JSON"; cat "$WORK_DIR/manifest.json"; exit 1; }
+
+          IMAGES=$(find "$WORK_DIR/media" -type f 2>/dev/null | wc -l | tr -d ' ')
+          {
+            echo "### 2. PDDs read"
+            echo ""
+            echo "${{ needs.identify.outputs.pdd_count }} PDD(s) normalised to markdown, ${IMAGES} image(s) extracted."
+            echo ""
+            echo '```json'
+            cat "$WORK_DIR/manifest.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "--- first 80 lines of the current PDD ---"
+          head -80 "$WORK_DIR/pdd/$(basename "${PRIMARY_PDD%.*}").md"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pdd-corpus
+          path: ${{ env.WORK_DIR }}
+          retention-days: 1
+          if-no-files-found: error
+
+  # ═══════════════════════════════════════════════════════════════
+  # 3. Determine architecture
+  # The decision job. It produces no prose - only architecture-<key>.json, the
+  # machine-readable design contract that job 4 writes the SDD from and the
+  # Development stage routes its build tasks from.
+  # ═══════════════════════════════════════════════════════════════
+  decide-architecture:
+    name: Determine architecture
+    needs: [identify, read-pdd]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.identify.outputs.branch }}
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: pdd-corpus
+          path: ${{ env.WORK_DIR }}
+
+      # Best effort. When it lands, the agent gets the real uipath-planner
+      # Constraint Gate / Level 1 / 1.75 / 2.5 logic and the seven SDD templates.
+      # When it does not, the rules inlined in the prompts below carry the run -
+      # they are the same contract, restated.
+      - name: Install UiPath skills
+        id: skills
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          npm i -g @uipath/cli@latest || { echo "::warning::@uipath/cli install failed"; exit 1; }
+          # --agent codex writes plain folders under .agents/skills/, which needs no
+          # plugin machinery - then they are moved where Claude Code looks for them.
+          uip skills install --agent codex --path "$RUNNER_TEMP/uip-skills" \
+            || { echo "::warning::uip skills install failed"; exit 1; }
+          mkdir -p "$HOME/.claude/skills"
+          cp -R "$RUNNER_TEMP/uip-skills/.agents/skills/." "$HOME/.claude/skills/"
+          echo "Installed skills:"; ls -1 "$HOME/.claude/skills"
+          test -d "$HOME/.claude/skills/uipath-planner" \
+            || { echo "::warning::uipath-planner not among the installed skills"; exit 1; }
+          echo "planner=true" >> "$GITHUB_OUTPUT"
+
+      - name: Run uipath-architect agent
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: ${{ env.AGENT_MODEL }}
+          timeout_minutes: '25'
+          allowed_tools: "Read,Write,Edit,Glob,Grep,Bash,Skill"
+          prompt: |
+            You are uipath-architect, a UiPath solution architect. You read the approved
+            PDD(s) for a process and decide the architecture - which UiPath products,
+            how many projects, how they relate. You do NOT write the SDD in this step and
+            you do NOT write any automation code.
+
+            PDD corpus:      ${{ env.WORK_DIR }}/manifest.json  (read this first)
+            Current PDD:     the manifest entry with "role": "current"
+            Prior SDD(s):    ${{ env.WORK_DIR }}/prior/  (empty on a first design)
+            Human steer:     the manifest "steer_markdown" (empty when none)
+            Story key:       ${{ needs.identify.outputs.story_key }}
+            Branch:          ${{ needs.identify.outputs.branch }}
+            Revision:        ${{ needs.identify.outputs.revision }}
+            OUTPUT (only file you write): ${{ env.WORK_DIR }}/architecture.json
+
+            Dispatch steer:  ${{ inputs.product_steer }}
+            Delivery model:  ${{ inputs.delivery_model }}
+            PINNED product:  ${{ env.FORCED_PRODUCT }}   (empty = you decide)
+            PINNED scope:    ${{ env.FORCED_SCOPE }}     (empty = you decide)
+
+            ## Step 0 - load the planner skill if it is installed
+
+            Run: `ls ~/.claude/skills`
+
+            If `uipath-planner` is there, invoke the Skill tool with skill
+            `uipath-planner` and follow its **Phase D, Phase 1** in AUTONOMOUS mode
+            (never ask a question - there is no human in this run). Its
+            references/product-selection-guide.md is the authority for every decision
+            below: Constraint Gate -> Level 0 -> Level 1 -> Level 1.5 -> Level 1.75 ->
+            Level 2.5 -> Level 3. Skip its Step 2.5 tenant/estate `uip` discovery - this
+            runner is not logged in; record that as an unverified reuse assumption.
+
+            If the skill is NOT installed, apply the rules restated in Step 2 below.
+            Either way the output contract in Step 3 is identical.
+
+            ## Step 0.5 - the pin, when there is one
+
+            If PINNED product above is non-empty, the architecture is ALREADY DECIDED and
+            you do not get to re-open it. Set `primary_product` to exactly that value and
+            `sdd_scope` to exactly PINNED scope. A `decisions[]` row records it with
+            `level: "Level 1"`, `source: "steer"` and a reason naming the pin.
+
+            You still do all the real work - Level 0 suitability, the step->executor map,
+            components, queues, project decomposition, the data contracts - you just do it
+            INSIDE the pinned product instead of choosing one. So with `api-workflows`
+            pinned: the API Workflow is the host, and every step in the PDD becomes either
+            an activity in it, a connector/HTTP call it makes, or an integrated component
+            it invokes. Anything the pinned product genuinely cannot do does NOT become a
+            different primary - it becomes an `integrated_components` row (an RPA process
+            the workflow calls for UI work, an IXP model for extraction, a Coded Function
+            for compute) or, if it truly cannot be served at all, a BLOCKING
+            `sme_review_items` row that names the step and why.
+
+            The job that runs after you FAILS if `primary_product` or `sdd_scope` does not
+            match the pin, so there is no point arguing with it in the file.
+
+            ## Step 1 - read everything
+
+            Read the manifest, then every markdown file it lists. The CURRENT PDD is the
+            one the architecture must satisfy. Older PDDs are change-request history:
+            read them to understand what changed and why, never to re-introduce dropped
+            scope.
+
+            The PDDs use load-bearing markers written by the analysis stage - `[SME REVIEW]`
+            means a business decision nobody has made yet, `[DEFAULT]` means an engineering
+            default was applied. Treat an `[SME REVIEW]` value as unconfirmed: design
+            around it and carry it forward, never silently promote it to fact.
+
+            Read these PDD sections with particular care - they are the architecture input:
+
+            - section 3 Process Overview - volume, handling time, exception rate -> sizing
+            - section 7 Detailed Process Steps -> the step-by-step executor map
+            - section 8 Applications and Systems -> API-vs-UI, so RPA-vs-API Workflow
+            - section 13 Environment and Constraint Signals -> the Constraint Gate input
+              (delivery model, product exclusions, orchestration constraints, attendance)
+            - section 16 Decomposition Signals -> stages, per-item transactions,
+              document understanding, human validation, multiple output channels
+
+            On a revision run, read every prior SDD in ${{ env.WORK_DIR }}/prior/ and its
+            Planner Handoff header. Keep the existing architecture unless the new PDD
+            genuinely breaks it - a change request that adds a field does NOT justify
+            re-platforming. When you do change it, the reason goes in
+            `revision_impact` and must name the PDD sentence that forced it.
+
+            A human steer, when present, OUTRANKS your own analysis: a forced product is
+            forced, an excluded product is blocked for the whole design and never
+            re-offered. Record it as the source of that decision.
+
+            ## Step 2 - decide (the rules, restated)
+
+            **Constraint Gate first.** The delivery model gates everything. `unspecified`
+            gates nothing - assume Automation Cloud and carry an `[SME REVIEW]` saying so.
+            On Automation Suite or standalone, treat the cloud-modern products (Maestro,
+            Coded Apps, IXP, Agents, Solutions) as needing verification before you
+            recommend them, and name the alternative you applied. A user exclusion is a
+            block, identical to a platform block. Never substitute silently.
+
+            **Level 0 - should this be automated at all?** Native capability in the target
+            system, an existing deployed automation that covers steps, a process mid-change,
+            waste that should be redesigned away, missing access, thin economics. Outcome is
+            one of `proceed` / `proceed-with-redesign` / `partial` / `do-not-automate`.
+            If it is genuinely `do-not-automate`, still emit the json with that outcome and
+            a populated `level_0_findings` - do not invent a design to fill the file.
+
+            **Level 1 - the coordination host.** Type every step from PDD section 7 with an
+            executor, then FOLD the map: a capability a host can invoke in-process is an
+            integrated component, not a reason to orchestrate. RPA absorbs IXP extraction,
+            LLM activities, connector and HTTP calls, synchronous child process/agent calls,
+            and ONE in-flight approval (long-running + Action Center). API Workflows absorb
+            connector and nested API calls. After folding:
+
+            - one host left -> that host is the primary, single-product scope
+            - two or more independently deployed peers left, OR a coordination shape no
+              single host can hold (case stages + SLA, formal gateways/events/parallel
+              branches, long-running waits across automations) -> the primary is a Maestro
+              host (Case -> BPMN -> Flow, in that order of specificity) and every peer
+              becomes a Solution project
+
+            Pick the host from the NEED, never from a keyword:
+
+            - judgment or reasoning not expressible as fixed rules, or runtime tool
+              planning -> Agents. "AI" over a rule set is RPA, not an Agent.
+            - one fixed generative step inside a known path -> an LLM activity in the host
+            - fixed document classification / extraction -> IXP as a component
+            - a user-facing screen as the deliverable -> Coded Apps
+            - headless system-to-system, no UI, no bot -> API Workflows
+            - staged lifecycle with SLA / approvals -> Case Management
+            - formal gateways / events / subprocesses, no case -> Maestro BPMN
+            - a plain multi-automation pipeline -> Maestro Flow
+            - one human approval inside ONE process -> long-running RPA + Action Center
+            - headless deterministic compute -> a Coded Function component
+            - UI automation, or machine-local work (Excel, files, on-prem DB, desktop
+              email, terminal/mainframe) -> RPA
+
+            The dominant correct answer is HYBRID: a deterministic primary, an Agent only
+            for the steps that need judgment, HITL gating the risky ones. A fixed process
+            containing judgment steps is a deterministic primary with an Agent component -
+            never an Agent-primary design.
+
+            **Level 1.5 (RPA only)** - Process / Library / Test Automation.
+            **Level 2 (RPA only)** - XAML / Coded C# / Hybrid.
+            **Level 2.5 Part A (RPA only)** - single project, or a Master Project of
+            queue-connected sub-projects (Dispatcher / Performer / Reporting). Per-item
+            transactional volume with a distinct selection step is the signal for the split;
+            a Master Project implies a queue, and every queue needs a name and item schema
+            owner.
+            **Level 3 - capability add-ons**: HITL, Integration Service, an API Workflow as
+            a component, a custom connector when the catalog has none.
+
+            Size the design against the PDD's real numbers. A 40-items-a-day process does
+            not need a Master Project; 4,000 does.
+
+            ## Step 3 - write architecture.json
+
+            Write EXACTLY this shape to ${{ env.WORK_DIR }}/architecture.json. Every key
+            present; use `[]`, `""` or `null` for genuinely-empty values, never omit a key.
+            `sdd_files` drives job 4 and the validator, so its paths and templates must be
+            exact.
+
+            ```json
+            {
+              "story_key": "${{ needs.identify.outputs.story_key }}",
+              "branch": "${{ needs.identify.outputs.branch }}",
+              "revision": ${{ needs.identify.outputs.revision }},
+              "process_name": "PascalCase name from PDD section 2 'Process Full Name'",
+              "process_kebab": "kebab-case of process_name",
+              "delivery_model": "cloud | automation-suite | standalone | unspecified",
+              "level_0_outcome": "proceed | proceed-with-redesign | partial | do-not-automate",
+              "level_0_findings": ["one line per failed suitability gate, [] when proceed"],
+              "need_profile": "one line: the core need and the target KPI",
+              "sdd_scope": "single-product | solution",
+              "primary_product": "rpa-process | rpa-library | rpa-test-automation | maestro-flow | maestro-bpmn | case-management | agents | coded-apps | api-workflows",
+              "blocked_products": [
+                {"product": "", "reason": "platform matrix | user exclusion | steer", "alternative_applied": ""}
+              ],
+              "projects": [
+                {
+                  "name": "e.g. NoPoInvoiceFinder.Performer",
+                  "kebab": "no-po-invoice-finder-performer",
+                  "product": "rpa-process",
+                  "skill": "uipath-rpa",
+                  "role": "primary | dispatcher | performer | reporting | library | component",
+                  "authoring_mode": "xaml | coded | hybrid | n/a",
+                  "framework": "reframework | sequence | n/a",
+                  "sdd_file": "docs/<kebab>-sdd.md or the shared RPA-group file",
+                  "build_order": 1,
+                  "why": "one line tying this project to the PDD"
+                }
+              ],
+              "integrated_components": [
+                {"type": "integration-service | ixp | coded-function | api-workflow | hitl | custom-connector | llm-activity",
+                 "name": "", "host_project": "", "skill": "", "why": ""}
+              ],
+              "queues": [
+                {"name": "", "producer_project": "", "consumer_project": "", "item_schema_summary": "", "why": ""}
+              ],
+              "capability_addons": ["hitl", "integration-service"],
+              "sdd_files": [
+                {"path": "docs/<kebab>-sdd.md",
+                 "template": "rpa-sdd-template.md | flow-sdd-template.md | bpmn-sdd-template.md | case-sdd-template.md | agent-sdd-template.md | coded-app-sdd-template.md | api-workflow-sdd-template.md | solution-overview",
+                 "role": "single-product | solution-root | project",
+                 "project": "project name, or the solution name for solution-root"}
+              ],
+              "tasks_file": "<process_kebab>-tasks.md, or <solution_kebab>-tasks.md for solution scope",
+              "decisions": [
+                {"level": "Constraint Gate | Level 0 | Level 1 | Level 1.5 | Level 2 | Level 2.5 | Level 3",
+                 "picked": "", "reason": "", "source": "pdd | steer | default"}
+              ],
+              "sme_review_items": [
+                {"section": "", "item": "", "question": "", "default_applied": "", "blocking": false}
+              ],
+              "revision_impact": "first design | what the new PDD changed and why the architecture did or did not move"
+            }
+            ```
+
+            Naming and file rules - these are contracts, not preferences:
+
+            - `single-product` scope -> exactly ONE entry in `sdd_files`, role
+              `single-product`, path `docs/<process_kebab>-sdd.md`.
+            - `solution` scope -> exactly ONE entry with role `solution-root`, template
+              `solution-overview`, path `docs/<process_kebab>-solution-sdd.md`, PLUS one
+              `project` entry per buildable project.
+            - An RPA Master Project's sub-projects SHARE one RPA SDD file - do not emit one
+              per sub-project.
+            - Component rows (Coded Function, IXP model, custom connector) get NO SDD file.
+              They live in `integrated_components` and in the host SDD's tables.
+            - `decisions` must contain a Constraint Gate row even when nothing is blocked.
+            - Every project needs a `build_order`; components come before their consumers.
+
+            ## Step 4 - self-check
+
+            ```
+            python3 -c "import json;d=json.load(open('${{ env.WORK_DIR }}/architecture.json'));\
+            print(d['sdd_scope'],d['primary_product'],len(d['projects']),len(d['sdd_files']))"
+            ```
+
+            It must print without error, and: a `solution` scope must have exactly one
+            `solution-root` in `sdd_files`; a `single-product` scope exactly one file and no
+            `solution-root`. Fix and re-run until it holds.
+
+            Do NOT modify anything under ${{ env.WORK_DIR }} other than architecture.json.
+            Do NOT write the SDD - that is the next job. Do NOT run git, gh, or `uip login`.
+
+      - name: Verify architecture decision
+        id: arch
+        run: |
+          set -euo pipefail
+          A="$WORK_DIR/architecture.json"
+          [ -f "$A" ] || { echo "::error::$A was not written."; exit 1; }
+
+          python3 - "$A" "${FORCED_PRODUCT:-}" "${FORCED_SCOPE:-}" <<'EOF_CHECK'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          forced_product = sys.argv[2] if len(sys.argv) > 2 else ""
+          forced_scope   = sys.argv[3] if len(sys.argv) > 3 else ""
+
+          # The pin is a gate, not a suggestion: a demo must not depend on the agent
+          # having agreed with it.
+          if forced_product and d.get("primary_product") != forced_product:
+              sys.exit(f"::error::architecture is pinned to primary_product "
+                       f"'{forced_product}' but the agent returned "
+                       f"'{d.get('primary_product')}'. Clear FORCED_PRODUCT to allow a free choice.")
+          if forced_scope and d.get("sdd_scope") != forced_scope:
+              sys.exit(f"::error::architecture is pinned to sdd_scope '{forced_scope}' "
+                       f"but the agent returned '{d.get('sdd_scope')}'. "
+                       f"Clear FORCED_SCOPE to allow a free choice.")
+          if forced_product:
+              print(f"pin honoured: {forced_product} / {forced_scope or 'any scope'}")
+          req = ["story_key","branch","revision","process_name","process_kebab",
+                 "delivery_model","level_0_outcome","level_0_findings","need_profile",
+                 "sdd_scope","primary_product","blocked_products","projects",
+                 "integrated_components","queues","capability_addons","sdd_files",
+                 "tasks_file","decisions","sme_review_items","revision_impact"]
+          missing = [k for k in req if k not in d]
+          if missing:
+              sys.exit("::error::architecture.json is missing keys: " + ", ".join(missing))
+
+          scope = d["sdd_scope"]
+          roots = [f for f in d["sdd_files"] if f.get("role") == "solution-root"]
+          if scope == "single-product":
+              if len(d["sdd_files"]) != 1 or roots:
+                  sys.exit("::error::single-product scope must declare exactly one sdd_file and no solution-root.")
+          elif scope == "solution":
+              if len(roots) != 1:
+                  sys.exit(f"::error::solution scope must declare exactly one solution-root, found {len(roots)}.")
+              if len(d["sdd_files"]) < 2:
+                  sys.exit("::error::solution scope needs the root plus at least one project SDD.")
+          else:
+              sys.exit(f"::error::sdd_scope must be single-product or solution, got '{scope}'.")
+
+          if d["level_0_outcome"] == "do-not-automate" and not d["level_0_findings"]:
+              sys.exit("::error::level_0_outcome is do-not-automate with no findings recorded.")
+          if not any(x.get("level") == "Constraint Gate" for x in d["decisions"]):
+              sys.exit("::error::decisions[] has no Constraint Gate row.")
+          if not d["projects"]:
+              sys.exit("::error::projects[] is empty - no buildable project was decided.")
+          for f in d["sdd_files"]:
+              if not f.get("path","").startswith("docs/") or not f["path"].endswith(".md"):
+                  sys.exit(f"::error::sdd_files path must be docs/*.md, got '{f.get('path')}'.")
+
+          # A pinned product with the wrong template would write the wrong section set.
+          TEMPLATE_FOR = {
+              "rpa-process": "rpa-sdd-template.md", "rpa-library": "rpa-sdd-template.md",
+              "rpa-test-automation": "rpa-sdd-template.md",
+              "maestro-flow": "flow-sdd-template.md", "maestro-bpmn": "bpmn-sdd-template.md",
+              "case-management": "case-sdd-template.md", "agents": "agent-sdd-template.md",
+              "coded-apps": "coded-app-sdd-template.md",
+              "api-workflows": "api-workflow-sdd-template.md",
+          }
+          if scope == "single-product":
+              want = TEMPLATE_FOR.get(d["primary_product"])
+              got = d["sdd_files"][0].get("template")
+              if want and got != want:
+                  sys.exit(f"::error::primary_product '{d['primary_product']}' needs template "
+                           f"'{want}' but sdd_files declares '{got}'.")
+          print("architecture.json is well formed.")
+          EOF_CHECK
+
+          echo "scope=$(python3 -c "import json;print(json.load(open('$A'))['sdd_scope'])")" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 3. Architecture determined"
+            echo ""
+            python3 - "$A" <<'EOF_SUMMARY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          print(f"**{d['process_name']}** - scope `{d['sdd_scope']}`, primary `{d['primary_product']}`, "
+                f"delivery `{d['delivery_model']}`, suitability `{d['level_0_outcome']}`")
+          print()
+          print(f"> {d['need_profile']}")
+          print()
+          print("| # | Project | Product | Role | Skill | SDD |")
+          print("| --- | --- | --- | --- | --- | --- |")
+          for p in sorted(d["projects"], key=lambda x: x.get("build_order", 99)):
+              print(f"| {p.get('build_order','')} | `{p['name']}` | {p['product']} | {p.get('role','')} "
+                    f"| `{p.get('skill','')}` | `{p.get('sdd_file','')}` |")
+          if d["blocked_products"]:
+              print()
+              print("**Blocked:** " + ", ".join(
+                  f"{b['product']} -> {b.get('alternative_applied') or 'no alternative'} ({b.get('reason')})"
+                  for b in d["blocked_products"]))
+          if d["queues"]:
+              print()
+              print("**Queues:** " + ", ".join(f"`{q['name']}`" for q in d["queues"]))
+          print()
+          print("| Level | Picked | Why | Source |")
+          print("| --- | --- | --- | --- |")
+          for x in d["decisions"]:
+              print(f"| {x.get('level','')} | {x.get('picked','')} | {x.get('reason','')} | {x.get('source','')} |")
+          if d["sme_review_items"]:
+              print()
+              print("**Open SME review items:** %d (%d blocking)" % (
+                  len(d["sme_review_items"]),
+                  sum(1 for i in d["sme_review_items"] if i.get("blocking"))))
+          EOF_SUMMARY
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "--- architecture.json ---"
+          cat "$A"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: architecture
+          path: ${{ env.WORK_DIR }}
+          retention-days: 1
+          if-no-files-found: error
+
+  # ═══════════════════════════════════════════════════════════════
+  # 4. Generate SDD
+  # Writes the document(s) architecture.json declared, validates, repairs once,
+  # then hard-gates. A half-empty SDD must never reach a reviewer - the
+  # Development stage builds straight off this file.
+  # ═══════════════════════════════════════════════════════════════
+  generate-sdd:
+    name: Generate SDD
+    needs: [identify, decide-architecture]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.identify.outputs.branch }}
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: architecture
+          path: ${{ env.WORK_DIR }}
+
+      - name: Install UiPath skills
+        id: skills
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          npm i -g @uipath/cli@latest || { echo "::warning::@uipath/cli install failed"; exit 1; }
+          uip skills install --agent codex --path "$RUNNER_TEMP/uip-skills" \
+            || { echo "::warning::uip skills install failed"; exit 1; }
+          mkdir -p "$HOME/.claude/skills"
+          cp -R "$RUNNER_TEMP/uip-skills/.agents/skills/." "$HOME/.claude/skills/"
+          echo "Installed skills:"; ls -1 "$HOME/.claude/skills"
+          test -d "$HOME/.claude/skills/uipath-planner" \
+            || { echo "::warning::uipath-planner not among the installed skills"; exit 1; }
+
+      - name: Run uipath-architect agent
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: ${{ env.AGENT_MODEL }}
+          timeout_minutes: '40'
+          allowed_tools: "Read,Write,Edit,Glob,Grep,Bash,Skill"
+          prompt: |
+            You are uipath-architect. The architecture is already decided. Your only job now
+            is to write the Solution Design Document(s) it declared - complete enough that a
+            developer opens one and starts building without asking a question.
+
+            ARCHITECTURE (the contract): ${{ env.WORK_DIR }}/architecture.json
+            PDD corpus:                 ${{ env.WORK_DIR }}/manifest.json
+            Prior SDD(s):               ${{ env.WORK_DIR }}/prior/  (empty on a first design)
+            Story key:                  ${{ needs.identify.outputs.story_key }}
+            Revision:                   ${{ needs.identify.outputs.revision }}
+            Today:                      run `date +%F` - use that as the generation date.
+
+            ## Step 0 - load the planner skill if it is installed
+
+            Run `ls ~/.claude/skills`. If `uipath-planner` is there, invoke the Skill tool
+            with skill `uipath-planner`, then for every file in `sdd_files` LOCATE the
+            template it names by searching for it - the package nests some templates one
+            level deeper than others, so search rather than assume a flat path:
+
+                find ~/.claude/skills/uipath-planner/assets/templates -name '<template-name>'
+
+            READ the template you find and follow it exactly - its headings, its tables, its
+            placeholder semantics. The template is the authority. Your generated H2/H3
+            heading set MUST be a SUPERSET of the template's: a missing template heading is a
+            defect you fix, never an `[SME REVIEW]` line.
+
+            Follow Phase D **Phase 3** in AUTONOMOUS mode. Never ask a question.
+
+            If the skill is NOT installed, use the section lists in Step 2 below.
+
+            ## Step 1 - read everything
+
+            Read architecture.json in full. It decides scope, products, projects, queues,
+            components, file paths and templates - do NOT re-open those decisions. If you
+            believe a decision is wrong, write the SDD as decided and add your objection as
+            an `[SME REVIEW]` row in the Action Required table.
+
+            Read every PDD in the manifest. The document you write must account for ALL of
+            the current PDD's content: every step in its section 7, every `BR-xx` in its
+            section 9, every business exception, every system error, every field in its
+            section 12, every concrete value in its section 15. A PDD business rule that
+            appears nowhere in the SDD is a hole in the design.
+
+            On a revision run, read every prior SDD and UPDATE it in place rather than
+            replacing it: keep section structure and reviewed content, change what the new
+            PDD changed, and add a Document History row (version +0.1, or +1.0 when the
+            architecture moved) whose comment names the change request.
+
+            ## Step 2 - write the SDD(s)
+
+            Write each `sdd_files[].path`. Nothing else. Universal front matter, in this
+            order, for EVERY file - the handoff block must stay inside the first 50 lines
+            because that is all the downstream planner reads to detect it:
+
+                # Solution Design Document — <process or project name>
+
+                ## Document History
+
+                | Date | Version | Author | Role | Comments |
+                (one row per revision, newest last)
+
+                <!-- DO NOT RENAME: uipath-planner detects SDDs via this exact heading or the marker below. -->
+                <!-- planner-handoff:v1 -->
+                ## Planner Handoff
+
+                | Field | Value |
+                |---|---|
+                | **Status** | ready |
+                | **Execution autonomy** | autonomous |
+                | **Delivery model** | <from architecture.json> |
+                | **SDD scope** | <single-product | solution> |
+                | **Project list section** | <the section number holding the project list> |
+                | **Tasks file** | `<tasks_file from architecture.json>` |
+                | **Generated by** | uipath-planner |
+                | **Generation date** | <YYYY-MM-DD> |
+                | **Template validation** | passed |
+
+                ## Decisions Made
+                (the decisions[] table from architecture.json - this run had no human
+                 checkpoint, so the record of what was picked and why is mandatory)
+
+                ## Recommended Scope
+                (Recommendation / Delivery model / Blocked by platform / Need profile)
+
+                ## Action Required — SME Review Items
+                (only when sme_review_items is non-empty)
+
+                ## Table of Contents
+
+            For a `solution-root` file add these handoff rows too: `Solution root SDD` (its
+            own filename), `Solution ID`, `Project SDD role: root`. Every `project` file
+            carries `Solution root SDD` pointing at the root, the SAME `Solution ID`, the
+            SAME `Tasks file`, `Project SDD role: child` and
+            `Independently executable | no — Lane A derives tasks only via the Solution root`.
+
+            Then the numbered body sections. Use `## <n>. <Name>` exactly, numbered from 1,
+            contiguous, in this order, every one present with real content:
+
+            **solution-overview**
+            1. Solution Overview · 2. Project Inventory · 3. Cross-Project Data Flow ·
+            4. Shared Assets & Queues · 5. Per-Project SDD Index · 6. Next Steps
+
+            **rpa-sdd-template.md**
+            1. Process Overview · 2. Process Map · 3. Detailed Process Steps ·
+            4. Business Rules · 5. Data Definitions · 6. Value Mappings ·
+            7. Exception Handling · 8. Error Handling · 9. Application Inventory ·
+            10. Master Project Architecture · 11. Project Structure · 12. Queue Architecture ·
+            13. Implementation Mode · 14. Packages · 15. Credentials & Assets ·
+            16. Deployment Environment · 17. Testing Strategy · 18. Next Steps
+
+            **flow-sdd-template.md**
+            1. Flow Overview · 2. Flow Diagram · 3. Nodes Inventory · 4. Variables ·
+            5. Subflows · 6. Triggers · 7. Integrated Components · 8. Error Handling ·
+            9. Project Structure · 10. Testing Strategy · 11. Next Steps
+
+            **bpmn-sdd-template.md**
+            1. Process Overview · 2. Process Diagram · 3. Pools & Lanes ·
+            4. Activities Inventory · 5. Gateways & Sequence Flows · 6. Events ·
+            7. Data Objects & Variables · 8. Subprocesses & Call Activities ·
+            9. Integrated Components · 10. Error Handling & Retry · 11. Triggers ·
+            12. Project Structure · 13. Testing Strategy · 14. Next Steps
+
+            **case-sdd-template.md**
+            1. Case Overview · 2. Case Lifecycle Diagram · 3. Stages · 4. Tasks Grid ·
+            5. Entry / Exit Conditions · 6. Business Rules · 7. Data Definitions ·
+            8. SLA Rules · 9. Escalations · 10. Exception Handling ·
+            11. Compliance Constraints · 12. Roles & RACI Matrix · 13. Task Type Registry ·
+            14. Integrated Components · 15. Project Structure · 16. Testing Strategy ·
+            17. Next Steps
+
+            **agent-sdd-template.md**
+            1. Agent Overview · 2. Agent Framework · 3. Tools · 4. Memory / RAG ·
+            5. Evaluation Criteria · 6. Orchestrator Bindings ·
+            7. Error Handling & Escalation · 8. Integrated Components ·
+            9. Project Structure · 10. Testing Strategy · 11. Next Steps
+
+            **coded-app-sdd-template.md**
+            1. App Overview · 2. App Type & Tech Stack · 3. Pages & Routes · 4. Components ·
+            5. State Management · 6. API Integration · 7. User Flows · 8. Error Handling ·
+            9. Integrated Components · 10. Project Structure · 11. Testing Strategy ·
+            12. Next Steps
+
+            **api-workflow-sdd-template.md**
+            1. API Workflow Overview · 2. Input Schema · 3. Output Schema ·
+            4. Execution Flow · 5. Connectors & External Calls · 6. Error Handling ·
+            7. Performance & Scaling · 8. Security & Authentication · 9. Consumers ·
+            10. Project Structure · 11. Testing Strategy · 12. Next Steps
+
+            ## What "ready for development" means
+
+            This is the difference between a document and a design. Every one of these:
+
+            - **Traceability.** Every `BR-xx` from the current PDD appears in the SDD's
+              business-rules table with the step or component that enforces it. Every
+              business exception and system error from the PDD maps to a handler. Every
+              field in the PDD's data definitions appears in the SDD's schema.
+            - **Steps typed to executors.** Each process step says which project, workflow
+              or node performs it, and which application it touches. A developer must never
+              have to guess where a step lives.
+            - **Concrete schemas.** Queue item schemas, input/output arguments, entity or
+              data-object shapes, config keys - written out with names and types, not
+              described in prose.
+            - **Named resources.** Assets, credentials, queues, storage buckets, connections
+              with the exact names to create in Orchestrator, and who owns each value.
+              Names follow the process name; never invent a credential value.
+            - **Project structure.** The folder/file layout, the workflow inventory with one
+              line of purpose each, and the dependency direction between them.
+            - **Packages.** The dependency list per project, and Integration Service versus
+              NuGet where both could serve.
+            - **Testing Strategy is mandatory and thorough** - happy path assertions, edge
+              cases, every business exception, every system error, non-functional checks,
+              UAT acceptance criteria, and an end-to-end test when more than one project is
+              involved. Never offer "happy path only".
+            - **Environments.** DEV / UAT / PROD differences, robot attendance and why,
+              concurrency, and the runtime prerequisites.
+
+            ## Hard rules
+
+            - **Architecture only - NO task list.** No `## Implementation Plan`, no
+              `### Task 1`, no `TaskCreate`. Task derivation is the Development stage's job.
+              Each file ENDS with its `Next Steps` section, which points at the skills that
+              will build it (from `projects[].skill`) and, for a Solution, at
+              `uipath-solution` for `uip solution init` -> `project add` -> `resources refresh`
+              -> `pack`.
+            - **No automation code.** No XAML, C#, Python, JSON project files, no scaffolding.
+              Markdown only.
+            - **Do not mirror the PDD.** The SDD reorganises the content for implementation.
+              Copying the PDD's section order is the most common failure here.
+            - **Never invent** a business rule, threshold, volume, system, URL, person,
+              selector or credential value. A gap is `[DEFAULT]` (a standard engineering
+              default you applied - retries, timeouts, logging) or `[SME REVIEW]` (business
+              knowledge only a human has). Both markers stay in the document and every
+              `[SME REVIEW]` also gets a row in the Action Required table.
+            - **No selectors.** They need the live application; the RPA specialist writes
+              them at development time. Describe the UI element, not its selector.
+            - **Real content only.** No `<PLACEHOLDER>`, no `TBD`, no `TODO`, no empty table
+              bodies, no template comment blocks left behind. Angle-bracket tokens copied
+              from a template are a validation failure.
+            - Tables are valid GitHub markdown with a header separator row. No HTML. Do not
+              wrap a document in a code fence.
+            - Write ONLY the paths in `sdd_files`. Do NOT touch anything under
+              ${{ env.WORK_DIR }}. Do NOT run git, gh, or `uip login`.
+
+            ## Step 3 - self-check before you finish
+
+            ```
+            bash .github/scripts/validate-sdd.sh ${{ env.WORK_DIR }}/architecture.json \
+              $(python3 -c "import json;print(' '.join(p['markdown'] for p in json.load(open('${{ env.WORK_DIR }}/manifest.json'))['pdds'] if p['role']=='current'))")
+            ```
+
+            Fix everything it reports and re-run until it exits 0.
+
+      - name: Validate SDD
+        id: check
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          PDDS=$(python3 -c "import json;print(' '.join(p['markdown'] for p in json.load(open('$WORK_DIR/manifest.json'))['pdds'] if p['role']=='current'))")
+          bash .github/scripts/validate-sdd.sh "$WORK_DIR/architecture.json" $PDDS
+
+      - name: Repair SDD
+        if: steps.check.outcome == 'failure'
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: ${{ env.AGENT_MODEL }}
+          timeout_minutes: '30'
+          allowed_tools: "Read,Write,Edit,Glob,Grep,Bash,Skill"
+          prompt: |
+            The SDD(s) declared in ${{ env.WORK_DIR }}/architecture.json failed validation.
+
+            Run the validator to see exactly what is wrong:
+
+                PDDS=$(python3 -c "import json;print(' '.join(p['markdown'] for p in json.load(open('${{ env.WORK_DIR }}/manifest.json'))['pdds'] if p['role']=='current'))")
+                bash .github/scripts/validate-sdd.sh ${{ env.WORK_DIR }}/architecture.json $PDDS
+
+            Then read architecture.json and the current PDD from the manifest, and fix the
+            SDD(s) until the validator exits 0. Common causes: a missing numbered section,
+            angle-bracket placeholders copied from the template, an empty table, a
+            `Status: draft` handoff, a PDD business rule with no home in the design, or a
+            task list that does not belong in an SDD. If a declared file is missing
+            entirely, write it from scratch.
+
+            Do not change architecture.json. Do not modify anything else under
+            ${{ env.WORK_DIR }}. Do not run git or gh.
+
+      - name: Verify SDD
+        id: verify
+        run: |
+          set -euo pipefail
+          PDDS=$(python3 -c "import json;print(' '.join(p['markdown'] for p in json.load(open('$WORK_DIR/manifest.json'))['pdds'] if p['role']=='current'))")
+          bash .github/scripts/validate-sdd.sh "$WORK_DIR/architecture.json" $PDDS
+
+          SDD_FILES=$(python3 -c "import json;print(' '.join(f['path'] for f in json.load(open('$WORK_DIR/architecture.json'))['sdd_files']))")
+          echo "sdd_files=$SDD_FILES" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 4. SDD generated"
+            echo ""
+            echo "| File | Bytes | Sections |"
+            echo "| --- | --- | --- |"
+            for f in $SDD_FILES; do
+              echo "| \`$f\` | $(wc -c < "$f" | tr -d ' ') | $(grep -c '^## [0-9]' "$f") |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Pushing with GITHUB_TOKEN does not re-trigger this workflow, so there is no
+      # loop. architecture.json is committed alongside the SDD: the Development
+      # stage routes its build tasks off it.
+      - name: Commit SDD
+        env:
+          SDD_FILES: ${{ steps.verify.outputs.sdd_files }}
+          ARCH_FILE: ${{ needs.identify.outputs.arch_file }}
+          STORY_KEY: ${{ needs.identify.outputs.story_key }}
+          BRANCH:    ${{ needs.identify.outputs.branch }}
+          SOURCE:    ${{ needs.identify.outputs.primary_pdd }}
+          REVISION:  ${{ needs.identify.outputs.revision }}
+        run: |
+          set -euo pipefail
+          git config user.name  "uipath-architect[bot]"
+          git config user.email "uipath-architect[bot]@users.noreply.github.com"
+
+          cp "$WORK_DIR/architecture.json" "$ARCH_FILE"
+          git add $SDD_FILES "$ARCH_FILE"
+
+          if git diff --cached --quiet; then
+            echo "No change to commit - SDD is already up to date."
+          else
+            VERB=$([ "$REVISION" -gt 1 ] && echo "update" || echo "add")
+            git commit -m "docs: $VERB SDD for $STORY_KEY" \
+                       -m "Generated by uipath-architect from $SOURCE."
+            git push origin "HEAD:$BRANCH"
+          fi
+
+  # ═══════════════════════════════════════════════════════════════
+  # 5. Open PR
+  # This is the Maestro resume signal. No auto-merge.
+  # ═══════════════════════════════════════════════════════════════
+  open-pr:
+    name: Open PR
+    needs: [identify, generate-sdd]
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+      pr_url:    ${{ steps.pr.outputs.pr_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.identify.outputs.branch }}
+          fetch-depth: 1
+
+      - name: Open PR into develop
+        id: pr
+        env:
+          # PR_AUTHOR_PAT so the PR can trigger downstream pull_request workflows;
+          # GITHUB_TOKEN is enough for Maestro's polling trigger.
+          GH_TOKEN:   ${{ secrets.PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          REPO:       ${{ github.repository }}
+          BRANCH:     ${{ needs.identify.outputs.branch }}
+          STORY_KEY:  ${{ needs.identify.outputs.story_key }}
+          ARCH_FILE:  ${{ needs.identify.outputs.arch_file }}
+          SOURCE:     ${{ needs.identify.outputs.primary_pdd }}
+          REVISION:   ${{ needs.identify.outputs.revision }}
+        run: |
+          set -euo pipefail
+
+          BLOB="${{ github.server_url }}/$REPO/blob/$BRANCH"
+
+          if [ -f "$ARCH_FILE" ]; then
+            PROCESS=$(python3 -c "import json;print(json.load(open('$ARCH_FILE'))['process_name'])")
+            SCOPE=$(python3   -c "import json;print(json.load(open('$ARCH_FILE'))['sdd_scope'])")
+            PRIMARY=$(python3 -c "import json;print(json.load(open('$ARCH_FILE'))['primary_product'])")
+          else
+            PROCESS="$STORY_KEY"; SCOPE="unknown"; PRIMARY="unknown"
+          fi
+          TITLE_LINE="SDD for $PROCESS ($SCOPE / $PRIMARY)"
+          [ "$REVISION" -gt 1 ] && TITLE_LINE="SDD update for $PROCESS ($SCOPE / $PRIMARY)"
+
+          EXISTING=$(gh pr list --repo "$REPO" --head "$BRANCH" --base "$BASE_BRANCH" \
+                       --state open --json number --jq '.[0].number' || echo "")
+
+          cat > /tmp/pr-body.md <<'EOF_BODY'
+          ## Solution Design Document for review
+
+          The architect agent read the approved PDD(s) on `develop`, decided the
+          architecture, and wrote the design. Merging this PR approves the SDD and releases
+          the case into development.
+
+          **Review checklist**
+          - [ ] The architecture is right — product, scope and project split match the process
+          - [ ] Every PDD business rule has a home in the design
+          - [ ] Queue / data schemas are concrete enough to build from
+          - [ ] Named Orchestrator resources (assets, credentials, queues) are correct
+          - [ ] Testing Strategy covers every business exception and system error
+          - [ ] Every `[SME REVIEW]` item in *Action Required* is answered or accepted
+          EOF_BODY
+
+          {
+            echo ""
+            if [ -f "$ARCH_FILE" ]; then
+              python3 - "$ARCH_FILE" <<'EOF_PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          print("### Architecture decided")
+          print()
+          print(f"> {d['need_profile']}")
+          print()
+          print("| | |")
+          print("| --- | --- |")
+          print(f"| Scope | `{d['sdd_scope']}` |")
+          print(f"| Primary product | `{d['primary_product']}` |")
+          print(f"| Delivery model | `{d['delivery_model']}` |")
+          print(f"| Suitability | `{d['level_0_outcome']}` |")
+          print(f"| Revision | {d['revision']} — {d['revision_impact']} |")
+          print()
+          print("| # | Project | Product | Build skill |")
+          print("| --- | --- | --- | --- |")
+          for p in sorted(d["projects"], key=lambda x: x.get("build_order", 99)):
+              print(f"| {p.get('build_order','')} | `{p['name']}` | {p['product']} | `{p.get('skill','')}` |")
+          if d["blocked_products"]:
+              print()
+              print("**Blocked by the Constraint Gate:** " + ", ".join(
+                  f"{b['product']} → {b.get('alternative_applied') or 'no alternative'}"
+                  for b in d["blocked_products"]))
+          if d["sme_review_items"]:
+              blocking = sum(1 for i in d["sme_review_items"] if i.get("blocking"))
+              print()
+              print(f"**Open SME review items:** {len(d['sme_review_items'])} ({blocking} blocking)")
+          print()
+          print("### Documents")
+          print()
+          for f in d["sdd_files"]:
+              print(f"- [`{f['path']}`](BLOB_URL/{f['path']}) — {f.get('role','')} · {f.get('template','')}")
+          EOF_PY
+            fi
+            echo ""
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Story | \`$STORY_KEY\` |"
+            echo "| Architecture | [\`$ARCH_FILE\`]($BLOB/$ARCH_FILE) |"
+            echo "| Source PDD | [\`$SOURCE\`]($BLOB/$SOURCE) |"
+            echo ""
+            echo "<sub>Generated by \`uipath-sdd\` - run [${{ github.run_id }}](${{ github.server_url }}/$REPO/actions/runs/${{ github.run_id }})</sub>"
+          } | sed "s|BLOB_URL|$BLOB|g" >> /tmp/pr-body.md
+
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            echo "PR #$EXISTING already open for $BRANCH - updating it."
+            gh pr edit "$EXISTING" --repo "$REPO" \
+              --title "docs: $TITLE_LINE" --body-file /tmp/pr-body.md
+            PR_NUMBER="$EXISTING"
+          else
+            gh pr create --repo "$REPO" \
+              --base "$BASE_BRANCH" \
+              --head "$BRANCH" \
+              --title "docs: $TITLE_LINE" \
+              --body-file /tmp/pr-body.md
+            PR_NUMBER=$(gh pr list --repo "$REPO" --head "$BRANCH" --base "$BASE_BRANCH" \
+                          --state open --json number --jq '.[0].number')
+          fi
+
+          # Maestro is blocked on this event, so a silent failure stalls the whole
+          # case - fail loudly instead.
+          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
+            echo "::error::PR from $BRANCH into $BASE_BRANCH was not created. Maestro will not resume."
+            exit 1
+          fi
+
+          PR_URL=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json url --jq .url)
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$PR_URL"       >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 5. PR opened"
+            echo ""
+            echo "[#$PR_NUMBER - docs: $TITLE_LINE]($PR_URL) into \`$BASE_BRANCH\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Opened/updated PR #$PR_NUMBER -> $PR_URL"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 6. Merge
+  # No human gate on the SDD - see the note in the header.
+  # ═══════════════════════════════════════════════════════════════
+  merge:
+    name: Merge
+    needs: [identify, open-pr]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge the SDD PR into develop
+        env:
+          GH_TOKEN:  ${{ secrets.PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          REPO:      ${{ github.repository }}
+          PR_NUMBER: ${{ needs.open-pr.outputs.pr_number }}
+          PR_URL:    ${{ needs.open-pr.outputs.pr_url }}
+        run: |
+          set -euo pipefail
+          # Assign first, so the merged PR still shows who owns the design.
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-assignee "$ASSIGNEE" || true
+
+          # Immediate merge first. --auto only works when the repo has auto-merge
+          # enabled and the branch has required checks, so it is the fallback.
+          if gh pr merge "$PR_NUMBER" --repo "$REPO" --merge; then
+            echo "Merged PR #$PR_NUMBER into $BASE_BRANCH."
+            RESULT="merged automatically"
+          elif gh pr merge "$PR_NUMBER" --repo "$REPO" --merge --auto; then
+            echo "::notice::Immediate merge refused; auto-merge queued on PR #$PR_NUMBER."
+            RESULT="auto-merge queued"
+          else
+            echo "::error::Could not merge PR #$PR_NUMBER. Check branch protection and token permissions."
+            exit 1
+          fi
+
+          {
+            echo "### 6. SDD merged"
+            echo ""
+            echo "[#$PR_NUMBER]($PR_URL) into \`$BASE_BRANCH\` - $RESULT."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,583 @@
+name: uipath-pdd
+
+# Stage 1 of the ADLC chain, as five visible jobs:
+#
+#   Identify request document -> Read request -> Generate PDD -> Open PR -> Assign PR
+#
+# Maestro creates branch  analysis-<key>  from develop and pushes
+# docs/<key>-request-details.docx into it (the key is the branch name minus the
+# "analysis-" prefix, e.g. analysis-jactiv-557 -> jactiv-557). The docs folder can
+# hold request details for several stories at once, so every job resolves the file
+# by the branch's own key - never "whatever request-details file is lying around".
+#
+# The PR into develop is the Maestro resume signal: the case waits on
+# PULL_CREATED_IN_REPO filtered by head.ref == analysis-* && base.ref == develop.
+# Do NOT auto-merge - the merge of that PR is the separate "PDD approved" signal.
+
+on:
+  push:
+    branches:
+      - 'analysis**'
+    # A trigger path cannot reference the branch, so it stays a broad glob and the
+    # Identify job narrows it to <key>-request-details* for this branch.
+    paths:
+      - 'docs/*request-details*'
+  # Manual re-run: pick the analysis branch in the UI, nothing to fill in.
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  DOCS_DIR: docs
+  BASE_BRANCH: develop
+  ASSIGNEE: irina-capatina-uipath
+  AGENT_MODEL: claude-sonnet-4-6
+  MIN_PDD_BYTES: '4000'
+  # Where the extracted request markdown lives inside the workspace. Never
+  # committed - only the PDD is staged. Must NOT start with a dot:
+  # actions/upload-artifact@v4 silently skips hidden files.
+  WORK_DIR: request-work
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: pdd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  # ═══════════════════════════════════════════════════════════════
+  # 1. Identify request document
+  # ═══════════════════════════════════════════════════════════════
+  identify:
+    name: Identify request document
+    runs-on: ubuntu-latest
+    outputs:
+      branch:       ${{ steps.resolve.outputs.branch }}
+      file_key:     ${{ steps.resolve.outputs.file_key }}
+      story_key:    ${{ steps.resolve.outputs.story_key }}
+      request_file: ${{ steps.resolve.outputs.request_file }}
+      pdd_file:     ${{ steps.resolve.outputs.pdd_file }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 1
+
+      - name: Resolve request document for this branch
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          BRANCH="${GITHUB_REF#refs/heads/}"
+
+          # Same rule Maestro uses to name the file: everything after the first
+          # dash. analysis-jactiv-557 -> jactiv-557
+          FILE_KEY="${BRANCH#*-}"
+          if [ -z "$FILE_KEY" ] || [ "$FILE_KEY" = "$BRANCH" ]; then
+            echo "::error::Branch '$BRANCH' has no key after an 'analysis-' prefix."
+            exit 1
+          fi
+
+          # Branches are lowercase; Jira keys are uppercase.
+          STORY_KEY=$(echo "$FILE_KEY" | tr '[:lower:]' '[:upper:]')
+
+          # Resolve strictly by this branch's key, so request details belonging to
+          # another story or CR sitting in docs/ can never be picked up.
+          MATCHES=$(ls -1 "$DOCS_DIR/$FILE_KEY"-request-details* 2>/dev/null || true)
+          COUNT=$(printf '%s' "$MATCHES" | grep -c . || true)
+          if [ "${COUNT:-0}" -eq 0 ]; then
+            echo "::error::No $DOCS_DIR/$FILE_KEY-request-details* found on branch $BRANCH."
+            echo "Files in $DOCS_DIR:"
+            ls -1 "$DOCS_DIR" 2>/dev/null || echo "  (no $DOCS_DIR folder)"
+            exit 1
+          fi
+          if [ "$COUNT" -gt 1 ]; then
+            echo "::warning::$COUNT files match $FILE_KEY-request-details*; using the first."
+            echo "$MATCHES"
+          fi
+          REQUEST_FILE=$(printf '%s\n' "$MATCHES" | head -1)
+
+          PDD_FILE="$DOCS_DIR/pdd-$FILE_KEY.md"
+
+          {
+            echo "branch=$BRANCH"
+            echo "file_key=$FILE_KEY"
+            echo "story_key=$STORY_KEY"
+            echo "request_file=$REQUEST_FILE"
+            echo "pdd_file=$PDD_FILE"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 1. Request document identified"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Branch | \`$BRANCH\` |"
+            echo "| Key | \`$FILE_KEY\` |"
+            echo "| Story key | \`$STORY_KEY\` |"
+            echo "| Request document | \`$REQUEST_FILE\` ($(wc -c < "$REQUEST_FILE" | tr -d ' ') bytes) |"
+            echo "| PDD to write | \`$PDD_FILE\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Branch:           $BRANCH"
+          echo "Key:              $FILE_KEY"
+          echo "Request document: $REQUEST_FILE"
+          echo "PDD to write:     $PDD_FILE"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 2. Read request
+  # Maestro pushes the SME's document exactly as it came off the Jira epic - a
+  # .docx - so convert it to markdown here. The result is passed to the next job
+  # as an artifact and never committed.
+  # ═══════════════════════════════════════════════════════════════
+  read-request:
+    name: Read request
+    needs: identify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.identify.outputs.branch }}
+          fetch-depth: 1
+
+      - name: Extract request text
+        env:
+          REQUEST_FILE: ${{ needs.identify.outputs.request_file }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK_DIR"
+          TARGET="$WORK_DIR/request-details.md"
+
+          EXT=$(echo "${REQUEST_FILE##*.}" | tr '[:upper:]' '[:lower:]')
+          case "$EXT" in
+            md|markdown|txt)
+              cp "$REQUEST_FILE" "$TARGET"
+              echo "Already text - copied as-is."
+              ;;
+            docx)
+              command -v pandoc >/dev/null 2>&1 \
+                || { sudo apt-get update -qq && sudo apt-get install -y -qq pandoc; }
+              pandoc -f docx -t gfm --wrap=none \
+                     --extract-media="$WORK_DIR/media" \
+                     -o "$TARGET" "$REQUEST_FILE"
+              echo "Converted $REQUEST_FILE with pandoc."
+              ;;
+            doc)
+              echo "::error::Legacy binary .doc cannot be converted. Push .docx or markdown."
+              exit 1
+              ;;
+            *)
+              echo "::error::Unsupported request format '.$EXT' ($REQUEST_FILE)."
+              exit 1
+              ;;
+          esac
+
+          # A document that extracts to almost nothing means the conversion failed
+          # or the file is image-only. Fail here rather than write an empty PDD.
+          BYTES=$(wc -c < "$TARGET" | tr -d ' ')
+          if [ "$BYTES" -lt 200 ]; then
+            echo "::error::Request extracted to only ${BYTES} bytes - nothing usable to build a PDD from."
+            exit 1
+          fi
+
+          IMAGES=$(find "$WORK_DIR/media" -type f 2>/dev/null | wc -l | tr -d ' ')
+          {
+            echo "### 2. Request read"
+            echo ""
+            echo "\`$REQUEST_FILE\` -> ${BYTES} bytes of markdown, ${IMAGES} image(s) extracted."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "--- first 120 lines of the extracted markdown ---"
+          head -120 "$TARGET"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: request-details
+          path: ${{ env.WORK_DIR }}
+          retention-days: 1
+          if-no-files-found: error
+
+  # ═══════════════════════════════════════════════════════════════
+  # 3. Generate PDD
+  # ═══════════════════════════════════════════════════════════════
+  generate-pdd:
+    name: Generate PDD
+    needs: [identify, read-request]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.identify.outputs.branch }}
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: request-details
+          path: ${{ env.WORK_DIR }}
+
+      # Section list and the [SME REVIEW] / [DEFAULT] conventions are aligned with
+      # the uipath-planner skill's PDD extraction rules, so the SDD stage can
+      # consume this document without a human reshaping it first.
+      - name: Run uipath-analyst agent
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: ${{ env.AGENT_MODEL }}
+          timeout_minutes: '25'
+          allowed_tools: "Read,Write,Edit,Glob,Grep,Bash"
+          prompt: |
+            You are uipath-analyst, a UiPath business analyst. You turn a raw automation
+            request into a Process Design Document (PDD) that a solution architect can turn
+            straight into an automation SDD.
+
+            INPUT  file: ${{ env.WORK_DIR }}/request-details.md
+                         (extracted from ${{ needs.identify.outputs.request_file }})
+            OUTPUT file: ${{ needs.identify.outputs.pdd_file }}
+            Story key:   ${{ needs.identify.outputs.story_key }}
+            Branch:      ${{ needs.identify.outputs.branch }}
+
+            ## Step 1 - read everything available
+
+            Read the INPUT file in full. It is the SME's own process document converted from
+            Word, so expect pandoc artefacts: tables rendered as pipe tables or as raw HTML,
+            image placeholders, stray anchors, hard line breaks mid-sentence. Read through
+            them - the content matters, the formatting does not.
+
+            Mine it exhaustively: every step, system, business rule, threshold, field name,
+            volume figure and concrete example value it contains must land somewhere in the
+            PDD.
+
+            Images extracted from the document are under ${{ env.WORK_DIR }}/media when it
+            exists - Read the PNG/JPEG ones for field names and sample values (section 15).
+            Skip `.emf` / `.wmf`: they cannot be rendered, so note in section 17 that a
+            figure was unreadable rather than guessing at it.
+
+            Also read `README.md` for repo and naming context. If the document references an
+            appendix or attachment whose content is not actually present, record that in
+            section 17 as a missing input - do not invent what it might have said.
+
+            ## Step 2 - write the PDD
+
+            Write the document to the OUTPUT path with the Write tool. Use EXACTLY these
+            headings, in this order, all of them present even when thin:
+
+                # PDD - <process title>
+
+                ## 1. Document Control
+                ## 2. Introduction
+                ## 3. Process Overview
+                ## 4. Scope
+                ## 5. As-Is Process
+                ## 6. To-Be Process (High Level)
+                ## 7. Detailed Process Steps
+                ## 8. Applications and Systems
+                ## 9. Business Rules
+                ## 10. Business Exceptions
+                ## 11. System Errors
+                ## 12. Data Definitions
+                ## 13. Environment and Constraint Signals
+                ## 14. Reporting Requirements
+                ## 15. Canonical Test Data
+                ## 16. Decomposition Signals
+                ## 17. Assumptions, Dependencies and Open Questions
+                ## 18. Benefits and Success Criteria
+
+            What each section must contain:
+
+            1. Document Control - markdown table: Document, Story key, Epic key, Source file,
+               Branch, Author (uipath-analyst), Status (Draft - pending SME approval), Version 0.1.
+            2. Introduction - process name, the official "Process Full Name" in PascalCase
+               (e.g. `NoPoInvoiceFinder`) on its own table row since the SDD uses it as the
+               project-name prefix, business objective, owning department, and a Delivery Team
+               table with only the roles the source actually names (SME / Process Owner / BA /
+               Developer). Never invent a person.
+            3. Process Overview - one markdown table with these rows, every row present:
+               Process full name, Function and department, Short description, Required roles,
+               Trigger and schedule, Volume (items per day / peak), Average handling time
+               (manual vs automated target), FTE effort, Estimated exception rate,
+               Input data, Output data.
+            4. Scope - two bullet lists, "In scope" and "Out of scope". Out of scope defines the
+               SDD boundary, so be explicit about adjacent work that is NOT included.
+            5. As-Is Process - how the work is done today: numbered steps, the systems touched,
+               the manual handoffs, and a short "Pain points" list.
+            6. To-Be Process (High Level) - the target process intent, what becomes automated
+               and what stays human. Business-level, not technical design. Re-engineer for
+               automation rather than restating the as-is, and say which as-is steps disappear.
+            7. Detailed Process Steps - the core section. A markdown table with columns
+               `Step | Action | Application | Expected Result | Remarks`. Number steps
+               hierarchically (1.1, 1.2, 1.5.A ...). Mark the per-item loop boundaries and every
+               decision point explicitly in the Action or Remarks cell. Aim for real granularity:
+               one row per action a robot would perform, not one row per phase.
+            8. Applications and Systems - table: `Application | Interface type (web/desktop/API/
+               terminal/email) | Access method | Login method | Credential handling | Comments`.
+               For email, state the protocol signal (IMAP / Exchange / O365 Graph / SMTP) or mark
+               it `[SME REVIEW]` - never default to O365. For document storage, never assume
+               SharePoint.
+            9. Business Rules - table `ID | Rule | Source | Applies at step`, IDs BR-01, BR-02...
+               Extract rules buried in prose and in step remarks. Every rule must be traceable to
+               a sentence in the source; a rule you cannot trace does not belong here.
+            10. Business Exceptions - table `ID | Name | Trigger step | Trigger condition | Action`,
+                IDs B1, B2... Preserve any catch-all handler as the last row.
+            11. System Errors - table `ID | Name | Trigger condition | Severity | Retry policy |
+                Action`, IDs S1, S2... If the source has none, add the common infrastructure
+                errors (application unresponsive, element not found, network timeout, credential
+                expiry, unhandled exception) and mark each `[DEFAULT]`.
+            12. Data Definitions - table `Field | Type | Source | Target | Validation | Required`.
+                Include every field name mentioned anywhere in the source, plus any value-mapping
+                tables reproduced in full.
+            13. Environment and Constraint Signals - table with rows: Delivery model
+                (Automation Cloud / Automation Suite / standalone), Product exclusions,
+                Orchestration constraints, Document storage, Signing modality, Robot attendance
+                (attended/unattended + reason). These gate product selection downstream, so state
+                the signal or mark it `[SME REVIEW]` - never silently default.
+            14. Reporting Requirements - report type, frequency, content, recipients, monitoring
+                tool. If the source mentions only logging, mark `[DEFAULT] - Orchestrator logs only`.
+            15. Canonical Test Data - a `Field | Value | Role (input / expected output /
+                validation / error message) | Source location` table built from concrete values
+                quoted verbatim from the source: sample IDs, names, amounts, dates, statuses,
+                error strings, hashes. A concrete value present in the source is FACT - do not
+                mark it `[SME REVIEW]`. Only if the entire source genuinely contains zero concrete
+                values may you fall back, and say so explicitly.
+            16. Decomposition Signals - short bullets on: distinct processing stages, per-item
+                transactional processing, document understanding with human validation, multiple
+                output channels, reporting, queue/batch mentions. Say "not present in source"
+                where that is the answer.
+            17. Assumptions, Dependencies and Open Questions - numbered list. Every gap you had
+                to fill gets a line here. Use `[SME REVIEW]` for a business decision only a human
+                can make, and `[DEFAULT]` for a safe engineering default you applied. List any
+                referenced-but-unavailable input.
+            18. Benefits and Success Criteria - expected benefit (time saved, error reduction,
+                cycle time) and the measurable acceptance criteria for the automation.
+
+            ## Hard rules
+
+            - NEVER invent a business rule, threshold, volume figure, system name, URL, person or
+              credential. If it is not in the source and not a stated engineering default, it is
+              an `[SME REVIEW]` line in section 17.
+            - Inference that follows directly from the source IS allowed and expected - label it.
+              A reasonable inferred step is better than an empty section, as long as it is marked
+              so the SME can correct it.
+            - Mark every inferred or defaulted cell inline with `[SME REVIEW]` or `[DEFAULT]`.
+              These markers are read by the downstream SDD stage; they are load-bearing, not
+              decoration.
+            - Tables must be valid GitHub markdown with a header separator row.
+            - Do not use HTML. Do not wrap the whole document in a code fence.
+            - Write a real document, not a template: no `<placeholder>` text, no "TBD",
+              no "Lorem ipsum", no empty table bodies.
+            - The document must stand on its own - an architect reading only this file must be
+              able to design the automation.
+            - Do NOT modify, move or delete anything under ${{ env.WORK_DIR }} or
+              ${{ needs.identify.outputs.request_file }}.
+            - Do NOT run git commit, git push, or gh. The workflow handles that.
+            - Write exactly one file: ${{ needs.identify.outputs.pdd_file }}.
+
+            ## Step 3 - self-check before you finish
+
+            Confirm all 18 headings are present:
+
+                grep -c '^## [0-9]' ${{ needs.identify.outputs.pdd_file }}
+
+            That must print 18. If it does not, fix the file and check again.
+
+      # Soft validation, then one repair pass, then a hard gate. A single weak
+      # agent run must not put a half-empty PDD in front of a reviewer.
+      - name: Validate PDD
+        id: check
+        continue-on-error: true
+        env:
+          PDD_FILE: ${{ needs.identify.outputs.pdd_file }}
+        run: bash .github/scripts/validate-pdd.sh "$PDD_FILE"
+
+      - name: Repair PDD
+        if: steps.check.outcome == 'failure'
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: ${{ env.AGENT_MODEL }}
+          timeout_minutes: '20'
+          allowed_tools: "Read,Write,Edit,Glob,Grep,Bash"
+          prompt: |
+            The PDD at ${{ needs.identify.outputs.pdd_file }} failed validation.
+
+            Run the validator to see exactly what is wrong:
+
+                bash .github/scripts/validate-pdd.sh ${{ needs.identify.outputs.pdd_file }}
+
+            Then read ${{ env.WORK_DIR }}/request-details.md and fix the PDD so the validator
+            passes: all 18 `## <n>.` headings present in order, real content in every section,
+            no placeholder text, no empty tables. If the file is missing entirely, write it
+            from scratch. Re-run the validator until it exits 0.
+
+            Do not modify anything under ${{ env.WORK_DIR }}. Do not run git or gh.
+
+      - name: Verify PDD
+        env:
+          PDD_FILE: ${{ needs.identify.outputs.pdd_file }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/validate-pdd.sh "$PDD_FILE"
+          {
+            echo "### 3. PDD generated"
+            echo ""
+            echo "\`$PDD_FILE\` - $(wc -c < "$PDD_FILE" | tr -d ' ') bytes, $(grep -c '^## [0-9]' "$PDD_FILE") sections."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Pushing with GITHUB_TOKEN does not re-trigger this workflow, so there is
+      # no loop. Only the PDD is staged - the extracted markdown stays local.
+      - name: Commit PDD
+        env:
+          PDD_FILE:  ${{ needs.identify.outputs.pdd_file }}
+          STORY_KEY: ${{ needs.identify.outputs.story_key }}
+          BRANCH:    ${{ needs.identify.outputs.branch }}
+          SOURCE:    ${{ needs.identify.outputs.request_file }}
+        run: |
+          set -euo pipefail
+          git config user.name  "uipath-analyst[bot]"
+          git config user.email "uipath-analyst[bot]@users.noreply.github.com"
+
+          git add "$PDD_FILE"
+          if git diff --cached --quiet; then
+            echo "No change to commit - PDD is already up to date."
+          else
+            git commit -m "docs: add PDD for $STORY_KEY" \
+                       -m "Generated by uipath-analyst from $SOURCE."
+            git push origin "HEAD:$BRANCH"
+          fi
+
+  # ═══════════════════════════════════════════════════════════════
+  # 4. Open PR
+  # This is the Maestro resume signal. No auto-merge.
+  # ═══════════════════════════════════════════════════════════════
+  open-pr:
+    name: Open PR
+    needs: [identify, generate-pdd]
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+      pr_url:    ${{ steps.pr.outputs.pr_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.identify.outputs.branch }}
+          fetch-depth: 1
+
+      - name: Open PR into develop
+        id: pr
+        env:
+          # PR_AUTHOR_PAT so the PR can trigger downstream pull_request workflows;
+          # GITHUB_TOKEN is enough for Maestro's polling trigger.
+          GH_TOKEN:  ${{ secrets.PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          REPO:      ${{ github.repository }}
+          BRANCH:    ${{ needs.identify.outputs.branch }}
+          STORY_KEY: ${{ needs.identify.outputs.story_key }}
+          PDD_FILE:  ${{ needs.identify.outputs.pdd_file }}
+          SOURCE:    ${{ needs.identify.outputs.request_file }}
+        run: |
+          set -euo pipefail
+
+          if [ -f "$PDD_FILE" ]; then
+            TITLE_LINE=$(grep -m1 '^# ' "$PDD_FILE" | sed 's/^# *//' || echo "PDD for $STORY_KEY")
+          else
+            TITLE_LINE="PDD for $STORY_KEY"
+          fi
+          BLOB="${{ github.server_url }}/$REPO/blob/$BRANCH"
+
+          EXISTING=$(gh pr list --repo "$REPO" --head "$BRANCH" --base "$BASE_BRANCH" \
+                       --state open --json number --jq '.[0].number' || echo "")
+
+          cat > /tmp/pr-body.md <<'EOF_BODY'
+          ## Process Design Document for review
+
+          The analysis agent read the request document pushed to this branch and produced a
+          full PDD, ready to be turned into a solution design.
+
+          **Review checklist**
+          - [ ] Scope (section 4) matches what we actually want automated
+          - [ ] Detailed process steps (section 7) are complete and in the right order
+          - [ ] Business rules (section 9) are correct and none are missing
+          - [ ] Every `[SME REVIEW]` item in section 17 is answered or accepted
+          - [ ] Canonical test data (section 15) is realistic
+
+          Merging this PR approves the PDD and advances the case to solution design.
+          EOF_BODY
+
+          {
+            echo ""
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Story | \`$STORY_KEY\` |"
+            echo "| PDD | [\`$PDD_FILE\`]($BLOB/$PDD_FILE) |"
+            echo "| Request | [\`$SOURCE\`]($BLOB/$SOURCE) |"
+            echo ""
+            echo "<sub>Generated by \`uipath-pdd\` - run [${{ github.run_id }}](${{ github.server_url }}/$REPO/actions/runs/${{ github.run_id }})</sub>"
+          } >> /tmp/pr-body.md
+
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            echo "PR #$EXISTING already open for $BRANCH - updating it."
+            gh pr edit "$EXISTING" --repo "$REPO" \
+              --title "docs: $TITLE_LINE" --body-file /tmp/pr-body.md
+            PR_NUMBER="$EXISTING"
+          else
+            gh pr create --repo "$REPO" \
+              --base "$BASE_BRANCH" \
+              --head "$BRANCH" \
+              --title "docs: $TITLE_LINE" \
+              --body-file /tmp/pr-body.md
+            PR_NUMBER=$(gh pr list --repo "$REPO" --head "$BRANCH" --base "$BASE_BRANCH" \
+                          --state open --json number --jq '.[0].number')
+          fi
+
+          # Maestro is blocked on this event, so a silent failure stalls the whole
+          # case - fail loudly instead.
+          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
+            echo "::error::PR from $BRANCH into $BASE_BRANCH was not created. Maestro will not resume."
+            exit 1
+          fi
+
+          PR_URL=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json url --jq .url)
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$PR_URL"       >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 4. PR opened"
+            echo ""
+            echo "[#$PR_NUMBER - docs: $TITLE_LINE]($PR_URL) into \`$BASE_BRANCH\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Opened/updated PR #$PR_NUMBER -> $PR_URL"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 5. Assign PR
+  # ═══════════════════════════════════════════════════════════════
+  assign-pr:
+    name: Assign PR
+    needs: [identify, open-pr]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assign and request review
+        env:
+          GH_TOKEN:  ${{ secrets.PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          REPO:      ${{ github.repository }}
+          PR_NUMBER: ${{ needs.open-pr.outputs.pr_number }}
+          PR_URL:    ${{ needs.open-pr.outputs.pr_url }}
+        run: |
+          set -euo pipefail
+
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-assignee "$ASSIGNEE"
+          echo "Assigned PR #$PR_NUMBER to $ASSIGNEE."
+
+          # Best effort: GitHub rejects a review request when the target is the PR
+          # author, which happens whenever PR_AUTHOR_PAT belongs to the assignee.
+          if gh pr edit "$PR_NUMBER" --repo "$REPO" --add-reviewer "$ASSIGNEE" 2>/dev/null; then
+            echo "Requested review from $ASSIGNEE."
+          else
+            echo "::notice::Review not requested from $ASSIGNEE (likely the PR author). Assignee is set."
+          fi
+
+          {
+            echo "### 5. PR assigned"
+            echo ""
+            echo "[#$PR_NUMBER]($PR_URL) assigned to \`$ASSIGNEE\`."
+          } >> "$GITHUB_STEP_SUMMARY"
