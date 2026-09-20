@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "createdAt": null,
+  "epicKey": null,
+  "repo": "irina-capatina-org/CHANGE-ME-TO-THE-TEMPLATE-REPO-NAME",
+  "stages": {
+    "Analysis":      { "status": "todo", "updatedAt": null },
+    "Architecture":  { "status": "todo", "updatedAt": null },
+    "Development":   { "status": "todo", "updatedAt": null },
+    "Testing":       { "status": "todo", "updatedAt": null },
+    "Documentation": { "status": "todo", "updatedAt": null },
+    "Production":    { "status": "todo", "updatedAt": null }
+  },
+  "documents": {}
+}
