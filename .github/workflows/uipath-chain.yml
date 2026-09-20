@@ -1,0 +1,125 @@
+name: uipath-chain
+run-name: Chain ${{ github.event.pull_request.head.ref }} -> next stage
+
+# Cuts the branch that starts the NEXT stage, for the one hop that no other
+# workflow can do for itself.
+#
+# ── Why this exists ───────────────────────────────────────────────────────────
+# Maestro used to create every stage branch. Without it each stage has to hand
+# over to the next, and the hops split into two kinds:
+#
+#   architecture -> dev    the SDD workflow merges its OWN PR, so it cuts dev-*
+#                          in that same run (see its `next-stage` job)
+#   dev -> docs            uipath-review merges the implementation PR, so it cuts
+#                          docs-* there
+#   analysis -> architecture   nobody can: the analysis PR is merged BY A HUMAN,
+#                          minutes or hours after the PDD run has finished
+#
+# That last hop is what this file is for. A workflow run cannot sit and wait for an
+# approval - it would burn minutes and die at the 6-hour job ceiling - so the merge
+# has to arrive as an event instead.
+#
+# ── The token matters more than anything else here ────────────────────────────
+# A ref created with GITHUB_TOKEN does NOT trigger workflows. Cutting
+# architecture-* with it would create the branch and then nothing would happen,
+# which looks exactly like a broken uipath-sdd. The PAT is what makes the next
+# stage start, and its absence is reported loudly rather than silently stalling.
+#
+# ── Keys ──────────────────────────────────────────────────────────────────────
+# The analysis key is carried through the whole lifecycle unchanged:
+#
+#   analysis-jactiv-611 -> architecture-jactiv-611 -> dev-jactiv-611 -> docs-jactiv-611
+#
+# The prefixes keep them distinct, and since every document is now named after the
+# REPOSITORY rather than a story key, the key only has to be stable - it no longer
+# decides any filename.
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [develop]
+
+env:
+  BASE_BRANCH: develop
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+
+  architecture:
+    name: Cut the architecture branch
+    # Merged, not just closed. A PR closed without merging means the PDD was
+    # rejected, and the chain should stop rather than design against it.
+    if: >-
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'analysis-')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create architecture-<key> from develop
+        env:
+          # PAT first: see the note at the top. Falls back so the branch is still
+          # created without one - it just will not start uipath-sdd by itself.
+          GH_TOKEN: ${{ secrets.DEV_PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          USING_PAT: ${{ secrets.DEV_PR_AUTHOR_PAT != '' }}
+          REPO:      ${{ github.repository }}
+          HEAD_REF:  ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # Everything after the first dash, the same rule every stage uses.
+          KEY="${HEAD_REF#*-}"
+          if [ -z "$KEY" ] || [ "$KEY" = "$HEAD_REF" ]; then
+            echo "::error::Branch '$HEAD_REF' has no key after its 'analysis-' prefix."
+            exit 1
+          fi
+          NEXT="architecture-$KEY"
+
+          if [ "$USING_PAT" != "true" ]; then
+            echo "::warning::DEV_PR_AUTHOR_PAT is not set. The branch will be created with GITHUB_TOKEN, which does NOT trigger workflows - uipath-sdd will not start on its own and you will have to run it manually."
+          fi
+
+          # Already there - a re-run, or the merge event arriving twice. Not an error.
+          if gh api "repos/$REPO/git/ref/heads/$NEXT" >/dev/null 2>&1; then
+            echo "::notice::$NEXT already exists - nothing to do."
+            {
+              echo "### Chain"
+              echo ""
+              echo "\`$NEXT\` already exists, so this run did nothing."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Cut from develop as it stands AFTER the merge, so the architecture stage
+          # sees the PDD it is meant to design from. The merge commit is already on
+          # develop by the time this event fires.
+          SHA=$(gh api "repos/$REPO/git/ref/heads/$BASE_BRANCH" --jq '.object.sha')
+          if [ -z "${SHA:-}" ]; then
+            echo "::error::Could not read the head of $BASE_BRANCH."
+            exit 1
+          fi
+
+          gh api -X POST "repos/$REPO/git/refs" \
+            -f ref="refs/heads/$NEXT" \
+            -f sha="$SHA" >/dev/null
+
+          echo "Created $NEXT at ${SHA:0:7} (from $BASE_BRANCH)."
+          {
+            echo "### Chain"
+            echo ""
+            echo "PDD [#$PR_NUMBER](${{ github.server_url }}/$REPO/pull/$PR_NUMBER) merged, so the architecture stage was started."
+            echo ""
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| From | \`$HEAD_REF\` |"
+            echo "| Created | \`$NEXT\` |"
+            echo "| At | \`${SHA:0:7}\` on \`$BASE_BRANCH\` |"
+            if [ "$USING_PAT" != "true" ]; then
+              echo ""
+              echo "> [!WARNING]"
+              echo "> Created with \`GITHUB_TOKEN\`, so \`uipath-sdd\` will **not** start by itself."
+              echo "> Set the \`DEV_PR_AUTHOR_PAT\` secret, or run \`uipath-sdd\` manually on \`$NEXT\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

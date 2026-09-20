@@ -1727,3 +1727,65 @@ jobs:
             echo ""
             echo "[#$PR_NUMBER]($PR_URL) into \`$BASE_BRANCH\` - $RESULT."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 7. Start Development
+  # This stage merges its own PR, so nothing external will notice and cut the next
+  # branch for it - a merge performed with GITHUB_TOKEN raises no event that can
+  # start another workflow. It therefore hands over itself, in this same run.
+  #
+  # The analysis key is carried through unchanged:
+  #   architecture-jactiv-611 -> dev-jactiv-611
+  #
+  # `needs: merge` rather than a step inside it, so a failed merge cannot leave a
+  # development branch pointing at a design that never landed on develop.
+  # ═══════════════════════════════════════════════════════════════
+  next-stage:
+    name: Start Development
+    needs: [identify, merge]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create dev-<key> from develop
+        env:
+          # A ref created with GITHUB_TOKEN does NOT trigger workflows, so the PAT is
+          # what actually starts uipath-develop. Without it the branch still appears,
+          # but nothing runs on it - which is indistinguishable from a broken stage,
+          # hence the warning rather than a silent fallback.
+          GH_TOKEN:  ${{ secrets.DEV_PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          USING_PAT: ${{ secrets.DEV_PR_AUTHOR_PAT != '' }}
+          REPO:      ${{ github.repository }}
+          KEY:       ${{ needs.identify.outputs.file_key }}
+        run: |
+          set -euo pipefail
+          NEXT="dev-$KEY"
+
+          if [ "$USING_PAT" != "true" ]; then
+            echo "::warning::DEV_PR_AUTHOR_PAT is not set - $NEXT will be created with GITHUB_TOKEN, which does not trigger workflows. uipath-develop will not start on its own."
+          fi
+
+          if gh api "repos/$REPO/git/ref/heads/$NEXT" >/dev/null 2>&1; then
+            echo "::notice::$NEXT already exists - nothing to do."
+            exit 0
+          fi
+
+          # develop as it stands after the merge above, so the SDD is on it.
+          SHA=$(gh api "repos/$REPO/git/ref/heads/$BASE_BRANCH" --jq '.object.sha')
+          [ -n "${SHA:-}" ] || { echo "::error::Could not read the head of $BASE_BRANCH."; exit 1; }
+
+          gh api -X POST "repos/$REPO/git/refs" \
+            -f ref="refs/heads/$NEXT" -f sha="$SHA" >/dev/null
+
+          echo "Created $NEXT at ${SHA:0:7}."
+          {
+            echo "### 7. Development started"
+            echo ""
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Created | \`$NEXT\` |"
+            echo "| At | \`${SHA:0:7}\` on \`$BASE_BRANCH\` |"
+            if [ "$USING_PAT" != "true" ]; then
+              echo ""
+              echo "> [!WARNING]"
+              echo "> Created with \`GITHUB_TOKEN\`, so \`uipath-develop\` will **not** start by itself."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
