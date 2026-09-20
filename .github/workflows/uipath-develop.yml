@@ -105,7 +105,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          .github/scripts/observe.sh stage Development status=in-progress \
+          bash .github/scripts/observe.sh stage Development status=in-progress \
             task="Deriving tasks" run=${{ github.run_id }}
 
       - name: Resolve the design for this branch
@@ -284,11 +284,18 @@ jobs:
 
             ## Step 0 - load the planner skill if it is installed
 
-            Run `ls ~/.claude/skills`. If `uipath-planner` is there, invoke the Skill tool
-            with skill `uipath-planner` and follow **Lane A** in AUTONOMOUS mode - the SDD
-            already carries `Status: ready` and `Execution autonomy: autonomous`, so never
-            ask a question and never re-ask anything the handoff header already answers.
-            Emit NO live TaskCreate calls: write the task list to the OUTPUT file instead.
+            Run `ls ~/.claude/skills`. If `uipath-planner` is there, READ
+            `~/.claude/skills/uipath-planner/SKILL.md` with the Read tool and follow
+            **Lane A** in AUTONOMOUS mode - the SDD already carries `Status: ready` and
+            `Execution autonomy: autonomous`, so never ask a question and never re-ask
+            anything the handoff header already answers. Emit NO live TaskCreate calls:
+            write the task list to the OUTPUT file instead.
+
+            NEVER load a skill through the Task tool. Spawning a subagent fails in this
+            runner: it resolves a retired model id and comes back
+            `404 not_found_error - model: claude-sonnet-4-20250514`, so you lose the skill
+            entirely. Read SKILL.md with the Read tool, and read the reference files it
+            points at the same way.
 
             If the skill is not installed, follow Step 2 below.
 
@@ -417,11 +424,19 @@ jobs:
 
             ## Step 0 - load the specialist skill for each project
 
-            Run `ls ~/.claude/skills`. For EVERY skill named in Build skills above, invoke
-            the Skill tool with that skill name before touching that project's files, and
-            follow it. Those skills own the real authoring procedure - scaffolding
-            commands, file formats, activity shapes, project metadata. Do not improvise a
-            project layout from memory when the skill is available.
+            Run `ls ~/.claude/skills`. For EVERY skill named in Build skills above, READ
+            `~/.claude/skills/<skill-name>/SKILL.md` with the Read tool before touching
+            that project's files, and follow it. Those skills own the real authoring
+            procedure - scaffolding commands, file formats, activity shapes, project
+            metadata. Do not improvise a project layout from memory when the skill is
+            available.
+
+            NEVER load a skill through the Task tool. Spawning a subagent fails in this
+            runner: it resolves a retired model id and comes back
+            `404 not_found_error - model: claude-sonnet-4-20250514`, so you lose the skill
+            entirely. Read SKILL.md with the Read tool, and read the reference files it
+            points at the same way.
+
 
             If the skills are NOT installed, still build the project using the `uip` CLI's
             own scaffolding (`uip <group> --help` to discover the supported verbs - never
@@ -441,13 +456,23 @@ jobs:
 
             For each task:
             1. Load its skill (Step 0) if you have not already.
-            2. Scaffold or open the project under ${{ env.CODE_DIR }}/.
+            2. Scaffold or open the project under ${{ env.CODE_DIR }}/. A scaffolding
+               command writes starter files of its own - `uip api-workflow init` emits
+               Workflow.json, bindings_v2.json, entry-points.json and project.uiproj.
+               Before you replace any of them wholesale, `rm` the file first (see Hard
+               rules).
             3. Implement what the SDD section referenced by that task specifies.
             4. Run whatever validate/build command that skill prescribes, and fix what it
                reports before moving on. Do not leave a project that does not validate.
 
             ## Hard rules
 
+            - **`rm` a scaffolded file before rewriting it.** Write is REJECTED on a file
+              that exists but has not been Read this session - and the rejection lands
+              only AFTER you have generated the entire payload. A previous run lost 226
+              seconds and a discarded 100 KB Workflow.json to exactly this. So: `rm
+              <file>` and then Write it, or Read it first. Never Write blind over a file
+              a scaffolding command just created.
             - **Implement every business rule** the SDD lists. A `BR-xx` with no
               implementation is an incomplete build, not a detail.
             - **Named resources come from the SDD** - queue names, asset names, argument
@@ -583,7 +608,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          .github/scripts/observe.sh stage Testing status=in-progress task="Running tests"
+          bash .github/scripts/observe.sh stage Testing status=in-progress task="Running tests"
 
       - name: Validate project
         id: validate
@@ -610,9 +635,11 @@ jobs:
           }
 
           case "$PRODUCT" in
+            # An API Workflow project is marked by project.uiproj. It has no
+            # uipath.json, so keying on that validated nothing and passed silently.
             api-workflows)
-              run_in_projects 'uipath.json' uip api-workflow validate
-              run_in_projects 'uipath.json' uip api-workflow run --no-auth
+              run_in_projects 'project.uiproj' uip api-workflow validate
+              run_in_projects 'project.uiproj' uip api-workflow run --no-auth
               ;;
             rpa-process|rpa-library|rpa-test-automation)
               run_in_projects 'project.json' uip rpa restore
@@ -666,8 +693,10 @@ jobs:
             Build skills:  ${{ needs.identify.outputs.skills }}
 
             1. Read the test log to see exactly what failed.
-            2. Invoke the Skill tool for each skill in Build skills (if installed) - the
-               specialist documents the correct validate and run commands for its product.
+            2. READ `~/.claude/skills/<skill-name>/SKILL.md` for each skill in Build skills
+               (if installed) - the specialist documents the correct validate and run
+               commands for its product. Never use the Task tool: subagent spawns fail in
+               this runner with a 404 on a retired model id.
             3. If the log shows `unknown command` or `unknown option`, the CLI surface has
                drifted: discover the supported verbs with `uip <group> --help` and use
                those. NEVER invent a command.
@@ -700,7 +729,7 @@ jobs:
             done < <(find "$CODE_DIR" -maxdepth 3 -type f -name "$marker" -exec dirname {} \; | sort -u)
           }
           case "$PRODUCT" in
-            api-workflows)   run_in_projects 'uipath.json' uip api-workflow validate ;;
+            api-workflows)   run_in_projects 'project.uiproj' uip api-workflow validate ;;
             rpa-process|rpa-library|rpa-test-automation)
                              run_in_projects 'project.json' uip rpa build ;;
             maestro-flow)    run_in_projects 'project.json' uip maestro flow validate ;;
@@ -750,7 +779,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          .github/scripts/observe.sh stage Testing status=done
+          bash .github/scripts/observe.sh stage Testing status=done
 
   # ═══════════════════════════════════════════════════════════════
   # 5. Open PR
@@ -913,7 +942,7 @@ jobs:
           PR_NUMBER: ${{ needs.open-pr.outputs.pr_number }}
           PR_URL:    ${{ needs.open-pr.outputs.pr_url }}
         run: |
-          .github/scripts/observe.sh stage Development status=in-review decidedBy=agent \
+          bash .github/scripts/observe.sh stage Development status=in-review decidedBy=agent \
             pr="$PR_NUMBER" prUrl="$PR_URL"
 
   # ═══════════════════════════════════════════════════════════════
@@ -945,11 +974,11 @@ jobs:
           # The tests are a job here, not a workflow, so a red test run has to
           # fault the Testing bubble as well as Development.
           if [ "${{ needs.test.result }}" = "failure" ]; then
-            .github/scripts/observe.sh stage Testing status=faulted \
+            bash .github/scripts/observe.sh stage Testing status=faulted \
               task="Tests failed"
           fi
 
-          .github/scripts/observe.sh stage Development status=faulted \
+          bash .github/scripts/observe.sh stage Development status=faulted \
             task="The development run failed" \
             run=${{ github.run_id }} \
             runUrl=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

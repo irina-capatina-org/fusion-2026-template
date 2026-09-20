@@ -81,8 +81,8 @@ jobs:
           #   analysis-jactiv-611 -> jactiv-611 -> JACTIV-611
           EPIC="$(echo "${GITHUB_REF_NAME#*-}" | tr '[:lower:]' '[:upper:]')"
 
-          .github/scripts/observe.sh set epicKey="$EPIC" repo="${{ github.repository }}"
-          .github/scripts/observe.sh stage Analysis \
+          bash .github/scripts/observe.sh set epicKey="$EPIC" repo="${{ github.repository }}"
+          bash .github/scripts/observe.sh stage Analysis \
             status=in-progress task="Reading the request" run=${{ github.run_id }}
 
       - name: Resolve request document for this branch
@@ -308,13 +308,13 @@ jobs:
             PDD.
 
             Images extracted from the document are under ${{ env.WORK_DIR }}/media when it
-            exists - Read the PNG/JPEG ones for field names and sample values (section 15).
-            Skip `.emf` / `.wmf`: they cannot be rendered, so note in section 17 that a
+            exists - Read the PNG/JPEG ones for field names and sample values (section 13).
+            Skip `.emf` / `.wmf`: they cannot be rendered, so note in section 15 that a
             figure was unreadable rather than guessing at it.
 
             Also read `README.md` for repo and naming context. If the document references an
             appendix or attachment whose content is not actually present, record that in
-            section 17 as a missing input - do not invent what it might have said.
+            section 15 as a missing input - do not invent what it might have said.
 
             ## Step 2 - write the PDD
 
@@ -328,20 +328,18 @@ jobs:
                 ## 2. Introduction
                 ## 3. Process Overview
                 ## 4. Scope
-                ## 5. As-Is Process
-                ## 6. To-Be Process (High Level)
-                ## 7. Detailed Process Steps
-                ## 8. Applications and Systems
-                ## 9. Business Rules
-                ## 10. Business Exceptions
-                ## 11. System Errors
-                ## 12. Data Definitions
-                ## 13. Environment and Constraint Signals
-                ## 14. Reporting Requirements
-                ## 15. Canonical Test Data
-                ## 16. Decomposition Signals
-                ## 17. Assumptions, Dependencies and Open Questions
-                ## 18. Benefits and Success Criteria
+                ## 5. To-Be Process (High Level)
+                ## 6. Detailed Process Steps
+                ## 7. Applications and Systems
+                ## 8. Business Rules
+                ## 9. Business Exceptions
+                ## 10. System Errors
+                ## 11. Data Definitions
+                ## 12. Environment and Constraint Signals
+                ## 13. Canonical Test Data
+                ## 14. Decomposition Signals
+                ## 15. Assumptions, Dependencies and Open Questions
+                ## 16. Benefits and Success Criteria
 
             What each section must contain:
 
@@ -369,62 +367,59 @@ jobs:
                Input data, Output data.
             4. Scope - two bullet lists, "In scope" and "Out of scope". Out of scope defines the
                SDD boundary, so be explicit about adjacent work that is NOT included.
-            5. As-Is Process - how the work is done today: numbered steps, the systems touched,
-               the manual handoffs, and a short "Pain points" list.
-            6. To-Be Process (High Level) - the target process intent, what becomes automated
+            5. To-Be Process (High Level) - the target process intent, what becomes automated
                and what stays human. Business-level, not technical design. Re-engineer for
-               automation rather than restating the as-is, and say which as-is steps disappear.
-            7. Detailed Process Steps - the core section. A markdown table with columns
+               automation rather than transcribing how the work is done today, and name the
+               manual steps that disappear.
+            6. Detailed Process Steps - the core section. A markdown table with columns
                `Step | Action | Application | Expected Result | Remarks`. Number steps
                hierarchically (1.1, 1.2, 1.5.A ...). Mark the per-item loop boundaries and every
                decision point explicitly in the Action or Remarks cell. Aim for real granularity:
                one row per action a robot would perform, not one row per phase.
-            8. Applications and Systems - table: `Application | Interface type (web/desktop/API/
+            7. Applications and Systems - table: `Application | Interface type (web/desktop/API/
                terminal/email) | Access method | Login method | Credential handling | Comments`.
                For email, state the protocol signal (IMAP / Exchange / O365 Graph / SMTP) or mark
                it `[SME REVIEW]` - never default to O365. For document storage, never assume
                SharePoint.
-            9. Business Rules - table `ID | Rule | Source | Applies at step`, IDs BR-01, BR-02...
+            8. Business Rules - table `ID | Rule | Source | Applies at step`, IDs BR-01, BR-02...
                Extract rules buried in prose and in step remarks. Every rule must be traceable to
                a sentence in the source; a rule you cannot trace does not belong here.
-            10. Business Exceptions - table `ID | Name | Trigger step | Trigger condition | Action`,
+            9. Business Exceptions - table `ID | Name | Trigger step | Trigger condition | Action`,
                 IDs B1, B2... Preserve any catch-all handler as the last row.
-            11. System Errors - table `ID | Name | Trigger condition | Severity | Retry policy |
+            10. System Errors - table `ID | Name | Trigger condition | Severity | Retry policy |
                 Action`, IDs S1, S2... If the source has none, add the common infrastructure
                 errors (application unresponsive, element not found, network timeout, credential
                 expiry, unhandled exception) and mark each `[DEFAULT]`.
-            12. Data Definitions - table `Field | Type | Source | Target | Validation | Required`.
+            11. Data Definitions - table `Field | Type | Source | Target | Validation | Required`.
                 Include every field name mentioned anywhere in the source, plus any value-mapping
                 tables reproduced in full.
-            13. Environment and Constraint Signals - table with rows: Delivery model
+            12. Environment and Constraint Signals - table with rows: Delivery model
                 (Automation Cloud / Automation Suite / standalone), Product exclusions,
                 Orchestration constraints, Document storage, Signing modality, Robot attendance
                 (attended/unattended + reason). These gate product selection downstream, so state
                 the signal or mark it `[SME REVIEW]` - never silently default.
-            14. Reporting Requirements - report type, frequency, content, recipients, monitoring
-                tool. If the source mentions only logging, mark `[DEFAULT] - Orchestrator logs only`.
-            15. Canonical Test Data - a `Field | Value | Role (input / expected output /
+            13. Canonical Test Data - a `Field | Value | Role (input / expected output /
                 validation / error message) | Source location` table built from concrete values
                 quoted verbatim from the source: sample IDs, names, amounts, dates, statuses,
                 error strings, hashes. A concrete value present in the source is FACT - do not
                 mark it `[SME REVIEW]`. Only if the entire source genuinely contains zero concrete
                 values may you fall back, and say so explicitly.
-            16. Decomposition Signals - short bullets on: distinct processing stages, per-item
+            14. Decomposition Signals - short bullets on: distinct processing stages, per-item
                 transactional processing, document understanding with human validation, multiple
                 output channels, reporting, queue/batch mentions. Say "not present in source"
                 where that is the answer.
-            17. Assumptions, Dependencies and Open Questions - numbered list. Every gap you had
+            15. Assumptions, Dependencies and Open Questions - numbered list. Every gap you had
                 to fill gets a line here. Use `[SME REVIEW]` for a business decision only a human
                 can make, and `[DEFAULT]` for a safe engineering default you applied. List any
                 referenced-but-unavailable input.
-            18. Benefits and Success Criteria - expected benefit (time saved, error reduction,
+            16. Benefits and Success Criteria - expected benefit (time saved, error reduction,
                 cycle time) and the measurable acceptance criteria for the automation.
 
             ## Hard rules
 
             - NEVER invent a business rule, threshold, volume figure, system name, URL, person or
               credential. If it is not in the source and not a stated engineering default, it is
-              an `[SME REVIEW]` line in section 17.
+              an `[SME REVIEW]` line in section 15.
             - Inference that follows directly from the source IS allowed and expected - label it.
               A reasonable inferred step is better than an empty section, as long as it is marked
               so the SME can correct it.
@@ -444,11 +439,11 @@ jobs:
 
             ## Step 3 - self-check before you finish
 
-            Confirm all 18 headings are present:
+            Confirm all 16 headings are present:
 
                 grep -c '^## [0-9]' ${{ needs.identify.outputs.pdd_file }}
 
-            That must print 18. If it does not, fix the file and check again.
+            That must print 16. If it does not, fix the file and check again.
 
       # Soft validation, then one repair pass, then a hard gate. A single weak
       # agent run must not put a half-empty PDD in front of a reviewer.
@@ -583,8 +578,8 @@ jobs:
           - [ ] Scope (section 4) matches what we actually want automated
           - [ ] Detailed process steps (section 7) are complete and in the right order
           - [ ] Business rules (section 9) are correct and none are missing
-          - [ ] Every `[SME REVIEW]` item in section 17 is answered or accepted
-          - [ ] Canonical test data (section 15) is realistic
+          - [ ] Every `[SME REVIEW]` item in section 15 is answered or accepted
+          - [ ] Canonical test data (section 13) is realistic
 
           Merging this PR approves the PDD and advances the case to solution design.
           EOF_BODY
@@ -690,13 +685,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          .github/scripts/observe.sh stage Analysis status=in-review decidedBy=human \
+          bash .github/scripts/observe.sh stage Analysis status=in-review decidedBy=human \
             task="PDD ready for review" \
             pr="$PR_NUMBER" prUrl="$PR_URL" story="$STORY_KEY"
 
           # Linked on the analysis branch, where it exists right now. The same
           # path resolves on develop once the PR is merged.
-          .github/scripts/observe.sh document pdd path="$PDD_FILE" \
+          bash .github/scripts/observe.sh document pdd path="$PDD_FILE" \
             url="https://github.com/${{ github.repository }}/blob/$BRANCH/$PDD_FILE"
 
   # ═══════════════════════════════════════════════════════════════
@@ -722,6 +717,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          .github/scripts/observe.sh stage Analysis status=faulted \
+          bash .github/scripts/observe.sh stage Analysis status=faulted \
             task="Analysis run failed" run=${{ github.run_id }} \
             runUrl=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

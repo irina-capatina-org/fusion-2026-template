@@ -321,10 +321,18 @@ jobs:
 
             ## Step 0 - load the reviewing skill if it is installed
 
-            Run `ls ~/.claude/skills`. If `uipath-review` is there, invoke the Skill tool
-            with skill `uipath-review` and follow it. Also invoke the specialist skill for
-            the primary product (e.g. `uipath-api-workflow`, `uipath-rpa`) - it documents
-            what idiomatic looks like for that product, which is most of this review.
+            Run `ls ~/.claude/skills`. If `uipath-review` is there, READ
+            `~/.claude/skills/uipath-review/SKILL.md` with the Read tool and follow it.
+            Also read the specialist skill for the primary product (e.g.
+            `~/.claude/skills/uipath-api-workflow/SKILL.md`) - it documents what idiomatic
+            looks like for that product, which is most of this review.
+
+            NEVER load a skill through the Task tool. Spawning a subagent fails in this
+            runner: it resolves a retired model id and comes back
+            `404 not_found_error - model: claude-sonnet-4-20250514`, so you lose the skill
+            entirely. Read SKILL.md with the Read tool, and read the reference files it
+            points at the same way.
+
 
             ## Step 1 - read before judging
 
@@ -515,24 +523,6 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-  # ═══════════════════════════════════════════════════════════════
-  # 4. Start Docs
-  # This workflow merges the implementation PR itself, and a merge performed with
-  # GITHUB_TOKEN raises no event another workflow could act on - so the hand-over
-  # to the Docs stage happens here, in the same run.
-  #
-  # The analysis key is carried through unchanged:
-  #   dev-jactiv-611 -> docs-jactiv-611
-  #
-  # Guarded on the merge having HAPPENED, not merely on the job having run: a
-  # request-changes verdict escalates to a human and leaves the PR open, and Docs
-  # must not document code that has not landed.
-  # ═══════════════════════════════════════════════════════════════      - uses: actions/checkout@v4
-        with:
-          ref: develop
-          sparse-checkout: .github/scripts
-          fetch-depth: 1
-
       # This job otherwise makes only `gh` API calls and needs no working tree - but
       # observe.sh is a FILE, and a job that never checks out has an empty workspace.
       # Sparse: only the scripts, from develop, so it costs a second.
@@ -551,13 +541,25 @@ jobs:
           REPO:     ${{ github.repository }}
         run: |
           if [ "${{ steps.merge.outputs.merged }}" = "true" ]; then
-            .github/scripts/observe.sh stage Development status=done
+            bash .github/scripts/observe.sh stage Development status=done
           else
-            .github/scripts/observe.sh stage Development status=in-review decidedBy=human \
+            bash .github/scripts/observe.sh stage Development status=in-review decidedBy=human \
               task="The review agent requested changes"
           fi
 
-
+  # ═══════════════════════════════════════════════════════════════
+  # 4. Start Docs
+  # This workflow merges the implementation PR itself, and a merge performed with
+  # GITHUB_TOKEN raises no event another workflow could act on - so the hand-over
+  # to the Docs stage happens here, in the same run.
+  #
+  # The analysis key is carried through unchanged:
+  #   dev-jactiv-611 -> docs-jactiv-611
+  #
+  # Guarded on the merge having HAPPENED, not merely on the job having run: a
+  # request-changes verdict escalates to a human and leaves the PR open, and Docs
+  # must not document code that has not landed.
+  # ═══════════════════════════════════════════════════════════════
   next-stage:
     name: Start Docs
     needs: [validate, merge-or-escalate]
@@ -630,7 +632,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          .github/scripts/observe.sh stage Documentation status=in-progress \
+          bash .github/scripts/observe.sh stage Documentation status=in-progress \
             task="Writing the as-built DSD"
 
   # ═══════════════════════════════════════════════════════════════
@@ -659,7 +661,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          .github/scripts/observe.sh stage Development status=faulted \
+          bash .github/scripts/observe.sh stage Development status=faulted \
             task="The development run failed" \
             run=${{ github.run_id }} \
             runUrl=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

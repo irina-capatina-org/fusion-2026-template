@@ -138,8 +138,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          .github/scripts/observe.sh stage Analysis status=done
-          .github/scripts/observe.sh stage Architecture status=in-progress \
+          bash .github/scripts/observe.sh stage Analysis status=done
+          bash .github/scripts/observe.sh stage Architecture status=in-progress \
             task="Designing the solution"
 
   # ═══════════════════════════════════════════════════════════════
@@ -168,7 +168,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          .github/scripts/observe.sh stage Architecture status=faulted \
+          bash .github/scripts/observe.sh stage Architecture status=faulted \
             task="The architecture run failed" \
             run=${{ github.run_id }} \
             runUrl=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

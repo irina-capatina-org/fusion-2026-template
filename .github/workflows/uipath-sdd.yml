@@ -230,7 +230,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          .github/scripts/observe.sh stage Architecture status=in-progress \
+          bash .github/scripts/observe.sh stage Architecture status=in-progress \
             task="Determining architecture" run=${{ github.run_id }}
 
       - name: Resolve the PDD corpus for this branch
@@ -554,15 +554,21 @@ jobs:
           if-no-files-found: error
 
   # ═══════════════════════════════════════════════════════════════
-  # 3. Determine architecture
-  # The decision job. It produces no prose - only architecture-<key>.json, the
-  # machine-readable design contract that job 4 writes the SDD from and the
-  # Development stage routes its build tasks from.
+  # 3. Determine architecture, then write the SDD
+  # One job, deliberately. The decision produces architecture-<key>.json - the
+  # machine-readable design contract - and the SDD is written from it in the same
+  # runner. Splitting these cost a second runner spin-up, a second skills install,
+  # a second agent cold start and a full re-read of the PDD: ~50s for nothing,
+  # since the second agent needs exactly the context the first one already had.
   # ═══════════════════════════════════════════════════════════════
-  decide-architecture:
-    name: Determine architecture
+  generate-sdd:
+    name: Architecture + SDD
     needs: [identify, read-pdd]
     runs-on: ubuntu-latest
+    outputs:
+      # Advisory only - the PR opens either way. It exists so the reviewer is told
+      # up front whether the validator was happy, instead of discovering it later.
+      verdict: ${{ steps.verify.outputs.verdict }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -663,8 +669,11 @@ jobs:
 
             Run: `ls ~/.claude/skills`
 
-            If `uipath-planner` is there, invoke the Skill tool with skill
-            `uipath-planner` and follow its **Phase D, Phase 1** in AUTONOMOUS mode
+            If `uipath-planner` is there, READ
+            `~/.claude/skills/uipath-planner/SKILL.md` with the Read tool - NEVER via the
+            Task tool, whose subagent spawn fails here with
+            `404 not_found_error - model: claude-sonnet-4-20250514` - and follow its
+            **Phase D, Phase 1** in AUTONOMOUS mode
             (never ask a question - there is no human in this run). Its
             references/product-selection-guide.md is the authority for every decision
             below: Constraint Gate -> Level 0 -> Level 1 -> Level 1.5 -> Level 1.75 ->
@@ -1051,37 +1060,12 @@ jobs:
           echo "--- architecture.json ---"
           cat "$A"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: architecture
-          path: ${{ env.WORK_DIR }}
-          retention-days: 1
-          if-no-files-found: error
-
-  # ═══════════════════════════════════════════════════════════════
-  # 4. Generate SDD
-  # Writes the document(s) architecture.json declared, validates, repairs once,
-  # then hard-gates. A half-empty SDD must never reach a reviewer - the
-  # Development stage builds straight off this file.
-  # ═══════════════════════════════════════════════════════════════
-  generate-sdd:
-    name: Generate SDD
-    needs: [identify, decide-architecture]
-    runs-on: ubuntu-latest
-    outputs:
-      # Advisory only - the PR opens either way. It exists so the reviewer is told
-      # up front whether the validator was happy, instead of discovering it later.
-      verdict: ${{ steps.verify.outputs.verdict }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.identify.outputs.branch }}
-          fetch-depth: 1
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: architecture
-          path: ${{ env.WORK_DIR }}
+      # ── 4. Generate SDD ─────────────────────────────────────────────────
+      # Writes the document(s) architecture.json declared, validates, repairs
+      # once, then hard-gates. A half-empty SDD must never reach a reviewer -
+      # the Development stage builds straight off this file.
+      # No artifact round-trip and no second checkout: architecture.json is
+      # already in WORK_DIR and the repo is already on disk.
 
       # Runs BEFORE the agent so it edits the document at its final path - otherwise
       # it would update the old file and the rename would look like a delete plus an
@@ -1127,23 +1111,6 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Install UiPath skills
-        id: skills
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          npm i -g @uipath/cli@latest || { echo "::warning::@uipath/cli install failed"; exit 1; }
-          # --path must already exist; the CLI refuses to create it and fails with
-          # "Path does not exist or is not a directory".
-          mkdir -p "$RUNNER_TEMP/uip-skills"
-          uip skills install --agent codex --path "$RUNNER_TEMP/uip-skills" \
-            || { echo "::warning::uip skills install failed"; exit 1; }
-          mkdir -p "$HOME/.claude/skills"
-          cp -R "$RUNNER_TEMP/uip-skills/.agents/skills/." "$HOME/.claude/skills/"
-          echo "Installed skills:"; ls -1 "$HOME/.claude/skills"
-          test -d "$HOME/.claude/skills/uipath-planner" \
-            || { echo "::warning::uipath-planner not among the installed skills"; exit 1; }
-
       - name: Run uipath-architect agent
         uses: anthropics/claude-code-base-action@beta
         with:
@@ -1167,8 +1134,11 @@ jobs:
 
             ## Step 0 - load the planner skill if it is installed
 
-            Run `ls ~/.claude/skills`. If `uipath-planner` is there, invoke the Skill tool
-            with skill `uipath-planner`, then for every file in `sdd_files` LOCATE the
+            Run `ls ~/.claude/skills`. If `uipath-planner` is there, READ
+            `~/.claude/skills/uipath-planner/SKILL.md` with the Read tool - NEVER via the
+            Task tool, whose subagent spawn fails here with
+            `404 not_found_error - model: claude-sonnet-4-20250514` - then for every file
+            in `sdd_files` LOCATE the
             template it names by searching for it - the package nests some templates one
             level deeper than others, so search rather than assume a flat path:
 
@@ -1270,8 +1240,6 @@ jobs:
                 ## Action Required — Architect Review Items
                 (only when architect_review_items is non-empty)
 
-                ## Table of Contents
-
             For a `solution-root` file add these handoff rows too: `Solution root SDD` (its
             own filename), `Solution ID`, `Project SDD role: root`. Every `project` file
             carries `Solution root SDD` pointing at the root, the SAME `Solution ID`, the
@@ -1328,8 +1296,21 @@ jobs:
             **api-workflow-sdd-template.md**
             1. API Workflow Overview · 2. Input Schema · 3. Output Schema ·
             4. Execution Flow · 5. Connectors & External Calls · 6. Error Handling ·
-            7. Performance & Scaling · 8. Security & Authentication · 9. Consumers ·
-            10. Project Structure · 11. Testing Strategy · 12. Next Steps
+            7. Security & Authentication · 8. Project Structure · 9. Testing Strategy ·
+            10. Next Steps
+
+            For this template the sections `Performance & Scaling` and `Consumers` are
+            DELIBERATELY OMITTED - do not emit them even if the template file lists them.
+            They are the one case where the generated SDD is a subset of its template.
+
+            ## Keep Testing Strategy short
+
+            `Testing Strategy` is capped at exactly three `###` subsections - happy path,
+            business exceptions, system errors - each a compact table or bullet list. It
+            was the largest section in the last SDD at 8 KB. Do NOT expand it into
+            acceptance-criteria matrices, test-data appendices or eval-set scaffolding:
+            the project's own eval/test mechanism owns those, and the build stage reads
+            the code, not this section.
 
             ## What "ready for development" means
 
@@ -1714,7 +1695,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          .github/scripts/observe.sh stage Architecture status=in-review decidedBy=auto \
+          bash .github/scripts/observe.sh stage Architecture status=in-review decidedBy=auto \
             pr="${{ steps.pr.outputs.pr_number }}" prUrl="${{ steps.pr.outputs.pr_url }}"
 
   # ═══════════════════════════════════════════════════════════════
@@ -1757,23 +1738,6 @@ jobs:
             echo "[#$PR_NUMBER]($PR_URL) into \`$BASE_BRANCH\` - $RESULT."
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ═══════════════════════════════════════════════════════════════
-  # 7. Start Development
-  # This stage merges its own PR, so nothing external will notice and cut the next
-  # branch for it - a merge performed with GITHUB_TOKEN raises no event that can
-  # start another workflow. It therefore hands over itself, in this same run.
-  #
-  # The analysis key is carried through unchanged:
-  #   architecture-jactiv-611 -> dev-jactiv-611
-  #
-  # `needs: merge` rather than a step inside it, so a failed merge cannot leave a
-  # development branch pointing at a design that never landed on develop.
-  # ═══════════════════════════════════════════════════════════════      - uses: actions/checkout@v4
-        with:
-          ref: develop
-          sparse-checkout: .github/scripts
-          fetch-depth: 1
-
       # This job otherwise makes only `gh` API calls and needs no working tree - but
       # observe.sh is a FILE, and a job that never checks out has an empty workspace.
       # Sparse: only the scripts, from develop, so it costs a second.
@@ -1791,12 +1755,23 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          .github/scripts/observe.sh stage Architecture status=done
-          .github/scripts/observe.sh document sdd \
+          bash .github/scripts/observe.sh stage Architecture status=done
+          bash .github/scripts/observe.sh document sdd \
             path="${{ needs.identify.outputs.sdd_file }}" \
             url="https://github.com/${{ github.repository }}/blob/develop/${{ needs.identify.outputs.sdd_file }}"
 
-
+  # ═══════════════════════════════════════════════════════════════
+  # 7. Start Development
+  # This stage merges its own PR, so nothing external will notice and cut the next
+  # branch for it - a merge performed with GITHUB_TOKEN raises no event that can
+  # start another workflow. It therefore hands over itself, in this same run.
+  #
+  # The analysis key is carried through unchanged:
+  #   architecture-jactiv-611 -> dev-jactiv-611
+  #
+  # `needs: merge` rather than a step inside it, so a failed merge cannot leave a
+  # development branch pointing at a design that never landed on develop.
+  # ═══════════════════════════════════════════════════════════════
   next-stage:
     name: Start Development
     needs: [identify, merge]
@@ -1861,7 +1836,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          .github/scripts/observe.sh stage Development status=in-progress \
+          bash .github/scripts/observe.sh stage Development status=in-progress \
             task="Building the automation"
 
   # ═══════════════════════════════════════════════════════════════
@@ -1872,7 +1847,7 @@ jobs:
   # ═══════════════════════════════════════════════════════════════
   faulted:
     name: Record fault
-    needs: [guard, identify, read-pdd, decide-architecture, generate-sdd, open-pr, merge, next-stage]
+    needs: [guard, identify, read-pdd, generate-sdd, open-pr, merge, next-stage]
     if: failure()
     runs-on: ubuntu-latest
     steps:
@@ -1890,7 +1865,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          .github/scripts/observe.sh stage Architecture status=faulted \
+          bash .github/scripts/observe.sh stage Architecture status=faulted \
             task="The architecture run failed" \
             run=${{ github.run_id }} \
             runUrl=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

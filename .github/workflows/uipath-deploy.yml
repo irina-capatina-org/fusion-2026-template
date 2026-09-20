@@ -153,6 +153,7 @@ jobs:
       folder_path:   ${{ steps.r.outputs.folder_path }}
       arch_file:     ${{ steps.r.outputs.arch_file }}
       packages:      ${{ steps.r.outputs.packages }}
+      solution_dir:  ${{ steps.r.outputs.solution_dir }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -166,7 +167,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          .github/scripts/observe.sh stage Production status=in-progress \
+          bash .github/scripts/observe.sh stage Production status=in-progress \
             task="Deploying" run=${{ github.run_id }}
 
       - name: Read the design
@@ -195,22 +196,32 @@ jobs:
             exit 1
           fi
 
-          # Every buildable project directory, in build order - used by the
-          # single-product path, which publishes each package on its own.
-          PACKAGES=$(python3 - "$ARCH_FILE" <<'EOF_PKG'
-          import json, sys, os
-          d = json.load(open(sys.argv[1]))
-          out = []
-          for p in sorted(d["projects"], key=lambda x: x.get("build_order", 99)):
-              if p.get("role") == "component":
-                  continue
-              kebab = p.get("kebab") or p["name"].lower().replace(".", "-")
-              path = os.path.join("code", kebab)
-              if path not in out:
-                  out.append(path)
-          print(" ".join(out))
-          EOF_PKG
-          )
+          # Project folders are named by the coding agent, not by the design, so
+          # they are discovered on disk rather than derived. uipath-develop already
+          # works this way; deriving code/<kebab> here was the one place that
+          # guessed, and it guessed wrong every time `uip` scaffolded a solution as
+          # code/<solution>/<Project>/.
+          SOLUTION_DIR=$(find "$CODE_DIR" -maxdepth 3 -type f \
+                           \( -name '*.uipx' -o -name 'solution.json' \) \
+                           -not -path "*/dist/*" -not -path "*/obj/*" \
+                           -exec dirname {} \; 2>/dev/null | sort -u | head -1 || true)
+
+          # Only used when there is no solution manifest, where each project ships
+          # its own package.
+          PACKAGES=$(find "$CODE_DIR" -maxdepth 3 -type f \
+                       \( -name 'project.uiproj' -o -name 'project.json' \
+                          -o -name 'uipath.json' -o -name 'agent.json' \) \
+                       -not -path "*/dist/*" -not -path "*/obj/*" \
+                       -exec dirname {} \; 2>/dev/null | sort -u | tr '\n' ' ' || true)
+
+          if [ -n "${SOLUTION_DIR:-}" ]; then
+            echo "Solution manifest found in $SOLUTION_DIR - packing as a solution."
+          elif [ -z "${PACKAGES// /}" ]; then
+            echo "::error::No solution manifest and no project directory under $CODE_DIR/."
+            echo "::error::Nothing to pack. What is actually on disk:"
+            find "$CODE_DIR" -type f | head -40
+            exit 1
+          fi
 
           {
             echo "scope=$SCOPE"
@@ -220,6 +231,7 @@ jobs:
             echo "folder_path=$FOLDER_PATH"
             echo "arch_file=$ARCH_FILE"
             echo "packages=$PACKAGES"
+            echo "solution_dir=$SOLUTION_DIR"
           } >> "$GITHUB_OUTPUT"
 
           {
@@ -233,7 +245,7 @@ jobs:
             echo "| Name | \`$NAME\` |"
             echo "| Version | \`$VERSION\` |"
             echo "| Folder | \`$FOLDER_PATH\` |"
-            echo "| Shipping path | $([ "$SCOPE" = "solution" ] && echo 'Solution (.uipx)' || echo 'single package per project') |"
+            echo "| Shipping path | $([ -n "${SOLUTION_DIR:-}" ] && echo 'Solution (.uipx)' || echo 'single package per project') |"
             echo "| Dry run | \`${{ inputs.dry_run }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -277,17 +289,15 @@ jobs:
           NAME:     ${{ needs.resolve.outputs.solution_name }}
           VERSION:  ${{ needs.resolve.outputs.version }}
           PACKAGES: ${{ needs.resolve.outputs.packages }}
+          SOLUTION_DIR: ${{ needs.resolve.outputs.solution_dir }}
         run: |
           set -euo pipefail
           mkdir -p "$OUTPUT_DIR"
 
-          if [ "$SCOPE" = "solution" ]; then
-            # One .uipx for the whole solution. Its root is wherever the solution
-            # manifest lives - the repo root if the projects sit under code/.
-            SOLUTION_DIR="."
-            if [ -f "$CODE_DIR/solution.json" ] || ls "$CODE_DIR"/*.uipx >/dev/null 2>&1; then
-              SOLUTION_DIR="$CODE_DIR"
-            fi
+          if [ -n "${SOLUTION_DIR:-}" ]; then
+            # One .uipx for the whole solution, packed from wherever the manifest
+            # actually lives. resolve found that on disk - it is not assumed to sit
+            # at the top of code/, because `uip` scaffolds code/<solution>/<Project>/.
             echo "Packing solution from $SOLUTION_DIR"
             uip solution pack "$SOLUTION_DIR" "$OUTPUT_DIR" --name "$NAME" --version "$VERSION"
           else
@@ -563,7 +573,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          .github/scripts/observe.sh stage Production status=done
+          bash .github/scripts/observe.sh stage Production status=done
 
   # ═══════════════════════════════════════════════════════════════
   # Fault
@@ -591,7 +601,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          .github/scripts/observe.sh stage Production status=faulted \
+          bash .github/scripts/observe.sh stage Production status=faulted \
             task="The production run failed" \
             run=${{ github.run_id }} \
             runUrl=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
