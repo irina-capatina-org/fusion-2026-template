@@ -90,6 +90,14 @@ jobs:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
 
+      - name: Observe - Documentation in progress
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          .github/scripts/observe.sh stage Documentation status=in-progress \
+            task="Writing the as-built DSD" run=${{ github.run_id }}
+
       - name: Resolve the delivered build
         id: resolve
         run: |
@@ -366,6 +374,9 @@ jobs:
         run: |
           set -uo pipefail
           npm i -g "@uipath/cli@${CLI_VERSION}" || { echo "::warning::@uipath/cli install failed"; exit 1; }
+          # --path must already exist; the CLI refuses to create it and fails with
+          # "Path does not exist or is not a directory".
+          mkdir -p "$RUNNER_TEMP/uip-skills"
           uip skills install --agent codex --path "$RUNNER_TEMP/uip-skills" \
             || { echo "::warning::uip skills install failed"; exit 1; }
           mkdir -p "$HOME/.claude/skills"
@@ -736,7 +747,27 @@ jobs:
   # 6. Promote to main
   # The release gate. This PR is the only one in the chain a human must approve
   # besides the PDD, and merging it is what triggers uipath-deploy.
-  # ═══════════════════════════════════════════════════════════════
+  # ═══════════════════════════════════════════════════════════════      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
+      - name: Observe - Documentation done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          .github/scripts/observe.sh stage Documentation status=done
+          # dsd_files is a space-separated list (one DSD per project); the first
+          # is the primary document. dsd_plan is a TSV build plan, not a path.
+          DSD_FILE="$(echo "${{ needs.identify.outputs.dsd_files }}" | awk '{print $1}')"
+
+          .github/scripts/observe.sh document dsd \
+            path="$DSD_FILE" \
+            url="https://github.com/${{ github.repository }}/blob/develop/$DSD_FILE"
+
+
   promote:
     name: Promote to main
     needs: [identify, merge]
@@ -847,3 +878,39 @@ jobs:
             echo "Merging it approves production and triggers \`uipath-deploy\`."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "Release PR #$PR_NUMBER -> $PR_URL"
+
+      - name: Observe - Production awaiting release approval
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          .github/scripts/observe.sh stage Production status=in-review decidedBy=human \
+            task="Release PR open for approval"
+
+  # ═══════════════════════════════════════════════════════════════
+  # Fault
+  # Without this a crashed run leaves the stage on `in-progress` and the card
+  # spins for ever. Runs only when a job above actually failed - a skipped job
+  # does not count as a failure.
+  # ═══════════════════════════════════════════════════════════════
+  faulted:
+    name: Record fault
+    needs: [identify, read-build, generate-dsd, open-pr, merge, promote]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
+      - name: Observe - Documentation faulted
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          .github/scripts/observe.sh stage Documentation status=faulted \
+            task="The documentation run failed" \
+            run=${{ github.run_id }} \
+            runUrl=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

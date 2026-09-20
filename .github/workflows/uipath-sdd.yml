@@ -222,6 +222,14 @@ jobs:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
 
+      - name: Observe - Architecture in progress
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          .github/scripts/observe.sh stage Architecture status=in-progress \
+            task="Determining architecture" run=${{ github.run_id }}
+
       - name: Resolve the PDD corpus for this branch
         id: resolve
         run: |
@@ -575,6 +583,9 @@ jobs:
           npm i -g @uipath/cli@latest || { echo "::warning::@uipath/cli install failed"; exit 1; }
           # --agent codex writes plain folders under .agents/skills/, which needs no
           # plugin machinery - then they are moved where Claude Code looks for them.
+          # --path must already exist; the CLI refuses to create it and fails with
+          # "Path does not exist or is not a directory".
+          mkdir -p "$RUNNER_TEMP/uip-skills"
           uip skills install --agent codex --path "$RUNNER_TEMP/uip-skills" \
             || { echo "::warning::uip skills install failed"; exit 1; }
           mkdir -p "$HOME/.claude/skills"
@@ -1119,6 +1130,9 @@ jobs:
         run: |
           set -uo pipefail
           npm i -g @uipath/cli@latest || { echo "::warning::@uipath/cli install failed"; exit 1; }
+          # --path must already exist; the CLI refuses to create it and fails with
+          # "Path does not exist or is not a directory".
+          mkdir -p "$RUNNER_TEMP/uip-skills"
           uip skills install --agent codex --path "$RUNNER_TEMP/uip-skills" \
             || { echo "::warning::uip skills install failed"; exit 1; }
           mkdir -p "$HOME/.claude/skills"
@@ -1689,10 +1703,19 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "Opened/updated PR #$PR_NUMBER -> $PR_URL"
 
+      - name: Observe - Architecture in review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          .github/scripts/observe.sh stage Architecture status=in-review decidedBy=auto \
+            pr="${{ steps.pr.outputs.pr_number }}" prUrl="${{ steps.pr.outputs.pr_url }}"
+
   # ═══════════════════════════════════════════════════════════════
   # 6. Merge
   # No human gate on the SDD - see the note in the header.
   # ═══════════════════════════════════════════════════════════════
+
   merge:
     name: Merge
     needs: [identify, open-pr]
@@ -1739,7 +1762,23 @@ jobs:
   #
   # `needs: merge` rather than a step inside it, so a failed merge cannot leave a
   # development branch pointing at a design that never landed on develop.
-  # ═══════════════════════════════════════════════════════════════
+  # ═══════════════════════════════════════════════════════════════      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
+      - name: Observe - Architecture done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          .github/scripts/observe.sh stage Architecture status=done
+          .github/scripts/observe.sh document sdd \
+            path="${{ needs.identify.outputs.sdd_file }}" \
+            url="https://github.com/${{ github.repository }}/blob/develop/${{ needs.identify.outputs.sdd_file }}"
+
+
   next-stage:
     name: Start Development
     needs: [identify, merge]
@@ -1789,3 +1828,45 @@ jobs:
               echo "> Created with \`GITHUB_TOKEN\`, so \`uipath-develop\` will **not** start by itself."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
+      - name: Observe - Development begins
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          .github/scripts/observe.sh stage Development status=in-progress \
+            task="Building the automation"
+
+  # ═══════════════════════════════════════════════════════════════
+  # Fault
+  # Without this a crashed run leaves the stage on `in-progress` and the card
+  # spins for ever. Runs only when a job above actually failed - a skipped job
+  # does not count as a failure.
+  # ═══════════════════════════════════════════════════════════════
+  faulted:
+    name: Record fault
+    needs: [guard, identify, read-pdd, decide-architecture, generate-sdd, open-pr, merge, next-stage]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
+      - name: Observe - Architecture faulted
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          .github/scripts/observe.sh stage Architecture status=faulted \
+            task="The architecture run failed" \
+            run=${{ github.run_id }} \
+            runUrl=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

@@ -154,6 +154,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Observe - Production in progress
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          .github/scripts/observe.sh stage Production status=in-progress \
+            task="Deploying" run=${{ github.run_id }}
+
       - name: Read the design
         id: r
         run: |
@@ -533,3 +541,44 @@ jobs:
             echo "the SDD's *Credentials & Assets* section lists what must exist, and the"
             echo "\`uipath-platform\` skill creates them."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
+      - name: Observe - Production live
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          .github/scripts/observe.sh stage Production status=done
+
+  # ═══════════════════════════════════════════════════════════════
+  # Fault
+  # Without this a crashed run leaves the stage on `in-progress` and the card
+  # spins for ever. Runs only when a job above actually failed - a skipped job
+  # does not count as a failure.
+  # ═══════════════════════════════════════════════════════════════
+  faulted:
+    name: Record fault
+    needs: [guard, resolve, build, deploy, verify]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
+      - name: Observe - Production faulted
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          .github/scripts/observe.sh stage Production status=faulted \
+            task="The production run failed" \
+            run=${{ github.run_id }} \
+            runUrl=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

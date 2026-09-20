@@ -97,6 +97,14 @@ jobs:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
 
+      - name: Observe - Development in progress
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          .github/scripts/observe.sh stage Development status=in-progress \
+            task="Deriving tasks" run=${{ github.run_id }}
+
       - name: Resolve the design for this branch
         id: resolve
         run: |
@@ -246,6 +254,9 @@ jobs:
         run: |
           set -uo pipefail
           npm i -g "@uipath/cli@${CLI_VERSION}" || { echo "::warning::@uipath/cli install failed"; exit 1; }
+          # --path must already exist; the CLI refuses to create it and fails with
+          # "Path does not exist or is not a directory".
+          mkdir -p "$RUNNER_TEMP/uip-skills"
           uip skills install --agent codex --path "$RUNNER_TEMP/uip-skills" \
             || { echo "::warning::uip skills install failed"; exit 1; }
           mkdir -p "$HOME/.claude/skills"
@@ -372,6 +383,9 @@ jobs:
           set -uo pipefail
           npm i -g "@uipath/cli@${CLI_VERSION}" || { echo "::warning::@uipath/cli install failed"; exit 1; }
           uip --version
+          # --path must already exist; the CLI refuses to create it and fails with
+          # "Path does not exist or is not a directory".
+          mkdir -p "$RUNNER_TEMP/uip-skills"
           uip skills install --agent codex --path "$RUNNER_TEMP/uip-skills" \
             || { echo "::warning::uip skills install failed"; exit 1; }
           mkdir -p "$HOME/.claude/skills"
@@ -495,7 +509,12 @@ jobs:
             echo ""
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
-          [ "${BLOCKED:-0}" -gt 0 ] && echo "::warning::build-notes.md mentions blocked work - check the summary."
+          # NOT `[ cond ] && echo ...`: this is the last command in the step, it runs under
+          # `bash -e`, and a false test makes the whole step exit 1 - failing a build that
+          # actually succeeded, purely because nothing was blocked.
+          if [ "${BLOCKED:-0}" -gt 0 ]; then
+            echo "::warning::build-notes.md mentions blocked work - check the summary."
+          fi
 
       - name: Commit build
         run: |
@@ -542,6 +561,9 @@ jobs:
           set -uo pipefail
           npm i -g "@uipath/cli@${CLI_VERSION}" || { echo "::warning::@uipath/cli install failed"; exit 1; }
           uip --version
+          # --path must already exist; the CLI refuses to create it and fails with
+          # "Path does not exist or is not a directory".
+          mkdir -p "$RUNNER_TEMP/uip-skills"
           uip skills install --agent codex --path "$RUNNER_TEMP/uip-skills" \
             || { echo "::warning::uip skills install failed"; exit 1; }
           mkdir -p "$HOME/.claude/skills"
@@ -550,6 +572,13 @@ jobs:
       # Deterministic first pass. The verbs differ per product and the CLI surface
       # drifts between versions, so an unknown-command result is reported for the
       # agent to resolve rather than treated as a build failure.
+      - name: Observe - Testing in progress
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          .github/scripts/observe.sh stage Testing status=in-progress task="Running tests"
+
       - name: Validate project
         id: validate
         continue-on-error: true
@@ -707,11 +736,19 @@ jobs:
             echo "| Re-validate | ${{ steps.revalidate.outcome || 'skipped - first pass was clean' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Observe - Testing passed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          .github/scripts/observe.sh stage Testing status=done
+
   # ═══════════════════════════════════════════════════════════════
   # 5. Open PR
   # The Maestro resume signal, and the surface uipath-review.yml reviews.
   # No auto-merge - the human merge is the approval.
   # ═══════════════════════════════════════════════════════════════
+
   open-pr:
     name: Open PR
     needs: [identify, test]
@@ -850,3 +887,54 @@ jobs:
             echo ""
             echo "[#$PR_NUMBER]($PR_URL) assigned to \`$ASSIGNEE\`. \`uipath-review\` reviews it and merges on approval."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
+      - name: Observe - Development in review
+        env:
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          REPO:      ${{ github.repository }}
+          PR_NUMBER: ${{ needs.open-pr.outputs.pr_number }}
+          PR_URL:    ${{ needs.open-pr.outputs.pr_url }}
+        run: |
+          .github/scripts/observe.sh stage Development status=in-review decidedBy=agent \
+            pr="$PR_NUMBER" prUrl="$PR_URL"
+
+  # ═══════════════════════════════════════════════════════════════
+  # Fault
+  # Without this a crashed run leaves the stage on `in-progress` and the card
+  # spins for ever. Runs only when a job above actually failed - a skipped job
+  # does not count as a failure.
+  # ═══════════════════════════════════════════════════════════════
+  faulted:
+    name: Record fault
+    needs: [identify, derive-tasks, build, test, open-pr, assign-pr]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
+      - name: Observe - Development faulted
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          # The tests are a job here, not a workflow, so a red test run has to
+          # fault the Testing bubble as well as Development.
+          if [ "${{ needs.test.result }}" = "failure" ]; then
+            .github/scripts/observe.sh stage Testing status=faulted \
+              task="Tests failed"
+          fi
+
+          .github/scripts/observe.sh stage Development status=faulted \
+            task="The development run failed" \
+            run=${{ github.run_id }} \
+            runUrl=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

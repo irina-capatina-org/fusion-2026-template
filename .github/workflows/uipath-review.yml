@@ -279,6 +279,9 @@ jobs:
         run: |
           set -uo pipefail
           npm i -g "@uipath/cli@${CLI_VERSION}" || { echo "::warning::@uipath/cli install failed"; exit 1; }
+          # --path must already exist; the CLI refuses to create it and fails with
+          # "Path does not exist or is not a directory".
+          mkdir -p "$RUNNER_TEMP/uip-skills"
           uip skills install --agent codex --path "$RUNNER_TEMP/uip-skills" \
             || { echo "::warning::uip skills install failed"; exit 1; }
           mkdir -p "$HOME/.claude/skills"
@@ -520,7 +523,25 @@ jobs:
   # Guarded on the merge having HAPPENED, not merely on the job having run: a
   # request-changes verdict escalates to a human and leaves the PR open, and Docs
   # must not document code that has not landed.
-  # ═══════════════════════════════════════════════════════════════
+  # ═══════════════════════════════════════════════════════════════      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
+      - name: Observe - Development decided
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          if [ "${{ steps.merge.outputs.merged }}" = "true" ]; then
+            .github/scripts/observe.sh stage Development status=done
+          else
+            .github/scripts/observe.sh stage Development status=in-review decidedBy=human \
+              task="The review agent requested changes"
+          fi
+
+
   next-stage:
     name: Start Docs
     needs: [validate, merge-or-escalate]
@@ -578,3 +599,45 @@ jobs:
               echo "> Created with \`GITHUB_TOKEN\`, so \`uipath-dsd\` will **not** start by itself."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
+      - name: Observe - Documentation begins
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          .github/scripts/observe.sh stage Documentation status=in-progress \
+            task="Writing the as-built DSD"
+
+  # ═══════════════════════════════════════════════════════════════
+  # Fault
+  # Without this a crashed run leaves the stage on `in-progress` and the card
+  # spins for ever. Runs only when a job above actually failed - a skipped job
+  # does not count as a failure.
+  # ═══════════════════════════════════════════════════════════════
+  faulted:
+    name: Record fault
+    needs: [validate, review, merge-or-escalate, next-stage]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
+      - name: Observe - Development faulted
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          .github/scripts/observe.sh stage Development status=faulted \
+            task="The development run failed" \
+            run=${{ github.run_id }} \
+            runUrl=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

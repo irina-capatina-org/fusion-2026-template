@@ -67,6 +67,21 @@ jobs:
           ref: ${{ github.ref_name }}
           fetch-depth: 1
 
+      # The card must light up before the agent starts thinking, not after.
+      - name: Observe - Analysis in progress
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          # The key is derived here rather than taken from the resolve step, so
+          # the card lights up before any of the identification work runs.
+          #   analysis-jactiv-611 -> jactiv-611 -> JACTIV-611
+          EPIC="$(echo "${GITHUB_REF_NAME#*-}" | tr '[:lower:]' '[:upper:]')"
+
+          .github/scripts/observe.sh set epicKey="$EPIC" repo="${{ github.repository }}"
+          .github/scripts/observe.sh stage Analysis \
+            status=in-progress task="Reading the request" run=${{ github.run_id }}
+
       - name: Resolve request document for this branch
         id: resolve
         run: |
@@ -649,3 +664,55 @@ jobs:
             echo ""
             echo "[#$PR_NUMBER]($PR_URL) assigned to \`$ASSIGNEE\`."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # `waiting` is what the app reads as an open gate: the PDD exists, the PR
+      # is open, and nothing moves until a person merges it.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.identify.outputs.branch }}
+          fetch-depth: 1
+
+      - name: Observe - Analysis in review
+        env:
+          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          REPO:       ${{ github.repository }}
+          PR_NUMBER:  ${{ needs.open-pr.outputs.pr_number }}
+          PR_URL:     ${{ needs.open-pr.outputs.pr_url }}
+          STORY_KEY:  ${{ needs.identify.outputs.story_key }}
+          PDD_FILE:   ${{ needs.identify.outputs.pdd_file }}
+          BRANCH:     ${{ needs.identify.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          .github/scripts/observe.sh stage Analysis status=in-review decidedBy=human \
+            task="PDD ready for review" \
+            pr="$PR_NUMBER" prUrl="$PR_URL" story="$STORY_KEY"
+
+          # Linked on the analysis branch, where it exists right now. The same
+          # path resolves on develop once the PR is merged.
+          .github/scripts/observe.sh document pdd path="$PDD_FILE" \
+            url="https://github.com/${{ github.repository }}/blob/$BRANCH/$PDD_FILE"
+
+  # ═══════════════════════════════════════════════════════════════
+  # Without this a crashed run leaves Analysis on `running` and the card spins
+  # for ever. Runs only when something above actually failed.
+  # ═══════════════════════════════════════════════════════════════
+  faulted:
+    name: Record fault
+    needs: [identify, read-request, generate-pdd, open-pr, assign-pr]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 1
+
+      - name: Observe - Analysis faulted
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          .github/scripts/observe.sh stage Analysis status=faulted \
+            task="Analysis run failed" run=${{ github.run_id }} \
+            runUrl=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
