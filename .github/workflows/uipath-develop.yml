@@ -699,6 +699,22 @@ jobs:
                      \( -name 'Workflow.json' -o -name 'project.json' -o -name 'uipath.json' \
                      -o -name 'agent.json' -o -name 'entry-points.json' \) | sort)
 
+          # Runnability. `uip api-workflow validate` checks the SHAPE of the file:
+          # to it a `<TODO: ...>` connection id is a valid string and an invented
+          # connector is a well-formed object, so a workflow that cannot possibly
+          # run passes it clean. validate-build.sh makes the checks it cannot -
+          # unresolved placeholders, connector keys and connection ids that are not
+          # in architectural-considerations.md §4, and curated vendor activities
+          # this runner has no credentials to resolve. No-ops when the build
+          # produced no Workflow.json, so it is safe for every product.
+          if [ -f .github/scripts/validate-build.sh ]; then
+            echo "=== validate-build.sh ===" | tee -a "$LOG"
+            bash .github/scripts/validate-build.sh "$CODE_DIR" \
+              "$DOCS_DIR/architectural-considerations.md" 2>&1 | tee -a "$LOG" || RC=1
+          else
+            echo "::warning::.github/scripts/validate-build.sh is missing - runnability not checked" | tee -a "$LOG"
+          fi
+
           # Deploy readiness. Packing is the only offline proof that uipath-deploy will
           # be able to publish this - a project can validate and run and still fail to
           # pack (missing solution registration, bad version, unresolved resource).
@@ -747,10 +763,19 @@ jobs:
             Make these four things pass, in this order:
 
             1. **Structurally sound** - the product's `validate` command is clean.
-            2. **Packs** - `uip solution pack` succeeds (this is the deploy gate).
-            3. **Runs** - the product's local run (`--no-auth` where it applies)
+            2. **Runnable** - `validate-build.sh` is clean. It reports things the
+               shape validator cannot see: a `<TODO: ...>` left in a connection or
+               activity id, a connector key or connection id that is not in
+               `architectural-considerations.md` §4, or a curated vendor activity
+               where §4 requires the connector's `httpRequest`. Every message names
+               the activity and what to write instead - that is the whole fix. The
+               connection ids come from the §4 table; if the value you need is not
+               there, stop and record it, do not invent one.
+            3. **Packs** - `uip solution pack` succeeds (this is the deploy gate).
+            4. **Runs** - the product's local run (`--no-auth` where it applies)
                completes without an unhandled fault.
-            4. Nothing else.
+            5. Nothing else. An activity-count WARNING is not yours to fix -
+               the size of the design is the PDD's business, not a repair job.
 
             ## Scope - read this twice
 
