@@ -81,20 +81,18 @@ REQUIRED_SECTIONS=(
   "2. Introduction"
   "3. Process Overview"
   "4. Scope"
-  "5. As-Is Process"
-  "6. To-Be Process (High Level)"
-  "7. Detailed Process Steps"
-  "8. Applications and Systems"
-  "9. Business Rules"
-  "10. Business Exceptions"
-  "11. System Errors"
-  "12. Data Definitions"
-  "13. Environment and Constraint Signals"
-  "14. Reporting Requirements"
-  "15. Canonical Test Data"
-  "16. Decomposition Signals"
-  "17. Assumptions, Dependencies and Open Questions"
-  "18. Benefits and Success Criteria"
+  "5. To-Be Process (High Level)"
+  "6. Detailed Process Steps"
+  "7. Applications and Systems"
+  "8. Business Rules"
+  "9. Business Exceptions"
+  "10. System Errors"
+  "11. Data Definitions"
+  "12. Environment and Constraint Signals"
+  "13. Canonical Test Data"
+  "14. Decomposition Signals"
+  "15. Assumptions, Dependencies and Open Questions"
+  "16. Benefits and Success Criteria"
 )
 
 echo "Validating $PDD_FILE"
@@ -176,15 +174,15 @@ fi
 
 # --- detailed process steps must actually be detailed ----------------------
 STEP_ROWS=$(awk '
-  $0 == "## 7. Detailed Process Steps" { inside = 1; next }
+  $0 == "## 6. Detailed Process Steps" { inside = 1; next }
   inside && /^## / { exit }
   inside && /^\|/ && $0 !~ /^\|[ :|-]+\|[ :|-]*$/ { n++ }
   END { print n + 0 }
 ' "$PDD_FILE")
 if [ "$STEP_ROWS" -lt 5 ]; then
-  fail "Section 7 has only ${STEP_ROWS} table rows - needs a real step-by-step breakdown (header + at least 4 steps)."
+  fail "Section 6 has only ${STEP_ROWS} table rows - needs a real step-by-step breakdown (header + at least 4 steps)."
 else
-  ok "section 7 has ${STEP_ROWS} table rows"
+  ok "section 6 has ${STEP_ROWS} table rows"
 fi
 
 echo

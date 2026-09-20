@@ -260,9 +260,7 @@ Output Schema
 Execution Flow
 Connectors & External Calls
 Error Handling
-Performance & Scaling
 Security & Authentication
-Consumers
 Project Structure
 Testing Strategy
 Next Steps
@@ -413,7 +411,9 @@ while IFS=$'\t' read -r SDD TEMPLATE ROLE PRODUCT; do
   esac
 
   # --- universal front matter ---------------------------------------------
-  for h in '## Recommended Scope' '## Table of Contents'; do
+  # A Table of Contents is no longer required: it is generated text that nothing
+  # downstream reads, and every second of it is a second on the demo clock.
+  for h in '## Recommended Scope'; do
     grep -qxF "$h" "$SDD" || fail "$SDD is missing '$h'."
   done
   check_document_history "$SDD"

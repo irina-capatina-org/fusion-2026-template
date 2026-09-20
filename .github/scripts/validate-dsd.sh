@@ -93,13 +93,13 @@ check_document_history() {
 
 # ── the section contract ─────────────────────────────────────────────────────
 # Kept in sync with the section list in uipath-dsd.yml's agent prompt.
+# Component Reference, Data and Interface Reference and Business Rules Implemented
+# were dropped: they restated the SDD instead of recording what only the build knows,
+# and together they were ~105s of generation on the critical path.
 REQUIRED_SECTIONS=(
   "Solution Overview"
   "As-Built Architecture"
-  "Component Reference"
-  "Data and Interface Reference"
   "Configuration Reference"
-  "Business Rules Implemented"
   "Exception and Error Handling"
   "Operations Runbook"
   "Troubleshooting Guide"
@@ -262,34 +262,6 @@ while IFS=$'\t' read -r DSD SDD PRODUCT SKILL PROJECT; do
   fi
 
   # --- the sections support actually opens --------------------------------
-  COMP_SUBS=$(awk '
-    /^## ([0-9]+\. )?Component Reference$/ { inside = 1; next }
-    inside && /^## / { exit }
-    inside && /^### / { n++ }
-    END { print n + 0 }
-  ' "$DSD")
-  # Content lines only - the '###' headings are structure, not documentation, and
-  # counting them would let four bare headings look like four documented components.
-  COMP_LINES=$(awk '
-    /^## ([0-9]+\. )?Component Reference$/ { inside = 1; next }
-    inside && /^## / { exit }
-    inside && /^### / { next }
-    inside && NF { n++ }
-    END { print n + 0 }
-  ' "$DSD")
-  # Depth is measured PER COMPONENT: four content lines is what it takes to give a
-  # file path, a purpose, the inputs and outputs, and the error behaviour. A flat
-  # total would only reward padding.
-  COMP_MIN=$(( ${COMP_SUBS:-0} * 4 ))
-  [ "$COMP_MIN" -ge 16 ] || COMP_MIN=16
-  if [ "${COMP_SUBS:-0}" -lt 2 ]; then
-    fail "$DSD Component Reference has only ${COMP_SUBS} '###' component(s) - document each one separately."
-  elif [ "${COMP_LINES:-0}" -lt "$COMP_MIN" ]; then
-    fail "$DSD Component Reference is ${COMP_LINES} lines for ${COMP_SUBS} components (needs ${COMP_MIN}) - under-documented."
-  else
-    ok "Component Reference: ${COMP_SUBS} components, ${COMP_LINES} lines (floor ${COMP_MIN})"
-  fi
-
   rows_in() {
     awk -v want="$1" '
       $0 ~ "^## ([0-9]+\\. )?"want"$" { inside = 1; next }
@@ -299,7 +271,7 @@ while IFS=$'\t' read -r DSD SDD PRODUCT SKILL PROJECT; do
     ' "$DSD"
   }
 
-  for section in "Configuration Reference" "Business Rules Implemented" "Troubleshooting Guide"; do
+  for section in "Configuration Reference" "Troubleshooting Guide"; do
     ROWS=$(rows_in "$section")
     if [ "${ROWS:-0}" -lt 3 ]; then
       fail "$DSD section '$section' has only ${ROWS} table row(s) - it must be a real table."
@@ -355,7 +327,9 @@ while IFS=$'\t' read -r DSD SDD PRODUCT SKILL PROJECT; do
 
   # --- traceability against the SDD ---------------------------------------
   # A business rule the design required and the documentation never mentions means
-  # nobody can tell whether it was built. That is the point of section 6.
+  # nobody can tell whether it was built. Since the standalone 'Business Rules
+  # Implemented' section was dropped, the compact 'Rule | Enforced in' table at the
+  # end of As-Built Architecture is what satisfies this.
   if [ -z "$SDD" ] || [ ! -f "$SDD" ]; then
     warn "source SDD '$SDD' not available - skipping traceability for $DSD"
   else
