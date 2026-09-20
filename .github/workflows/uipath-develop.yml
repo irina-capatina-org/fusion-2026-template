@@ -704,8 +704,8 @@ jobs:
           # connector is a well-formed object, so a workflow that cannot possibly
           # run passes it clean. validate-build.sh makes the checks it cannot -
           # unresolved placeholders, connector keys and connection ids that are not
-          # in architectural-considerations.md §4, and curated vendor activities
-          # this runner has no credentials to resolve. No-ops when the build
+          # in architectural-considerations.md §4, and activities that are not the
+          # HTTP-Request-with-connector-authentication shape §4 approves. No-ops when the build
           # produced no Workflow.json, so it is safe for every product.
           if [ -f .github/scripts/validate-build.sh ]; then
             echo "=== validate-build.sh ===" | tee -a "$LOG"
@@ -766,8 +766,10 @@ jobs:
             2. **Runnable** - `validate-build.sh` is clean. It reports things the
                shape validator cannot see: a `<TODO: ...>` left in a connection or
                activity id, a connector key or connection id that is not in
-               `architectural-considerations.md` §4, or a curated vendor activity
-               where §4 requires the connector's `httpRequest`. Every message names
+               `architectural-considerations.md` §4, or an activity that is not the
+               shape §4 approves - the HTTP Request activity with
+               `authentication: "connector"`, which §4 carries verbatim with both a
+               Coupa and a Slack example. Every message names
                the activity and what to write instead - that is the whole fix. The
                connection ids come from the §4 table; if the value you need is not
                there, stop and record it, do not invent one.
