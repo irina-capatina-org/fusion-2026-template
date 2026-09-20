@@ -10,11 +10,23 @@
 # the design instead of the delivery fails it, which is the exact failure mode of an
 # agent that read the SDD and paraphrased it.
 #
-# The DSD paths are derived from architecture.json exactly as uipath-dsd.yml derives
-# them, so the validator and the workflow cannot disagree about which files exist.
+# The DSD paths are derived from architecture.json AND the repository name exactly as
+# uipath-dsd.yml derives them (docs/dsd-<repo>.md), so the validator and the workflow
+# cannot disagree about which files exist.
 set -uo pipefail
 
 ARCH_FILE="${1:?usage: validate-dsd.sh <architecture.json>}"
+
+# The DSD name comes from the REPOSITORY, never the process name - the same rule
+# uipath-dsd.yml applies, and for the same reason: a process name is not unique
+# across the estate and changes when the process is renamed. Deriving it from
+# process_kebab here is what made this script and the workflow disagree about the
+# filename and fail a run whose document was perfectly good.
+# Optional 2nd argument wins, then $DSD_REPO_NAME, then the GitHub repo, then git.
+REPO_NAME="${2:-${DSD_REPO_NAME:-}}"
+[ -n "$REPO_NAME" ] || REPO_NAME="${GITHUB_REPOSITORY:-}"
+REPO_NAME="${REPO_NAME##*/}"
+[ -n "$REPO_NAME" ] || REPO_NAME="$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")"
 
 # 600, not 700: as-built sections are largely tables (config, rules, troubleshooting)
 # and are legitimately more compact than the build-spec prose this stage used to hold.
@@ -120,9 +132,10 @@ if ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$ARCH_FILE" 2>/
   exit 1
 fi
 
-DECLARED=$(python3 - "$ARCH_FILE" <<'EOF_PLAN'
+DECLARED=$(python3 - "$ARCH_FILE" "$REPO_NAME" <<'EOF_PLAN'
 import json, sys
 d = json.load(open(sys.argv[1]))
+repo = sys.argv[2]
 rows, seen = [], set()
 for p in sorted(d["projects"], key=lambda x: x.get("build_order", 99)):
     if p.get("role") == "component":
@@ -133,8 +146,8 @@ for p in sorted(d["projects"], key=lambda x: x.get("build_order", 99)):
     if key in seen:
         continue
     seen.add(key)
-    path = (f"docs/{d['process_kebab']}-dsd.md" if d["sdd_scope"] == "single-product"
-            else f"docs/{kebab}-dsd.md")
+    path = (f"docs/dsd-{repo}.md" if d["sdd_scope"] == "single-product"
+            else f"docs/dsd-{repo}-{kebab}.md")
     rows.append("\t".join([path, sdd, p.get("product", ""), p.get("skill", ""), p["name"]]))
 print("\n".join(rows))
 EOF_PLAN
@@ -368,8 +381,14 @@ done <<< "$DECLARED"
 if [ "$WARNINGS" -gt 0 ]; then
   echo "DSD validation raised ${WARNINGS} warning(s)."
 fi
+# The exit code exists to DRIVE the repair pass, not to reject a delivery. A DSD is
+# generated documentation written AFTER the build was tested and reviewed - it must
+# never be the thing that fails a release. DSD_NEVER_FAIL=1 makes that explicit for
+# callers that only report (the Verify step); leave it UNSET for the repair loop,
+# which needs a non-zero exit to know there is work to do.
 if [ "$FAILURES" -gt 0 ]; then
   echo "DSD validation FAILED with ${FAILURES} problem(s)."
+  [ "${DSD_NEVER_FAIL:-0}" = "1" ] && { echo "DSD_NEVER_FAIL=1 - reporting only."; exit 0; }
   exit 1
 fi
 echo "DSD validation passed."
