@@ -74,7 +74,11 @@ env:
   CLI_VERSION: 'latest'
 
 permissions:
-  contents: read
+  # write, not read: observe.sh PUTs observability.json through the contents
+  # API, and the workflow permissions block caps what GITHUB_TOKEN may do.
+  # Under `read` every status write 403s, including the verdict that
+  # merge-or-escalate and next-stage report.
+  contents: write
   pull-requests: write
   id-token: write
 
@@ -529,7 +533,19 @@ jobs:
           sparse-checkout: .github/scripts
           fetch-depth: 1
 
+      # This job otherwise makes only `gh` API calls and needs no working tree - but
+      # observe.sh is a FILE, and a job that never checks out has an empty workspace.
+      # Sparse: only the scripts, from develop, so it costs a second.
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
       - name: Observe - Development decided
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
@@ -607,6 +623,9 @@ jobs:
           fetch-depth: 1
 
       - name: Observe - Documentation begins
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
@@ -633,6 +652,9 @@ jobs:
           fetch-depth: 1
 
       - name: Observe - Development faulted
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}

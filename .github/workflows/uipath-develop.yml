@@ -98,6 +98,9 @@ jobs:
           fetch-depth: 0
 
       - name: Observe - Development in progress
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
@@ -573,6 +576,9 @@ jobs:
       # drifts between versions, so an unknown-command result is reported for the
       # agent to resolve rather than treated as a build failure.
       - name: Observe - Testing in progress
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
@@ -737,6 +743,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Observe - Testing passed
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
@@ -895,6 +904,9 @@ jobs:
           fetch-depth: 1
 
       - name: Observe - Development in review
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
         env:
           GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
@@ -923,6 +935,9 @@ jobs:
           fetch-depth: 1
 
       - name: Observe - Development faulted
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}

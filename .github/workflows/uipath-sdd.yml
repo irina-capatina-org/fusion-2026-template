@@ -223,6 +223,9 @@ jobs:
           fetch-depth: 0
 
       - name: Observe - Architecture in progress
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
@@ -1704,6 +1707,9 @@ jobs:
           echo "Opened/updated PR #$PR_NUMBER -> $PR_URL"
 
       - name: Observe - Architecture in review
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
@@ -1768,7 +1774,19 @@ jobs:
           sparse-checkout: .github/scripts
           fetch-depth: 1
 
+      # This job otherwise makes only `gh` API calls and needs no working tree - but
+      # observe.sh is a FILE, and a job that never checks out has an empty workspace.
+      # Sparse: only the scripts, from develop, so it costs a second.
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
       - name: Observe - Architecture done
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
@@ -1836,6 +1854,9 @@ jobs:
           fetch-depth: 1
 
       - name: Observe - Development begins
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
@@ -1862,6 +1883,9 @@ jobs:
           fetch-depth: 1
 
       - name: Observe - Architecture faulted
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}

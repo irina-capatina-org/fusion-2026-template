@@ -53,7 +53,11 @@ env:
   NODE_VERSION: '20'
 
 permissions:
-  contents: read
+  # write, not read: observe.sh PUTs observability.json through the contents
+  # API, and the workflow permissions block caps what GITHUB_TOKEN may do.
+  # Under `read` every status write 403s, including the faulted job - so a
+  # failed deploy could not even report that it had failed.
+  contents: write
   id-token: write
 
 concurrency:
@@ -155,6 +159,9 @@ jobs:
           fetch-depth: 0
 
       - name: Observe - Production in progress
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
@@ -549,6 +556,9 @@ jobs:
           fetch-depth: 1
 
       - name: Observe - Production live
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
@@ -574,6 +584,9 @@ jobs:
           fetch-depth: 1
 
       - name: Observe - Production faulted
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
