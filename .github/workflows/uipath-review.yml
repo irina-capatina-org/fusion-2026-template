@@ -455,11 +455,17 @@ jobs:
     needs: [validate, review]
     if: needs.validate.outputs.reviewable == 'true'
     runs-on: ubuntu-latest
+    outputs:
+      # Only set when the implementation actually landed on develop. An escalated
+      # PR leaves it empty, which is what stops the Docs stage starting against
+      # code that is still sitting in an open PR.
+      merged: ${{ steps.merge.outputs.merged }}
     steps:
       # GITHUB_TOKEN, never the dev PAT: this job posts the agent's review on a PR
       # the PAT now authors, and GitHub rejects a review submitted by the PR's own
       # author. Reviewing as the bot is also what puts it in the Reviewers sidebar.
       - name: Merge on approval, assign a human otherwise
+        id: merge
         env:
           GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
@@ -479,6 +485,7 @@ jobs:
               exit 1
             fi
             echo "$RESULT"
+            echo "merged=true" >> "$GITHUB_OUTPUT"
             {
               echo "### 3. Merged"
               echo ""
@@ -500,3 +507,74 @@ jobs:
               echo "The case waits on the merge, so the chain is paused here until someone acts."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+
+  # ═══════════════════════════════════════════════════════════════
+  # 4. Start Docs
+  # This workflow merges the implementation PR itself, and a merge performed with
+  # GITHUB_TOKEN raises no event another workflow could act on - so the hand-over
+  # to the Docs stage happens here, in the same run.
+  #
+  # The analysis key is carried through unchanged:
+  #   dev-jactiv-611 -> docs-jactiv-611
+  #
+  # Guarded on the merge having HAPPENED, not merely on the job having run: a
+  # request-changes verdict escalates to a human and leaves the PR open, and Docs
+  # must not document code that has not landed.
+  # ═══════════════════════════════════════════════════════════════
+  next-stage:
+    name: Start Docs
+    needs: [validate, merge-or-escalate]
+    if: needs.merge-or-escalate.outputs.merged == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create docs-<key> from develop
+        env:
+          # A ref created with GITHUB_TOKEN does NOT trigger workflows, so the PAT is
+          # what actually starts uipath-dsd.
+          GH_TOKEN:  ${{ secrets.DEV_PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          USING_PAT: ${{ secrets.DEV_PR_AUTHOR_PAT != '' }}
+          REPO:      ${{ github.repository }}
+          HEAD_REF:  ${{ needs.validate.outputs.head_ref }}
+        run: |
+          set -euo pipefail
+
+          # dev-jactiv-611 / development-jactiv-611 -> jactiv-611
+          KEY="${HEAD_REF#*-}"
+          if [ -z "$KEY" ] || [ "$KEY" = "$HEAD_REF" ]; then
+            echo "::error::Branch '$HEAD_REF' has no key after its prefix."
+            exit 1
+          fi
+          NEXT="docs-$KEY"
+
+          if [ "$USING_PAT" != "true" ]; then
+            echo "::warning::DEV_PR_AUTHOR_PAT is not set - $NEXT will be created with GITHUB_TOKEN, which does not trigger workflows. uipath-dsd will not start on its own."
+          fi
+
+          if gh api "repos/$REPO/git/ref/heads/$NEXT" >/dev/null 2>&1; then
+            echo "::notice::$NEXT already exists - nothing to do."
+            exit 0
+          fi
+
+          # develop after the merge, so the delivered code is on it - the Docs stage
+          # fails outright if code/ is empty, because it documents what was built.
+          SHA=$(gh api "repos/$REPO/git/ref/heads/develop" --jq '.object.sha')
+          [ -n "${SHA:-}" ] || { echo "::error::Could not read the head of develop."; exit 1; }
+
+          gh api -X POST "repos/$REPO/git/refs" \
+            -f ref="refs/heads/$NEXT" -f sha="$SHA" >/dev/null
+
+          echo "Created $NEXT at ${SHA:0:7}."
+          {
+            echo "### 4. Docs started"
+            echo ""
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| From | \`$HEAD_REF\` |"
+            echo "| Created | \`$NEXT\` |"
+            echo "| At | \`${SHA:0:7}\` on \`develop\` |"
+            if [ "$USING_PAT" != "true" ]; then
+              echo ""
+              echo "> [!WARNING]"
+              echo "> Created with \`GITHUB_TOKEN\`, so \`uipath-dsd\` will **not** start by itself."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
