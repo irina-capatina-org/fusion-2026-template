@@ -459,20 +459,42 @@ jobs:
             2. Scaffold or open the project under ${{ env.CODE_DIR }}/. A scaffolding
                command writes starter files of its own - `uip api-workflow init` emits
                Workflow.json, bindings_v2.json, entry-points.json and project.uiproj.
-               Before you replace any of them wholesale, `rm` the file first (see Hard
-               rules).
+               You may write over a scaffolded file ONCE, to lay down your first version
+               (see Hard rules). After that the file is yours: patch it, never
+               regenerate it.
             3. Implement what the SDD section referenced by that task specifies.
             4. Run whatever validate/build command that skill prescribes, and fix what it
                reports before moving on. Do not leave a project that does not validate.
 
             ## Hard rules
 
-            - **`rm` a scaffolded file before rewriting it.** Write is REJECTED on a file
-              that exists but has not been Read this session - and the rejection lands
-              only AFTER you have generated the entire payload. A previous run lost 226
-              seconds and a discarded 100 KB Workflow.json to exactly this. So: `rm
-              <file>` and then Write it, or Read it first. Never Write blind over a file
-              a scaffolding command just created.
+            - **Write the big file ONCE. After that, patch it.** Regenerating a large
+              file to fix it is the single most expensive mistake you can make here. A
+              previous run spent 130s writing Workflow.json, validated, found one wrong
+              field shape, deleted the file, and spent another 131s writing it again -
+              4.4 minutes to fix something `Edit` would have fixed in seconds.
+              So:
+                - First version of a scaffolded file: `rm <file>` then Write, or Read
+                  then Write. (Write is REJECTED on a file that exists but has not been
+                  Read this session, and the rejection lands only AFTER you have
+                  generated the entire payload - that is what `rm` avoids.)
+                - Every version after that: `Edit` / `MultiEdit`, or a small `python3`
+                  patch script. The validator tells you exactly which fields are wrong;
+                  change those fields.
+                - NEVER `rm` a file you authored yourself this session in order to
+                  rewrite it. If you are about to delete your own work and regenerate
+                  it, stop - the fix is an Edit.
+                - A full rewrite is justified ONLY when the file's top-level structure
+                  is wrong (wrong root keys, wrong activity nesting throughout). "Many
+                  activities have the same wrong field" is a MultiEdit or a scripted
+                  patch, not a rewrite. Say in the build notes why you rewrote.
+            - **Build the simplest thing that satisfies the SDD.** Straight-line happy
+              path first. Do not add retry loops, per-call try/catch, correlation keys,
+              extra terminal outcomes or state variables unless the SDD explicitly
+              specifies them - and prefer a platform-native mechanism (e.g. an API
+              Workflow's `httpRetryConfig`) over building one out of activities. See
+              `architectural-considerations.md` §8. This never licenses dropping a
+              business rule: same coverage, fewer moving parts.
             - **Implement every business rule** the SDD lists. A `BR-xx` with no
               implementation is an incomplete build, not a detail.
             - **Named resources come from the SDD** - queue names, asset names, argument
@@ -677,6 +699,25 @@ jobs:
                      \( -name 'Workflow.json' -o -name 'project.json' -o -name 'uipath.json' \
                      -o -name 'agent.json' -o -name 'entry-points.json' \) | sort)
 
+          # Deploy readiness. Packing is the only offline proof that uipath-deploy will
+          # be able to publish this - a project can validate and run and still fail to
+          # pack (missing solution registration, bad version, unresolved resource).
+          # Product-agnostic: pack whatever solution the build produced.
+          PACKED=0
+          while IFS= read -r sol; do
+            [ -n "$sol" ] || continue
+            PACKED=1
+            echo "=== uip solution pack (in $sol) ===" | tee -a "$LOG"
+            # Output OUTSIDE $CODE_DIR: "Commit test fixes" runs `git add $CODE_DIR`,
+            # so a ./build here would commit the package to the branch.
+            ( cd "$sol" && uip solution pack . "$RUNNER_TEMP/packcheck" \
+                --name "$(basename "$sol")" --version 0.0.1 --output json ) 2>&1 \
+              | tee -a "$LOG" || { echo "::error::solution pack failed in $sol" | tee -a "$LOG"; RC=1; }
+          done < <(find "$CODE_DIR" -maxdepth 3 -type f -name '*.uipx' -exec dirname {} \; | sort -u)
+          if [ "$PACKED" -eq 0 ]; then
+            echo "::warning::no .uipx under $CODE_DIR - deploy readiness not proven" | tee -a "$LOG"
+          fi
+
           if grep -qiE "unknown command|unknown option" "$LOG"; then
             echo "::warning::The CLI rejected a verb - surface has drifted. The agent will discover the right one."
             RC=1
@@ -690,34 +731,65 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           model: ${{ env.AGENT_MODEL }}
-          timeout_minutes: '40'
-          allowed_tools: "Read,Write,Edit,Glob,Grep,Bash,Skill"
+          timeout_minutes: '20'
+          allowed_tools: "Read,Edit,MultiEdit,Glob,Grep,Bash,Skill"
           prompt: |
-            The project under ${{ env.CODE_DIR }}/ does not validate. Fix it.
+            You are a REPAIR agent, not a developer. The project under
+            ${{ env.CODE_DIR }}/ was already built and reviewed against the SDD. One or
+            more mechanical checks failed. Fix ONLY what the checks report.
 
             Test log:      ${{ env.WORK_DIR }}/test-log.txt
-            Architecture:  ${{ needs.identify.outputs.arch_file }}
-            SDD(s):        ${{ needs.identify.outputs.sdd_files }}
-            Task list:     ${{ env.WORK_DIR }}/${{ needs.identify.outputs.tasks_file }}
             Primary:       ${{ needs.identify.outputs.product }}
             Build skills:  ${{ needs.identify.outputs.skills }}
 
-            1. Read the test log to see exactly what failed.
-            2. READ `~/.claude/skills/<skill-name>/SKILL.md` for each skill in Build skills
-               (if installed) - the specialist documents the correct validate and run
-               commands for its product. Never use the Task tool: subagent spawns fail in
-               this runner with a 404 on a retired model id.
-            3. If the log shows `unknown command` or `unknown option`, the CLI surface has
-               drifted: discover the supported verbs with `uip <group> --help` and use
-               those. NEVER invent a command.
-            4. Fix the project so it validates. Re-run the validate command until it is
-               clean. Where the SDD specifies behaviour, fix toward the SDD - do not
-               weaken the implementation to make a check pass.
-            5. Add or extend the project's own tests where the product supports them
-               (API Workflow eval sets, RPA test cases, agent eval sets), covering the
-               happy path and every business exception the SDD lists.
-            6. Append a `## Test repair` section to ${{ env.CODE_DIR }}/build-notes.md:
-               what failed, what you changed, and what is still not covered.
+            ## Your only job
+
+            Make these four things pass, in this order:
+
+            1. **Structurally sound** - the product's `validate` command is clean.
+            2. **Packs** - `uip solution pack` succeeds (this is the deploy gate).
+            3. **Runs** - the product's local run (`--no-auth` where it applies)
+               completes without an unhandled fault.
+            4. Nothing else.
+
+            ## Scope - read this twice
+
+            - **Start from the test log, not from the design.** The log names the failing
+              file, check and message. That is your entire brief.
+            - **Do NOT read the SDD, the architecture json, or the task list.** They are
+               deliberately not listed above. The design decisions are settled; you are
+               not re-deriving them. If a failure genuinely cannot be fixed without a
+               design decision, STOP, leave it, and record it in the build notes for a
+               human - do not decide it yourself.
+            - **Do NOT add features, business rules, activities, eval sets or test
+              cases.** Authoring tests is the Build stage's job. If coverage is thin,
+              say so in the build notes; do not write it here.
+            - **Do NOT restructure, reformat or "improve" anything that already passes.**
+              A file the checks did not complain about is not yours to touch.
+            - **Smallest possible diff.** You have Edit/MultiEdit and no Write tool, on
+              purpose: patch the broken fields. Never delete and regenerate a file.
+
+            ## How to fix
+
+            - Read ONLY the file(s) the log names, and only the regions that matter -
+              use Grep to find the failing key rather than reading a large file whole.
+            - Consult `~/.claude/skills/<skill-name>/SKILL.md` for a skill in Build
+              skills ONLY when the log shows a product-specific shape error you cannot
+              fix from the message alone. Do not read skills pre-emptively. Never use
+              the Task tool: subagent spawns fail in this runner with a 404 on a retired
+              model id.
+            - If the log shows `unknown command` or `unknown option`, the CLI surface has
+              drifted: discover the supported verbs with `uip <group> --help` and use
+              those. NEVER invent a command.
+            - Re-run the failing check after each fix until it is clean. Do not weaken
+              the implementation to make a check pass - if the only way through is to
+              remove behaviour, stop and report it instead.
+
+            ## Then
+
+            Append a short `## Test repair` section to ${{ env.CODE_DIR }}/build-notes.md:
+            what failed, the exact change you made, and anything you deliberately left
+            for a human. Keep it to a few lines - this is a repair log, not a report.
 
             Do NOT run `uip login` or anything needing a tenant - there are no credentials
             here. Do NOT modify ${{ env.DOCS_DIR }}/. Do NOT run git or gh.
@@ -740,10 +812,15 @@ jobs:
           }
           case "$PRODUCT" in
             # validate takes the workflow FILE, not the project directory.
+            # Mirror the first pass exactly, run included - the repair agent is told
+            # the gate is validate + pack + run, so re-validating less than that would
+            # let a project through that still faults at runtime.
             api-workflows)
               run_in_projects 'project.uiproj' bash -c '
                 MAIN=$(python3 -c "import json;print(json.load(open(\"project.uiproj\")).get(\"MainFile\") or \"Workflow.json\")")
-                uip api-workflow build . && uip api-workflow validate "$MAIN"
+                uip api-workflow build . &&
+                uip api-workflow validate "$MAIN" &&
+                uip api-workflow run "$MAIN" --no-auth
               '
               ;;
             rpa-process|rpa-library|rpa-test-automation)
@@ -754,11 +831,21 @@ jobs:
             agents)          run_in_projects 'agent.json' uip agent pack --output-dir /tmp/agentpack2 ;;
             coded-apps)      run_in_projects 'package.json' npm run build ;;
           esac
+
+          # Deploy readiness, same gate as the first pass.
+          while IFS= read -r sol; do
+            [ -n "$sol" ] || continue
+            echo "=== uip solution pack (in $sol) ==="
+            ( cd "$sol" && uip solution pack . "$RUNNER_TEMP/packcheck2" \
+                --name "$(basename "$sol")" --version 0.0.1 --output json ) 2>&1 \
+              || { echo "::error::solution pack still fails in $sol"; RC=1; }
+          done < <(find "$CODE_DIR" -maxdepth 3 -type f -name '*.uipx' -exec dirname {} \; | sort -u)
+
           if [ "$RC" -ne 0 ]; then
             echo "::error::The project still does not validate after one repair pass."
             exit 1
           fi
-          echo "Project validates."
+          echo "Project validates, packs and runs."
 
       - name: Commit test fixes
         run: |
@@ -780,9 +867,11 @@ jobs:
           {
             echo "### 4. Test"
             echo ""
+            echo "Gate: structurally valid → packs → runs clean. No re-implementation."
+            echo ""
             echo "| Check | Result |"
             echo "| --- | --- |"
-            echo "| First validate pass | ${{ steps.validate.outcome }} |"
+            echo "| First pass (validate + pack + run) | ${{ steps.validate.outcome }} |"
             echo "| Repair pass | ${{ steps.validate.outcome == 'failure' && 'ran' || 'not needed' }} |"
             echo "| Re-validate | ${{ steps.revalidate.outcome || 'skipped - first pass was clean' }} |"
           } >> "$GITHUB_STEP_SUMMARY"

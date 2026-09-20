@@ -595,18 +595,30 @@ jobs:
 
             Do not modify ${{ env.CODE_DIR }}/ or ${{ env.WORK_DIR }}/. Do not run git or gh.
 
+      # Reporting only. The DSD is documentation generated AFTER the build was tested
+      # and the PR reviewed; it must never be the step that fails a good delivery.
+      # NOT `set -e`: a `grep -c` that finds nothing exits 1, and a missing file used
+      # to kill the job with a bare "No such file or directory".
       - name: Verify DSD
+        env:
+          DSD_NEVER_FAIL: '1'
+          DSD_FILES: ${{ needs.identify.outputs.dsd_files }}
         run: |
-          set -euo pipefail
-          bash .github/scripts/validate-dsd.sh "$WORK_DIR/architecture.json"
+          set -uo pipefail
+          bash .github/scripts/validate-dsd.sh "$WORK_DIR/architecture.json" || true
           {
             echo "### 3. DSD generated"
             echo ""
             echo "| File | Bytes | Sections | Code refs |"
             echo "| --- | --- | --- | --- |"
-            for f in ${{ needs.identify.outputs.dsd_files }}; do
+            for f in $DSD_FILES; do
+              if [ ! -f "$f" ]; then
+                echo "| \`$f\` | **missing** | - | - |"
+                echo "::warning::$f was not produced. Documentation is advisory, so the run continues."
+                continue
+              fi
               REFS=$(grep -oE '`'"$CODE_DIR"'/[^`]+`' "$f" | sort -u | wc -l | tr -d ' ')
-              echo "| \`$f\` | $(wc -c < "$f" | tr -d ' ') | $(grep -c '^## [0-9]' "$f") | $REFS |"
+              echo "| \`$f\` | $(wc -c < "$f" | tr -d ' ') | $(grep -c '^## [0-9]' "$f" || true) | $REFS |"
             done
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -620,7 +632,15 @@ jobs:
           set -euo pipefail
           git config user.name  "uipath-documenter[bot]"
           git config user.email "uipath-documenter[bot]@users.noreply.github.com"
-          git add $DSD_FILES
+          # Add only what exists: a DSD the agent failed to write must not turn the
+          # documentation stage into a failed release.
+          for f in $DSD_FILES; do
+            if [ -f "$f" ]; then
+              git add "$f"
+            else
+              echo "::warning::$f not on disk - nothing to commit for it."
+            fi
+          done
           if git diff --cached --quiet; then
             echo "No change to commit - DSD is already up to date."
           else

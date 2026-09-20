@@ -1312,6 +1312,41 @@ jobs:
             the project's own eval/test mechanism owns those, and the build stage reads
             the code, not this section.
 
+            ## Keep Error Handling proportionate - it is not a licence to invent
+
+            `Error Handling` is a mandatory section, but a mandatory section does NOT
+            mean mandatory complexity. It documents how the process behaves when
+            something the PDD describes goes wrong. It is not an invitation to design
+            a resilience layer nobody asked for.
+
+            Apply `architectural-considerations.md` §8 (Design simplicity) here:
+
+            - **A failure mode the PDD does not name does not belong in this section.**
+              If the PDD says nothing about the source system being flaky, the SDD does
+              not specify retries for it. Write "No retry specified - the PDD describes
+              no transient-failure behaviour for this system" and move on. That is a
+              complete, correct answer.
+            - **Prefer the platform's own mechanism over designed-in control flow.** For
+              an API Workflow, transient HTTP failure is `httpRetryConfig` at the
+              workflow level - one config block. Do NOT specify a `Do_While` + `Wait` +
+              attempt-counter retry loop; that is three activities and a variable to
+              express what the runtime already does, and the build stage will faithfully
+              construct all of it.
+            - **One failure boundary is the default.** A single catch at the edge of the
+              process that reports and stops. Per-call `Try/Catch` needs a named business
+              fallback that differs from failing the run - otherwise it is noise.
+            - **Do not multiply terminal outcomes.** Each distinct outcome the SDD names
+              becomes a branch, a variable and a Response activity in the build. Name an
+              outcome only when a human does something different because of it.
+            - Cap: this section is a compact table - failure, detection, response, who is
+              told. If it needs more than that, the process genuinely is that complex and
+              *Decisions Made* must say which PDD statement forced it.
+
+            The same restraint applies to `Execution Flow`: it describes the happy path
+            plus the deviations the PDD names, in the fewest steps that express the
+            process. Every step you write becomes an activity someone has to build,
+            validate and maintain.
+
             ## What "ready for development" means
 
             This is the difference between a document and a design. Every one of these:
