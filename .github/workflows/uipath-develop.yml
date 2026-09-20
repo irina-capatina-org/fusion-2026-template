@@ -53,7 +53,7 @@ env:
   BASE_BRANCH: develop
   ASSIGNEE: irina-capatina-uipath
   AGENT_MODEL: claude-sonnet-4-6
-  CLI_VERSION: 'latest'
+  CLI_VERSION: '1.202.0'
   NODE_VERSION: '20'
   # Design inputs and the derived task list live here. Must NOT start with a dot:
   # actions/upload-artifact@v4 silently skips hidden files.
@@ -635,11 +635,21 @@ jobs:
           }
 
           case "$PRODUCT" in
-            # An API Workflow project is marked by project.uiproj. It has no
+            # An API Workflow project is marked by project.uiproj - it has no
             # uipath.json, so keying on that validated nothing and passed silently.
+            #
+            # `validate` and `run` take the workflow FILE (MainFile from
+            # project.uiproj, normally Workflow.json); `build` takes the project
+            # DIRECTORY. Handing run_in_projects a bare file-based verb exits 3
+            # with "missing required argument 'file'".
             api-workflows)
-              run_in_projects 'project.uiproj' uip api-workflow validate
-              run_in_projects 'project.uiproj' uip api-workflow run --no-auth
+              run_in_projects 'project.uiproj' bash -c '
+                MAIN=$(python3 -c "import json;print(json.load(open(\"project.uiproj\")).get(\"MainFile\") or \"Workflow.json\")")
+                echo "MainFile: $MAIN"
+                uip api-workflow build . &&
+                uip api-workflow validate "$MAIN" &&
+                uip api-workflow run "$MAIN" --no-auth
+              '
               ;;
             rpa-process|rpa-library|rpa-test-automation)
               run_in_projects 'project.json' uip rpa restore
@@ -729,7 +739,13 @@ jobs:
             done < <(find "$CODE_DIR" -maxdepth 3 -type f -name "$marker" -exec dirname {} \; | sort -u)
           }
           case "$PRODUCT" in
-            api-workflows)   run_in_projects 'project.uiproj' uip api-workflow validate ;;
+            # validate takes the workflow FILE, not the project directory.
+            api-workflows)
+              run_in_projects 'project.uiproj' bash -c '
+                MAIN=$(python3 -c "import json;print(json.load(open(\"project.uiproj\")).get(\"MainFile\") or \"Workflow.json\")")
+                uip api-workflow build . && uip api-workflow validate "$MAIN"
+              '
+              ;;
             rpa-process|rpa-library|rpa-test-automation)
                              run_in_projects 'project.json' uip rpa build ;;
             maestro-flow)    run_in_projects 'project.json' uip maestro flow validate ;;
@@ -771,7 +787,7 @@ jobs:
             echo "| Re-validate | ${{ steps.revalidate.outcome || 'skipped - first pass was clean' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Observe - Testing passed
+      - name: Observe - Development done
         # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
         # a rate limit or a transient 5xx would otherwise take a good stage down with it.
         continue-on-error: true
@@ -779,7 +795,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          bash .github/scripts/observe.sh stage Testing status=done
+          # Code written and tests green - Development is complete. Testing stays
+          # in-progress until uipath-review decides, so the row only moves forward.
+          bash .github/scripts/observe.sh stage Development status=done
 
   # ═══════════════════════════════════════════════════════════════
   # 5. Open PR
@@ -932,7 +950,7 @@ jobs:
           sparse-checkout: .github/scripts
           fetch-depth: 1
 
-      - name: Observe - Development in review
+      - name: Observe - Testing in review
         # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
         # a rate limit or a transient 5xx would otherwise take a good stage down with it.
         continue-on-error: true
@@ -942,7 +960,13 @@ jobs:
           PR_NUMBER: ${{ needs.open-pr.outputs.pr_number }}
           PR_URL:    ${{ needs.open-pr.outputs.pr_url }}
         run: |
-          bash .github/scripts/observe.sh stage Development status=in-review decidedBy=agent \
+          # The gate moves to Testing the moment the PR exists, so the bubble is
+          # already amber when uipath-review picks it up. Development stays done.
+          bash .github/scripts/observe.sh stage Testing status=in-review decidedBy=agent \
+            pr="$PR_NUMBER" prUrl="$PR_URL"
+
+          # Keep the implementation PR reachable from the Development card too.
+          bash .github/scripts/observe.sh stage Development \
             pr="$PR_NUMBER" prUrl="$PR_URL"
 
   # ═══════════════════════════════════════════════════════════════
@@ -963,7 +987,7 @@ jobs:
           sparse-checkout: .github/scripts
           fetch-depth: 1
 
-      - name: Observe - Development faulted
+      - name: Observe - Attribute the fault
         # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
         # a rate limit or a transient 5xx would otherwise take a good stage down with it.
         continue-on-error: true
@@ -971,14 +995,30 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          # The tests are a job here, not a workflow, so a red test run has to
-          # fault the Testing bubble as well as Development.
-          if [ "${{ needs.test.result }}" = "failure" ]; then
-            bash .github/scripts/observe.sh stage Testing status=faulted \
-              task="Tests failed"
+          # Development is the code being written - identify, derive-tasks, build.
+          # Testing is a separate job in this same workflow. Once build is green the
+          # automation exists, so a red test run must paint Testing red and leave
+          # Development done, rather than dragging both bubbles down together.
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          DEV_FAILED=0
+          if [ "${{ needs.identify.result }}" = "failure" ] \
+             || [ "${{ needs['derive-tasks'].result }}" = "failure" ] \
+             || [ "${{ needs.build.result }}" = "failure" ]; then
+            DEV_FAILED=1
           fi
 
-          bash .github/scripts/observe.sh stage Development status=faulted \
-            task="The development run failed" \
-            run=${{ github.run_id }} \
-            runUrl=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          if [ "$DEV_FAILED" = "1" ]; then
+            bash .github/scripts/observe.sh stage Development status=faulted \
+              task="The development run failed" \
+              run=${{ github.run_id }} runUrl="$RUN_URL"
+          else
+            # The code was written and built; whatever failed came after it.
+            bash .github/scripts/observe.sh stage Development status=done
+          fi
+
+          if [ "${{ needs.test.result }}" = "failure" ]; then
+            bash .github/scripts/observe.sh stage Testing status=faulted \
+              task="Tests failed" \
+              run=${{ github.run_id }} runUrl="$RUN_URL"
+          fi

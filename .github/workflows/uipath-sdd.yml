@@ -1342,8 +1342,14 @@ jobs:
 
             ## Hard rules
 
-            - **Architecture only - NO task list.** No `## Implementation Plan`, no
-              `### Task 1`, no `TaskCreate`. Task derivation is the Development stage's job.
+            - **Architecture only - NO task list.** No `## Implementation Plan` heading and
+              no `### Task 1` heading. Task derivation is the Development stage's job.
+            - **Never write the literal word `TaskCreate` anywhere in the document.** Not in
+              a heading, not in a table, not in a sentence explaining what the next stage
+              does. The validator greps for that exact string and fails the whole file as a
+              task list wherever it appears - including inside otherwise-correct prose in
+              Next Steps, which is exactly how a previous run lost 90 seconds. Write "the
+              planner derives the task list" without naming the call.
               Each file ENDS with its `Next Steps` section, which points at the skills that
               will build it (from `projects[].skill`) and, for a Solution, at
               `uipath-solution` for `uip solution init` -> `project add` -> `resources refresh`
@@ -1357,6 +1363,11 @@ jobs:
               default you applied - retries, timeouts, logging) or `[ARCHITECT REVIEW]` (business
               knowledge only a human has). Both markers stay in the document and every
               `[ARCHITECT REVIEW]` also gets a row in the Action Required table.
+            - **Open items are `[ARCHITECT REVIEW]`, never `[SME REVIEW]`.** The PDD uses
+              `[SME REVIEW]` because its open questions go to the business; an SDD's go to
+              an architect. When you carry a PDD item across, rewrite the marker AS YOU
+              WRITE IT. Do not write `[SME REVIEW]` into an SDD and sweep it up afterwards -
+              that costs a validator round trip every run.
             - **No selectors.** They need the live application; the RPA specialist writes
               them at development time. Describe the UI element, not its selector.
             - **Real content only.** No `<PLACEHOLDER>`, no `TBD`, no `TODO`, no empty table
@@ -1369,12 +1380,23 @@ jobs:
 
             ## Step 3 - self-check before you finish
 
+            Run it with `SDD_ADVISORY_ONLY=1`. That leaves structural problems - a missing
+            section, a task list, an empty table - as the only things that can fail it:
+
             ```
-            bash .github/scripts/validate-sdd.sh ${{ env.WORK_DIR }}/architecture.json \
+            SDD_ADVISORY_ONLY=1 bash .github/scripts/validate-sdd.sh ${{ env.WORK_DIR }}/architecture.json \
               $(python3 -c "import json;print(' '.join(p['markdown'] for p in json.load(open('${{ env.WORK_DIR }}/manifest.json'))['pdds'] if p['role']=='current'))")
             ```
 
-            Fix everything it reports and re-run until it exits 0.
+            Fix every `::error::` and re-run until it exits 0.
+
+            Lines marked `::warning::[quality]` are ADVISORY. Read them. Fix one only if it
+            is genuinely wrong and the fix is a single edit. Then STOP - do not loop on
+            them. A dedicated repair pass runs after you and is better placed to judge.
+            A previous run spent 90 seconds running find-and-replace scripts against
+            individual punctuation to chase one quality advisory, never converged, and the
+            advisory would not have blocked anything. Your job is a correct document, not
+            an empty advisory list.
 
       - name: Validate SDD
         id: check

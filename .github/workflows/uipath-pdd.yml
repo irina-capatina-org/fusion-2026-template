@@ -339,7 +339,7 @@ jobs:
                 ## 13. Canonical Test Data
                 ## 14. Decomposition Signals
                 ## 15. Assumptions, Dependencies and Open Questions
-                ## 16. Benefits and Success Criteria
+                ## 16. Success Criteria
 
             What each section must contain:
 
@@ -381,7 +381,15 @@ jobs:
                For email, state the protocol signal (IMAP / Exchange / O365 Graph / SMTP) or mark
                it `[SME REVIEW]` - never default to O365. For document storage, never assume
                SharePoint.
-            8. Business Rules - table `ID | Rule | Source | Applies at step`, IDs BR-01, BR-02...
+            8. Business Rules - table `ID | Rule | Source | Applies at step`.
+               IDs are `BR-01`, `BR-02`, ... `BR-nn`: the letters BR, a hyphen, and EXACTLY
+               TWO digits, zero-padded. Never `BR-1`, never `BR-001`. Use that one form
+               every single time you write a rule ID - in this table, in step remarks, in
+               section 9, in prose, in parentheses, anywhere. Mixing `BR-01` and `BR-001`
+               for the same rule turns one rule into two for every stage that reads this
+               document: they match IDs as exact strings, so the SDD hunts for rules that
+               do not exist and the review stage reviews phantoms. The validator rejects a
+               PDD that mixes widths.
                Extract rules buried in prose and in step remarks. Every rule must be traceable to
                a sentence in the source; a rule you cannot trace does not belong here.
             9. Business Exceptions - table `ID | Name | Trigger step | Trigger condition | Action`,
@@ -412,11 +420,19 @@ jobs:
                 to fill gets a line here. Use `[SME REVIEW]` for a business decision only a human
                 can make, and `[DEFAULT]` for a safe engineering default you applied. List any
                 referenced-but-unavailable input.
-            16. Benefits and Success Criteria - expected benefit (time saved, error reduction,
-                cycle time) and the measurable acceptance criteria for the automation.
+            16. Success Criteria - the measurable acceptance criteria: what must be
+                demonstrably true for the automation to be signed off. Make every line
+                testable. The SDD copies these straight into its own acceptance criteria,
+                so they are load-bearing. Do NOT write benefit estimates here - hours
+                saved, error reduction, cycle time - nothing downstream reads them.
 
             ## Hard rules
 
+            - **Do not use the TodoWrite tool.** This is a read-one-source, write-one-document
+              task: a checklist costs a model round trip per call and puts nothing in the PDD.
+              Plan before you write, then write. This changes your process, NOT the document -
+              every section requirement above still applies in full, at the same depth. The
+              Step 3 self-check and the validator both grade the file, not how you got there.
             - NEVER invent a business rule, threshold, volume figure, system name, URL, person or
               credential. If it is not in the source and not a stated engineering default, it is
               an `[SME REVIEW]` line in section 15.

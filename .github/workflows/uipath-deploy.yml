@@ -49,7 +49,7 @@ env:
   DOCS_DIR: docs
   CODE_DIR: code
   OUTPUT_DIR: ./dist
-  CLI_VERSION: 'latest'
+  CLI_VERSION: '1.202.0'
   NODE_VERSION: '20'
 
 permissions:

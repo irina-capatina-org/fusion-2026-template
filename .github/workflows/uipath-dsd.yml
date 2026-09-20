@@ -46,7 +46,7 @@ env:
   RELEASE_BRANCH: main
   ASSIGNEE: irina-capatina-uipath
   AGENT_MODEL: claude-sonnet-4-6
-  CLI_VERSION: 'latest'
+  CLI_VERSION: '1.202.0'
   MIN_DSD_BYTES_PER_SECTION: '600'
   WORK_DIR: build-work
 

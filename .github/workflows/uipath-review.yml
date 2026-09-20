@@ -71,7 +71,7 @@ env:
   REVIEW_HEAD_PREFIXES: 'dev- development-'
   ASSIGNEE: irina-capatina-uipath
   AGENT_MODEL: claude-sonnet-4-6
-  CLI_VERSION: 'latest'
+  CLI_VERSION: '1.202.0'
 
 permissions:
   # write, not read: observe.sh PUTs observability.json through the contents
@@ -277,6 +277,19 @@ jobs:
         with:
           ref: ${{ needs.validate.outputs.head_sha }}
           fetch-depth: 0
+
+      - name: Observe - Testing in review
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
+        env:
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          REPO:      ${{ github.repository }}
+          PR_NUMBER: ${{ needs.validate.outputs.pr_number }}
+        run: |
+          bash .github/scripts/observe.sh stage Testing status=in-review decidedBy=agent \
+            pr="$PR_NUMBER" \
+            task="The review agent is reviewing the implementation"
 
       - name: Install UiPath skills
         continue-on-error: true
@@ -532,7 +545,7 @@ jobs:
           sparse-checkout: .github/scripts
           fetch-depth: 1
 
-      - name: Observe - Development decided
+      - name: Observe - Testing decided
         # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
         # a rate limit or a transient 5xx would otherwise take a good stage down with it.
         continue-on-error: true
@@ -540,10 +553,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
+          # The gate is on Testing, not Development: Development went done when its
+          # tests passed, and Testing is the rightmost bubble before Docs, so nothing
+          # to its right can be green while this decision is still open.
           if [ "${{ steps.merge.outputs.merged }}" = "true" ]; then
-            bash .github/scripts/observe.sh stage Development status=done
+            bash .github/scripts/observe.sh stage Testing status=done
           else
-            bash .github/scripts/observe.sh stage Development status=in-review decidedBy=human \
+            bash .github/scripts/observe.sh stage Testing status=in-review decidedBy=human \
               task="The review agent requested changes"
           fi
 
@@ -653,7 +669,7 @@ jobs:
           sparse-checkout: .github/scripts
           fetch-depth: 1
 
-      - name: Observe - Development faulted
+      - name: Observe - Testing faulted
         # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
         # a rate limit or a transient 5xx would otherwise take a good stage down with it.
         continue-on-error: true
@@ -661,7 +677,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          bash .github/scripts/observe.sh stage Development status=faulted \
-            task="The development run failed" \
+          # Development is already done by the time this workflow runs - the code was
+          # written and its tests passed. A failure here is a failure of the review,
+          # which is the gate that sits on Testing.
+          bash .github/scripts/observe.sh stage Testing status=faulted \
+            task="The review run failed" \
             run=${{ github.run_id }} \
             runUrl=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
