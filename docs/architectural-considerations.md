@@ -13,7 +13,7 @@ Read this before the Constraint Gate, and apply it as follows.
 |---|---|---|
 | a plain value | a **confirmed fact** about the org | state it as fact. Do NOT raise an `[ARCHITECT REVIEW]` for it. Record the source as "org architectural considerations" in *Recommended Scope*. |
 | `[UNCONFIRMED]` | nobody has confirmed this yet | treat exactly as if this file did not mention it: apply the normal default and carry the `[ARCHITECT REVIEW]` item. |
-| a **preference** (§3–§4) | a house default, not a law | apply it, and record in *Decisions Made* that it came from this file. If the PDD's actual need contradicts it, follow the PDD and note the deviation with its reason. A preference must never force a design the process cannot use. |
+| a **preference** (§3–§4, §8) | a house default, not a law | apply it, and record in *Decisions Made* that it came from this file. If the PDD's actual need contradicts it, follow the PDD and note the deviation with its reason. A preference must never force a design the process cannot use. |
 
 Two rules that matter more than the rest:
 
@@ -181,7 +181,73 @@ must create and authorise in Integration Service.
 
 ---
 
-## 8. Maintaining this file
+## 8. Design simplicity — the default is the smallest thing that works
+
+The design must be the **smallest artifact that satisfies the requirement**. Complexity
+is opt-in: every construct beyond the happy path has to trace back to something the PDD
+actually states. This is a preference, not a law — but the burden of proof sits on the
+complexity, not on the simplicity.
+
+### The happy path is the design. Everything else is justified or absent.
+
+Write the straight-line sequence first: read the data, decide, act, report. That
+sequence *is* the process. Then add a deviation only when the PDD names the failure,
+names who cares about it, and names what should happen instead. A failure mode nobody
+has described is not a requirement — it is an invention.
+
+### Do not add these unless the PDD asks for them
+
+| Construct | Add it only when |
+|---|---|
+| Retry loop (`Do_While` + `Wait`, backoff, attempt counters) | the PDD states the system is unreliable **and** the platform's own retry cannot cover it (see below) |
+| `Try/Catch` around an individual call | that one call has a **documented** business fallback that differs from failing the run |
+| Correlation keys, run ids, trace tokens | the PDD or §7 asks for them |
+| More than one terminal outcome | the PDD names each outcome and what a human does differently for each |
+| A status/state variable | something downstream actually branches on it |
+| Pagination, batching, chunking | the PDD gives a volume that needs it |
+| A config asset for a value | the value genuinely changes per environment |
+
+**Platform-native beats hand-built.** Where the runtime already provides a behaviour,
+use it instead of building it out of activities. An API Workflow has `httpRetryConfig`
+at the workflow level — that is the retry mechanism, not a `Do_While` wrapping a
+`Try/Catch` wrapping a `Wait`. A connector's own filter/format operation beats a
+JavaScript step that does the same string work (§4). Hand-rolling a platform feature
+triples the artifact size and is the single largest driver of build time.
+
+**One failure boundary, not one per call.** The default error design is a single
+catch at the edge of the process that reports the failure and stops. Per-activity
+error handling is the exception and needs a reason in the SDD.
+
+### Business rules are filters, not architecture
+
+A `BR-xx` that reads "exclude credit notes" is a predicate — one clause inside one
+filtering step, alongside the other predicates. It is not its own activity, its own
+branch, or its own outcome. Ten exclusion rules are **one** filter step with ten
+conditions. Only a rule that changes *what the process does next* earns a branch.
+
+### Sizing expectation
+
+For a single-product automation with one source system and one destination, the
+expected shape is roughly:
+
+```
+read from source  →  filter/decide  →  format  →  act on destination  →  respond
+```
+
+Five to eight activities. If the design exceeds **twelve** activities, or introduces a
+second loop, the SDD must say in *Decisions Made* which PDD statement forced it. "Good
+practice", "robustness" and "production-grade" are not PDD statements.
+
+### What this does not mean
+
+This is not licence to drop scope. Every business rule the PDD lists still gets
+implemented, every named resource still gets created, and nothing gets weakened to make
+a check pass. Simplicity is about the *shape* of the solution, not its coverage — the
+same behaviour, expressed with fewer moving parts.
+
+---
+
+## 9. Maintaining this file
 
 - One row, one fact. If a value is contested, leave it `[UNCONFIRMED]` rather than
   guessing — an unmarked wrong value becomes an unmarked wrong statement in every SDD.
@@ -192,3 +258,4 @@ must create and authorise in Integration Service.
 | Date | Who | What changed |
 |---|---|---|
 | 2026-09-19 | drafted | initial skeleton; only the delivery type is confirmed |
+| 2026-09-20 | irina.capatina | added §8 Design simplicity after JACTIV-665 produced a 1,837-line artifact (2 retry loops, 2 try/catch, 4 outcomes) for a 5-step process |
