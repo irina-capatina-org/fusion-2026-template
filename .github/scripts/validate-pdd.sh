@@ -92,7 +92,7 @@ REQUIRED_SECTIONS=(
   "13. Canonical Test Data"
   "14. Decomposition Signals"
   "15. Assumptions, Dependencies and Open Questions"
-  "16. Benefits and Success Criteria"
+  "16. Success Criteria"
 )
 
 echo "Validating $PDD_FILE"
@@ -149,6 +149,23 @@ if [ "$(echo "$ORDER" | tr '\n' ' ')" != "$(echo "$ORDER" | sort -n | tr '\n' ' 
   fail "Numbered sections are out of order: $(echo "$ORDER" | tr '\n' ' ')"
 else
   ok "sections in order"
+fi
+
+# --- business rule IDs use ONE format --------------------------------------
+# Every downstream stage (SDD, DSD, review) matches these as exact strings, so
+# BR-01 and BR-001 are two different rules to all of them. A PDD that mixes the
+# two turned 11 rules into 22 in a previous run and sent the SDD agent hunting
+# for the phantoms - 90 seconds of find-and-replace that never converged.
+BR_IDS=$(grep -oE '\bBR-[0-9]+\b' "$PDD_FILE" | sort -u || true)
+if [ -n "$BR_IDS" ]; then
+  BR_WIDTHS=$(printf '%s\n' "$BR_IDS" | sed 's/^BR-//' | awk '{ print length($0) }' | sort -u)
+  BR_NWIDTH=$(printf '%s\n' "$BR_WIDTHS" | grep -c . || true)
+  if [ "${BR_NWIDTH:-0}" -gt 1 ]; then
+    fail "Business rule IDs mix digit widths ($(printf '%s' "$BR_WIDTHS" | tr '\n' '/' | sed 's:/$::')) - use BR-01 .. BR-nn everywhere, including every mention in prose."
+    echo "    ids found: $(printf '%s' "$BR_IDS" | tr '\n' ' ')"
+  else
+    ok "business rule IDs use one format ($(printf '%s\n' "$BR_IDS" | grep -c . || true) unique)"
+  fi
 fi
 
 # --- no template leftovers -------------------------------------------------
