@@ -19,12 +19,115 @@ PDD_FILES=("$@")
 # and a flat floor tuned to RPA rejects it.
 BYTES_PER_SECTION="${MIN_SDD_BYTES_PER_SECTION:-650}"
 MIN_ROOT_BYTES="${MIN_SOLUTION_SDD_BYTES:-3000}"
+
+# The epic key is the repository name's prefix - jactiv-572-no-po-invoice-chaser
+# -> jactiv-572 -> the resource prefix jactiv_572_. It is the only identifier stable
+# across the whole lifecycle: every stage has its own story key, so naming resources
+# off a story key means a change-request replay renames live Orchestrator resources.
+# The repository name is also the solution name, verbatim.
+REPO_NAME="${EPIC_REPO_NAME:-${GITHUB_REPOSITORY##*/}}"
+EPIC_KEY="${EPIC_KEY:-$(printf '%s' "$REPO_NAME" | grep -oiE '^[a-z]+-[0-9]+' || true)}"
+RESOURCE_PREFIX=""
+[ -n "$EPIC_KEY" ] && RESOURCE_PREFIX="$(printf '%s' "$EPIC_KEY" | tr 'A-Z-' 'a-z_')_"
+
 FAILURES=0
 WARNINGS=0
+ADVISORIES=0
 
-fail() { echo "::error::$*"; FAILURES=$((FAILURES + 1)); }
-warn() { echo "::warning::$*"; WARNINGS=$((WARNINGS + 1)); }
-ok()   { echo "  ok  - $*"; }
+# ── two severities, on purpose ───────────────────────────────────────────────
+# This script exists to DRIVE a good SDD, not to reject one after the fact.
+#
+#   fail()   the next stage cannot consume the document - uipath-develop literally
+#            refuses to build on a missing planner-handoff marker or Status: draft.
+#            Letting these through does not save the run, it just moves the failure
+#            one stage later where the error is about the wrong thing.
+#
+#   advise() the document is worse than it should be, but usable. Counts toward the
+#            exit code on the FIRST pass, so the repair agent runs and is handed the
+#            exact message - then the workflow's Verify step re-runs with
+#            SDD_ADVISORY_ONLY=1, where advisories print as warnings and can never
+#            fail the run.
+#
+# A warning alone would guide nothing: the repair step keys off this script's exit
+# code, so a warn-only finding is printed and ignored.
+ADVISORY_ONLY="${SDD_ADVISORY_ONLY:-0}"
+
+fail()   { echo "::error::$*"; FAILURES=$((FAILURES + 1)); }
+warn()   { echo "::warning::$*"; WARNINGS=$((WARNINGS + 1)); }
+advise() {
+  if [ "$ADVISORY_ONLY" = "1" ]; then
+    echo "::warning::[quality] $*"; WARNINGS=$((WARNINGS + 1))
+  else
+    echo "::error::[quality] $*"; ADVISORIES=$((ADVISORIES + 1))
+  fi
+}
+ok()     { echo "  ok  - $*"; }
+# Document History naming rides the same advisory channel as every other
+# quality finding, so it drives the repair pass and is then downgraded to a
+# warning by SDD_ADVISORY_ONLY in the Verify step.
+soft_note() { advise "$*"; }
+
+# ── Document History: the record of what changed and why ─────────────────────
+# The lifecycle documents are LIVING files at fixed repository-based names - never
+# renamed, never superseded by a second file - so this table is the only
+# human-readable record of which change request caused which revision. Git has the
+# diff; this has the reason.
+#
+# Two severities on purpose: the table's EXISTENCE and its rows are hard, because a
+# document without one loses its history permanently. Whether a revision NAMES its
+# change request is advisory, so a first-run document - which has no CR to name -
+# can never fail on it.
+check_document_history() {
+  local f="$1" label="${2:-$1}"
+
+  if ! grep -qxF '## Document History' "$f"; then
+    fail "$label is missing '## Document History' - without it a revision leaves no record of what changed."
+    return
+  fi
+
+  # Data rows only: everything after the table's separator line, up to the next H2.
+  local rows n
+  rows=$(awk '
+    /^## Document History$/           { inside = 1; next }
+    inside && /^## /                  { exit }
+    inside && /^\|[ :|-]+\|[ :|-]*$/  { sep = 1; next }
+    inside && sep && /^\|/            { print }
+  ' "$f")
+  n=$(printf '%s' "$rows" | grep -c . || true)
+
+  if [ "${n:-0}" -lt 1 ]; then
+    fail "$label has an empty Document History table - it needs at least one row."
+    return
+  fi
+
+  # Every row must actually say something. A dated row with no comment records that
+  # a change happened while hiding what it was, which is worse than no row at all.
+  local blank
+  # The COMMENTS column specifically - the last cell before the trailing pipe -
+  # not merely "the last non-empty cell", which a row ending `| Architect | |`
+  # would satisfy while saying nothing about what changed.
+  blank=$(printf '%s\n' "$rows" | awk -F'|' '{
+    if (NF < 3) { print NR; next }
+    c = $(NF - 1); gsub(/^[ \t]+|[ \t]+$/, "", c);
+    if (c == "") print NR
+  }')
+  if [ -n "$blank" ]; then
+    fail "$label Document History has row(s) with an empty Comments cell: row(s) $(echo "$blank" | tr '\n' ' ')"
+  else
+    ok "Document History has ${n} row(s), all with comments"
+  fi
+
+  # Two or more rows means a revision happened, so the newest row should name what
+  # caused it - a CR document, a story key, or a filename.
+  if [ "${n:-0}" -ge 2 ]; then
+    local newest
+    newest=$(printf '%s\n' "$rows" | tail -1)
+    if ! printf '%s' "$newest" \
+         | grep -qiE '\.md|\.docx|[a-z]+-[0-9]+|change[ -]request|\bCR\b'; then
+      soft_note "$label newest Document History row does not name the change request that caused it: ${newest}"
+    fi
+  fi
+}
 
 # ── the section contract, per template ────────────────────────────────────────
 # Kept in sync with uipath-planner assets/templates/*. A generated SDD must be a
@@ -182,11 +285,21 @@ fi
 
 SCOPE=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('sdd_scope',''))" "$ARCH_FILE")
 TASKS_FILE=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('tasks_file',''))" "$ARCH_FILE")
-# one "path<TAB>template<TAB>role" line per declared document
+# one "path<TAB>template<TAB>role<TAB>product" line per declared document. The product
+# comes from the project that owns the file, falling back to the primary - it is what
+# the artifact-vocabulary check keys on.
 DECLARED=$(python3 - "$ARCH_FILE" <<'EOF_DECL'
 import json, sys
-for f in json.load(open(sys.argv[1])).get("sdd_files", []):
-    print("\t".join([f.get("path", ""), f.get("template", ""), f.get("role", "")]))
+d = json.load(open(sys.argv[1]))
+by_path = {}
+for p in d.get("projects", []):
+    sf = p.get("sdd_file")
+    if sf and sf not in by_path:
+        by_path[sf] = p.get("product", "")
+for f in d.get("sdd_files", []):
+    path = f.get("path", "")
+    product = by_path.get(path) or d.get("primary_product", "")
+    print("\t".join([path, f.get("template", ""), f.get("role", ""), product]))
 EOF_DECL
 )
 
@@ -202,9 +315,9 @@ echo
 ALL_SDD_TEXT=$(mktemp)
 ROOT_COUNT=0
 
-while IFS=$'\t' read -r SDD TEMPLATE ROLE; do
+while IFS=$'\t' read -r SDD TEMPLATE ROLE PRODUCT; do
   [ -n "$SDD" ] || continue
-  echo "── $SDD  [$TEMPLATE / $ROLE]"
+  echo "── $SDD  [$TEMPLATE / $ROLE / ${PRODUCT:-?}]"
 
   if [ ! -f "$SDD" ]; then
     fail "declared SDD file not found: $SDD"
@@ -230,7 +343,7 @@ while IFS=$'\t' read -r SDD TEMPLATE ROLE; do
   fi
   BYTES=$(wc -c < "$SDD" | tr -d ' ')
   if [ "$BYTES" -lt "$FLOOR" ]; then
-    fail "$SDD is only ${BYTES} bytes (minimum ${FLOOR} for ${SECTION_COUNT} sections) - too thin to build from."
+    advise "$SDD is only ${BYTES} bytes (minimum ${FLOOR} for ${SECTION_COUNT} sections) - too thin to build from."
   else
     ok "size ${BYTES} bytes (floor ${FLOOR})"
   fi
@@ -300,9 +413,10 @@ while IFS=$'\t' read -r SDD TEMPLATE ROLE; do
   esac
 
   # --- universal front matter ---------------------------------------------
-  for h in '## Document History' '## Recommended Scope' '## Table of Contents'; do
+  for h in '## Recommended Scope' '## Table of Contents'; do
     grep -qxF "$h" "$SDD" || fail "$SDD is missing '$h'."
   done
+  check_document_history "$SDD"
   # Autonomous generation has no human checkpoint, so the record of what was
   # picked and why is mandatory rather than optional.
   grep -qxF '## Decisions Made' "$SDD" \
@@ -389,6 +503,75 @@ while IFS=$'\t' read -r SDD TEMPLATE ROLE; do
     ok "no task list"
   fi
 
+  # --- artifact vocabulary ------------------------------------------------
+  # The template being right does not mean the content is. An agent that defaults to
+  # XAML writes an RPA design under an API Workflow heading - internally
+  # contradictory, and the build agent then has nothing real to follow. Advisory:
+  # it drives a repair pass but never blocks the run.
+  # The solution root indexes projects rather than specifying artifacts, so it has no
+  # vocabulary of its own and is skipped.
+  if [ "$ROLE" != "solution-root" ] && [ -n "${PRODUCT:-}" ]; then
+    case "$PRODUCT" in
+      api-workflows)   V_MUST='Workflow\.json|uipath\.json'; V_NOT='\.xaml|project\.json' ;;
+      rpa-*)           V_MUST='project\.json';                V_NOT='Workflow\.json|caseplan\.json|agent\.json' ;;
+      maestro-flow)    V_MUST='\.flow';                       V_NOT='\.xaml' ;;
+      maestro-bpmn)    V_MUST='\.bpmn';                       V_NOT='\.xaml' ;;
+      case-management) V_MUST='caseplan\.json';               V_NOT='\.xaml' ;;
+      agents)          V_MUST='agent\.json';                  V_NOT='\.xaml' ;;
+      coded-apps)      V_MUST='package\.json';                V_NOT='\.xaml' ;;
+      *)               V_MUST=''; V_NOT='' ;;
+    esac
+
+    if [ -n "$V_MUST" ]; then
+      if grep -qE "$V_MUST" "$SDD"; then
+        ok "names its own '$PRODUCT' artifacts"
+      else
+        advise "$SDD is a '$PRODUCT' design but never names its own artifacts (expected something matching $V_MUST) - the content does not match the product."
+      fi
+    fi
+
+    if [ -n "$V_NOT" ]; then
+      V_HITS=$(grep -cE "$V_NOT" "$SDD" || true)
+      if [ "${V_HITS:-0}" -gt 0 ]; then
+        advise "$SDD is a '$PRODUCT' design but has ${V_HITS} line(s) referencing another product's artifacts ($V_NOT):"
+        grep -nE "$V_NOT" "$SDD" | head -5
+      else
+        ok "no foreign artifact references"
+      fi
+    fi
+  fi
+
+  # --- review marker ------------------------------------------------------
+  # An SDD's open questions go to an architect; the PDD owns the SME-facing ones.
+  # A document carrying the wrong marker is one nobody is assigned to answer.
+  if grep -qF '[SME REVIEW]' "$SDD"; then
+    advise "$SDD uses [SME REVIEW]; an SDD's open items are [ARCHITECT REVIEW] ($(grep -cF '[SME REVIEW]' "$SDD") occurrence(s))."
+  fi
+
+  # --- resource naming ----------------------------------------------------
+  # Names come from the repository's epic key, never from the process name.
+  if [ -n "$RESOURCE_PREFIX" ] && [ "$ROLE" != "solution-root" ]; then
+    PREFIX_HITS=$(grep -cF "$RESOURCE_PREFIX" "$SDD" || true)
+    if [ "${PREFIX_HITS:-0}" -lt 2 ]; then
+      advise "$SDD names no resources with the epic prefix '$RESOURCE_PREFIX' (found ${PREFIX_HITS}) - assets, credentials, queues and connections must be '<epic_key>_<thing>'."
+    else
+      ok "resource names carry the epic prefix '$RESOURCE_PREFIX' (${PREFIX_HITS})"
+    fi
+
+    # The old convention: a process-name prefix. Not unique across the estate, and it
+    # changes whenever the process is renamed.
+    BADNAMES=$(grep -oE '\b[A-Z][a-z][A-Za-z0-9]*_[A-Za-z0-9_]+\b' "$SDD" | sort -u || true)
+    if [ -n "$BADNAMES" ]; then
+      advise "$SDD has process-name-prefixed resource name(s) - use '${RESOURCE_PREFIX}<thing>' instead:"
+      printf '%s\n' "$BADNAMES" | head -6 | sed 's/^/    /'
+    fi
+  fi
+
+  # The solution name is the repository name, verbatim - deployment packs under it.
+  if [ "$ROLE" = "solution-root" ] && [ -n "$REPO_NAME" ] && ! grep -qF "$REPO_NAME" "$SDD"; then
+    advise "$SDD is the solution root but never names the solution '$REPO_NAME' (= the repository name)."
+  fi
+
   # --- the sections development actually needs ----------------------------
   if [ "$ROLE" != "solution-root" ]; then
     TEST_SUBS=$(awk '
@@ -398,7 +581,7 @@ while IFS=$'\t' read -r SDD TEMPLATE ROLE; do
       END { print n + 0 }
     ' "$SDD")
     if [ "$TEST_SUBS" -lt 3 ]; then
-      fail "$SDD Testing Strategy has only ${TEST_SUBS} subsection(s) - needs happy path, exceptions, system errors and acceptance criteria."
+      advise "$SDD Testing Strategy has only ${TEST_SUBS} subsection(s) - needs happy path, exceptions, system errors and acceptance criteria."
     else
       ok "Testing Strategy has ${TEST_SUBS} subsections"
     fi
@@ -410,7 +593,7 @@ while IFS=$'\t' read -r SDD TEMPLATE ROLE; do
       END { print n + 0 }
     ' "$SDD")
     if [ "$STRUCT_ROWS" -lt 10 ]; then
-      fail "$SDD Project Structure has only ${STRUCT_ROWS} lines - a developer cannot lay the project out from that."
+      advise "$SDD Project Structure has only ${STRUCT_ROWS} lines - a developer cannot lay the project out from that."
     else
       ok "Project Structure has ${STRUCT_ROWS} lines"
     fi
@@ -446,7 +629,7 @@ if [ "${#PDD_FILES[@]}" -gt 0 ]; then
       grep -qF "$id" "$ALL_SDD_TEXT" || MISSING_BR="$MISSING_BR $id"
     done
     if [ -n "$MISSING_BR" ]; then
-      fail "business rules from $pdd have no home in the design:$MISSING_BR"
+      advise "business rules from $pdd have no home in the design:$MISSING_BR"
     else
       ok "every BR-xx in $(basename "$pdd") is referenced in the design"
     fi
@@ -485,11 +668,26 @@ fi
 
 rm -f "$ALL_SDD_TEXT"
 
-if [ "$WARNINGS" -gt 0 ]; then
-  echo "SDD validation raised ${WARNINGS} warning(s)."
-fi
+[ "$WARNINGS" -gt 0 ] && echo "SDD validation raised ${WARNINGS} warning(s)."
+
+# ── exit code ────────────────────────────────────────────────────────────────
+# The exit code exists to DRIVE the repair pass, not to reject a document. The
+# workflow never lets it fail the run: the Validate step is continue-on-error and
+# the Verify step captures the status instead of propagating it, so the SDD is
+# committed and the PR opens whatever this says.
+#
+# SDD_NEVER_FAIL=1 makes that guarantee at the script level too, for a caller that
+# cannot conveniently trap the status - findings are still printed and still
+# annotate the run, but the exit is always 0. Leave it UNSET for the repair loop,
+# which needs a non-zero exit to know there is work to do.
 if [ "$FAILURES" -gt 0 ]; then
-  echo "SDD validation FAILED with ${FAILURES} problem(s)."
+  echo "SDD validation found ${FAILURES} blocking problem(s)$([ "$ADVISORIES" -gt 0 ] && echo " and ${ADVISORIES} quality problem(s)")."
+  [ "${SDD_NEVER_FAIL:-0}" = "1" ] && { echo "SDD_NEVER_FAIL=1 - reporting only."; exit 0; }
+  exit 1
+fi
+if [ "$ADVISORIES" -gt 0 ]; then
+  echo "SDD is structurally valid but has ${ADVISORIES} quality problem(s) - repairing."
+  [ "${SDD_NEVER_FAIL:-0}" = "1" ] && { echo "SDD_NEVER_FAIL=1 - reporting only."; exit 0; }
   exit 1
 fi
 echo "SDD validation passed."

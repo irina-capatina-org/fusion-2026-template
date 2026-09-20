@@ -11,6 +11,70 @@ FAILURES=0
 
 fail() { echo "::error::$*"; FAILURES=$((FAILURES + 1)); }
 ok()   { echo "  ok  - $*"; }
+# Advisory: printed and annotated, never counted toward the exit code.
+soft_note() { echo "::warning::[advisory] $*"; }
+
+# ── Document History: the record of what changed and why ─────────────────────
+# The lifecycle documents are LIVING files at fixed repository-based names - never
+# renamed, never superseded by a second file - so this table is the only
+# human-readable record of which change request caused which revision. Git has the
+# diff; this has the reason.
+#
+# Two severities on purpose: the table's EXISTENCE and its rows are hard, because a
+# document without one loses its history permanently. Whether a revision NAMES its
+# change request is advisory, so a first-run document - which has no CR to name -
+# can never fail on it.
+check_document_history() {
+  local f="$1" label="${2:-$1}"
+
+  if ! grep -qxF '## Document History' "$f"; then
+    fail "$label is missing '## Document History' - without it a revision leaves no record of what changed."
+    return
+  fi
+
+  # Data rows only: everything after the table's separator line, up to the next H2.
+  local rows n
+  rows=$(awk '
+    /^## Document History$/           { inside = 1; next }
+    inside && /^## /                  { exit }
+    inside && /^\|[ :|-]+\|[ :|-]*$/  { sep = 1; next }
+    inside && sep && /^\|/            { print }
+  ' "$f")
+  n=$(printf '%s' "$rows" | grep -c . || true)
+
+  if [ "${n:-0}" -lt 1 ]; then
+    fail "$label has an empty Document History table - it needs at least one row."
+    return
+  fi
+
+  # Every row must actually say something. A dated row with no comment records that
+  # a change happened while hiding what it was, which is worse than no row at all.
+  local blank
+  # The COMMENTS column specifically - the last cell before the trailing pipe -
+  # not merely "the last non-empty cell", which a row ending `| Architect | |`
+  # would satisfy while saying nothing about what changed.
+  blank=$(printf '%s\n' "$rows" | awk -F'|' '{
+    if (NF < 3) { print NR; next }
+    c = $(NF - 1); gsub(/^[ \t]+|[ \t]+$/, "", c);
+    if (c == "") print NR
+  }')
+  if [ -n "$blank" ]; then
+    fail "$label Document History has row(s) with an empty Comments cell: row(s) $(echo "$blank" | tr '\n' ' ')"
+  else
+    ok "Document History has ${n} row(s), all with comments"
+  fi
+
+  # Two or more rows means a revision happened, so the newest row should name what
+  # caused it - a CR document, a story key, or a filename.
+  if [ "${n:-0}" -ge 2 ]; then
+    local newest
+    newest=$(printf '%s\n' "$rows" | tail -1)
+    if ! printf '%s' "$newest" \
+         | grep -qiE '\.md|\.docx|[a-z]+-[0-9]+|change[ -]request|\bCR\b'; then
+      soft_note "$label newest Document History row does not name the change request that caused it: ${newest}"
+    fi
+  fi
+}
 
 REQUIRED_SECTIONS=(
   "1. Document Control"
@@ -56,6 +120,9 @@ if ! grep -q '^# ' "$PDD_FILE"; then
 else
   ok "H1 title present"
 fi
+
+# --- document history ------------------------------------------------------
+check_document_history "$PDD_FILE" "PDD"
 
 # --- every required section present, with content --------------------------
 SECTION_FAILS=0
