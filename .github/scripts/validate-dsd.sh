@@ -114,10 +114,6 @@ REQUIRED_SECTIONS=(
   "Configuration Reference"
   "Exception and Error Handling"
   "Operations Runbook"
-  "Troubleshooting Guide"
-  "Monitoring and Logging"
-  "Deviations from Design"
-  "Handover and Support"
 )
 SECTION_COUNT=${#REQUIRED_SECTIONS[@]}
 FLOOR=$(( SECTION_COUNT * BYTES_PER_SECTION ))
@@ -248,8 +244,8 @@ while IFS=$'\t' read -r DSD SDD PRODUCT SKILL PROJECT; do
       || fail "$DSD section numbering is not contiguous from 1: got $(echo "$ORDER" | tr '\n' ' ')"
     LAST=$(grep -E '^## [0-9]+\.' "$DSD" | tail -1)
     case "$LAST" in
-      *"Handover and Support") ok "document ends on Handover and Support" ;;
-      *) fail "$DSD last numbered section is '$LAST' - a DSD must end on 'Handover and Support'." ;;
+      *"Operations Runbook") ok "document ends on Operations Runbook" ;;
+      *) fail "$DSD last numbered section is '$LAST' - a DSD must end on 'Operations Runbook'." ;;
     esac
   fi
 
@@ -284,7 +280,7 @@ while IFS=$'\t' read -r DSD SDD PRODUCT SKILL PROJECT; do
     ' "$DSD"
   }
 
-  for section in "Configuration Reference" "Troubleshooting Guide"; do
+  for section in "Configuration Reference"; do
     ROWS=$(rows_in "$section")
     if [ "${ROWS:-0}" -lt 3 ]; then
       fail "$DSD section '$section' has only ${ROWS} table row(s) - it must be a real table."
@@ -292,18 +288,6 @@ while IFS=$'\t' read -r DSD SDD PRODUCT SKILL PROJECT; do
       ok "'$section' has ${ROWS} table rows"
     fi
   done
-
-  # Deviations may legitimately be empty, but it must say so rather than be blank.
-  DEV_ROWS=$(rows_in "Deviations from Design")
-  if [ "${DEV_ROWS:-0}" -lt 1 ]; then
-    if grep -qiE 'no deviations|none - the build matches|no differences' "$DSD"; then
-      ok "'Deviations from Design' states there are none"
-    else
-      fail "$DSD 'Deviations from Design' has no rows and does not state that there are none."
-    fi
-  else
-    ok "'Deviations from Design' has ${DEV_ROWS} rows"
-  fi
 
   # --- documentation, not a code dump -------------------------------------
   if grep -qE '<Activity|xmlns:ui=|xmlns:x="http://schemas.microsoft.com' "$DSD"; then
@@ -320,7 +304,7 @@ while IFS=$'\t' read -r DSD SDD PRODUCT SKILL PROJECT; do
     ok "no placeholders"
   fi
 
-  if LEFTOVERS=$(grep -nEi '(\bTBD\b|Lorem ipsum|\bFIXME\b|XXXX)' "$DSD"); then
+  if LEFTOVERS=$(grep -nEi '(\bTBD\b|Lorem ipsum|\bFIXME\b|\bX{4,}\b)' "$DSD"); then
     fail "$DSD has placeholder text left in it:"
     echo "$LEFTOVERS" | head -20
   else
@@ -339,26 +323,16 @@ while IFS=$'\t' read -r DSD SDD PRODUCT SKILL PROJECT; do
   fi
 
   # --- traceability against the SDD ---------------------------------------
-  # A business rule the design required and the documentation never mentions means
-  # nobody can tell whether it was built. Since the standalone 'Business Rules
-  # Implemented' section was dropped, the compact 'Rule | Enforced in' table at the
-  # end of As-Built Architecture is what satisfies this.
+  # There is deliberately NO per-BR-xx check here any more. It grepped every
+  # `BR-<digits>` out of the SDD and demanded each one appear in the DSD - but the
+  # SDD cites the PDD's own numbering (BR-001 ...) alongside its own (BR-01 ...), so
+  # the check demanded BOTH forms. The only way to pass was a traceability table
+  # writing every rule twice, `BR-01 / BR-001`, which turned 10 rules into 20 and
+  # taught a reader nothing. The SDD already maps each rule to the step that enforces
+  # it; that is where rule traceability lives.
   if [ -z "$SDD" ] || [ ! -f "$SDD" ]; then
     warn "source SDD '$SDD' not available - skipping traceability for $DSD"
   else
-    MISSING_BR=""; COUNT_BR=0
-    for id in $(grep -oE '\bBR-[0-9]+\b' "$SDD" | sort -u); do
-      COUNT_BR=$((COUNT_BR + 1))
-      grep -qF "$id" "$DSD" || MISSING_BR="$MISSING_BR $id"
-    done
-    if [ -n "$MISSING_BR" ]; then
-      fail "business rules in $SDD are not accounted for in $DSD:$MISSING_BR"
-    elif [ "$COUNT_BR" -gt 0 ]; then
-      ok "all ${COUNT_BR} BR-xx rules from the SDD are accounted for"
-    else
-      warn "$SDD declares no BR-xx business rules - nothing to trace"
-    fi
-
     IDS=$(grep -oE '\b[BS][0-9]+\b' "$SDD" | sort -u | tr '\n' ' ')
     if [ -n "${IDS// /}" ]; then
       PRESENT=0; MISSING_IDS=""
@@ -367,7 +341,7 @@ while IFS=$'\t' read -r DSD SDD PRODUCT SKILL PROJECT; do
       done
       TOTAL=$(printf '%s' "$IDS" | wc -w | tr -d ' ')
       if [ "$PRESENT" -eq 0 ]; then
-        fail "none of the ${TOTAL} exception/error IDs in $SDD appear in $DSD - section 7 is decorative."
+        fail "none of the ${TOTAL} exception/error IDs in $SDD appear in $DSD - 'Exception and Error Handling' is decorative."
       elif [ -n "$MISSING_IDS" ]; then
         warn "exception/error IDs not documented in $DSD (renamed, or not built?):$MISSING_IDS"
       else

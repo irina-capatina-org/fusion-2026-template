@@ -216,7 +216,7 @@ else
 fi
 
 # --- no template leftovers -------------------------------------------------
-if LEFTOVERS=$(grep -nEi '(\bTBD\b|Lorem ipsum|<placeholder|<one-line|<process title>|\bTODO\b|\bFIXME\b|XXXX)' "$PDD_FILE"); then
+if LEFTOVERS=$(grep -nEi '(\bTBD\b|Lorem ipsum|<placeholder|<one-line|<process title>|\bTODO\b|\bFIXME\b|\bX{4,}\b)' "$PDD_FILE"); then
   fail "Placeholder / template text left in the PDD:"
   echo "$LEFTOVERS" | head -20
 else

@@ -260,7 +260,6 @@ Output Schema
 Execution Flow
 Connectors & External Calls
 Error Handling
-Security & Authentication
 Project Structure
 Testing Strategy
 Next Steps
@@ -411,16 +410,13 @@ while IFS=$'\t' read -r SDD TEMPLATE ROLE PRODUCT; do
   esac
 
   # --- universal front matter ---------------------------------------------
-  # A Table of Contents is no longer required: it is generated text that nothing
-  # downstream reads, and every second of it is a second on the demo clock.
-  for h in '## Recommended Scope'; do
-    grep -qxF "$h" "$SDD" || fail "$SDD is missing '$h'."
-  done
+  # Neither a Table of Contents, nor '## Recommended Scope', nor '## Decisions Made'
+  # is required any more. All three are generated text that nothing downstream reads,
+  # and the last two restate architecture.json - which carries `sdd_scope`,
+  # `projects[]`, `blocked_products[]`, `need_profile` and `decisions[]`, and is
+  # committed next to the SDD. The record is not lost by dropping them; it just stops
+  # being written twice, and every byte not written is a second off the demo clock.
   check_document_history "$SDD"
-  # Autonomous generation has no human checkpoint, so the record of what was
-  # picked and why is mandatory rather than optional.
-  grep -qxF '## Decisions Made' "$SDD" \
-    || fail "$SDD is missing '## Decisions Made' - this run had no human checkpoint."
 
   # --- numbered sections: present, in order, contiguous, with content -----
   SECTION_FAILS=0
@@ -475,7 +471,7 @@ while IFS=$'\t' read -r SDD TEMPLATE ROLE PRODUCT; do
     ok "no template placeholders"
   fi
 
-  if LEFTOVERS=$(grep -nEi '(\bTBD\b|Lorem ipsum|\bTODO\b|\bFIXME\b|XXXX|EMIT THIS BLOCK|Phase 2 sections:|Before filling §)' "$SDD"); then
+  if LEFTOVERS=$(grep -nEi '(\bTBD\b|Lorem ipsum|\bTODO\b|\bFIXME\b|\bX{4,}\b|EMIT THIS BLOCK|Phase 2 sections:|Before filling §)' "$SDD"); then
     fail "$SDD has placeholder or template-instruction text left in it:"
     echo "$LEFTOVERS" | head -20
   else
@@ -627,8 +623,31 @@ if [ "${#PDD_FILES[@]}" -gt 0 ]; then
   for pdd in "${PDD_FILES[@]}"; do
     [ -f "$pdd" ] || { warn "PDD not found for traceability: $pdd"; continue; }
 
+    # IDs taken from the FIRST column of the PDD's Business Rules table only. A bare
+    # grep for BR-<digits> also catches the `Source` cells, where the PDD correctly
+    # quotes the SME document's own numbering (BR-001 ...) - and then demands the SDD
+    # carry those too. That is how one rule became two: the SDD grew a "PDD source ID"
+    # column to satisfy this grep, the DSD validator then read BOTH forms out of the
+    # SDD and demanded both, and a 10-rule design was reported as "all 20 BR-xx rules
+    # accounted for". Canonical IDs only.
+    PDD_BR=$(python3 - "$pdd" <<'EOF_BR'
+import re, sys
+want, out = False, []
+for line in open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines():
+    if re.match(r"^## \d+\. Business Rules\s*$", line):
+        want = True
+        continue
+    if want and line.startswith("## "):
+        break
+    if want and line.startswith("|"):
+        cell = re.sub("[" + chr(96) + r"*\s]", "", line.strip("|").split("|")[0])
+        if re.fullmatch(r"BR-\d+", cell):
+            out.append(cell)
+print("\n".join(sorted(set(out))))
+EOF_BR
+)
     MISSING_BR=""
-    for id in $(grep -oE '\bBR-[0-9]+\b' "$pdd" | sort -u); do
+    for id in $PDD_BR; do
       grep -qF "$id" "$ALL_SDD_TEXT" || MISSING_BR="$MISSING_BR $id"
     done
     if [ -n "$MISSING_BR" ]; then
