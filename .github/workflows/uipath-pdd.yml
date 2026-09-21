@@ -468,6 +468,58 @@ jobs:
 
             That must print 16. If it does not, fix the file and check again.
 
+      # Document History is the one heading an agent reliably drops: it is the only
+      # UNNUMBERED heading in a 17-heading contract, so a model marching from the H1
+      # into '## 1.' skips straight past it. It cost a repair pass on more than one
+      # run - roughly a minute of agent time to add six lines whose content is
+      # entirely predictable on a first write.
+      #
+      # So write it here instead of asking an agent to. This only ever fires when the
+      # heading is absent; an existing table, including one with revision rows, is
+      # never touched.
+      - name: Ensure Document History
+        env:
+          PDD_FILE:     ${{ needs.identify.outputs.pdd_file }}
+          REQUEST_FILE: ${{ needs.identify.outputs.request_file }}
+        run: |
+          set -euo pipefail
+          [ -f "$PDD_FILE" ] || { echo "no PDD yet - nothing to seed"; exit 0; }
+          if grep -qxF '## Document History' "$PDD_FILE"; then
+            echo "Document History already present - left untouched."
+            exit 0
+          fi
+          echo "::warning::$PDD_FILE had no '## Document History' - inserting the first-run table."
+          python3 - "$PDD_FILE" "${REQUEST_FILE:-the source request document}" <<'EOF_DH'
+          import datetime, sys
+
+          path, source = sys.argv[1], sys.argv[2]
+          lines = open(path, encoding="utf-8").read().split("\n")
+
+          table = [
+              "## Document History",
+              "",
+              "| Date | Version | Author | Role | Comments |",
+              "|---|---|---|---|---|",
+              f"| {datetime.date.today():%Y-%m-%d} | 0.1 | uipath-analyst | Analyst | "
+              f"Initial PDD created from {source}. |",
+              "",
+          ]
+
+          # Directly after the H1, which is where the contract puts it. If there is no
+          # H1 the validator fails on that separately, so prepend and let it say so.
+          at = next((i for i, l in enumerate(lines) if l.startswith("# ")), None)
+          if at is None:
+              lines = table + lines
+          else:
+              at += 1
+              while at < len(lines) and not lines[at].strip():
+                  at += 1
+              lines[at:at] = table
+
+          open(path, "w", encoding="utf-8").write("\n".join(lines))
+          print(f"inserted Document History at line {at + 1}")
+          EOF_DH
+
       # Soft validation, then one repair pass, then a hard gate. A single weak
       # agent run must not put a half-empty PDD in front of a reviewer.
       - name: Validate PDD
