@@ -507,6 +507,38 @@ jobs:
             - Do NOT modify anything in ${{ env.DOCS_DIR }}/ or ${{ env.WORK_DIR }}/.
             - Do NOT run git or gh. The workflow commits for you.
 
+            ## Step 1.5 - wrap the projects in a solution, ALWAYS
+
+            Every build ships as a solution, whatever the scope says. "Single-product,
+            single-project" describes how many projects the solution CONTAINS, not
+            whether there is one. Without a `.uipx` the Test stage's `uip solution pack`
+            gate finds nothing to pack and passes silently, so the build reaches review
+            with its deploy readiness never once proven, and deployment falls back to
+            per-project packages - a different and far less exercised path.
+
+            Read `~/.claude/skills/uipath-solution/SKILL.md` first and follow it. Then,
+            from `${{ env.CODE_DIR }}/`:
+
+            1. Probe the surface: `uip solution init --help --output json`. `Success`
+               means the verb is `init`; `unknown command` means this CLI still calls it
+               `new`. Never invent a verb.
+            2. Create the solution with its name EXACTLY the repository name -
+               `${{ github.event.repository.name }}`. Deployment packs and publishes
+               under that name; a different one orphans the package.
+            3. Register EVERY project you built, one `uip solution projects add` call
+               per project directory. Coded-app directories are the one exception - they
+               are never part of a `.uipx`.
+            4. Do NOT run `uip solution resources refresh` and do NOT run `uip login`.
+               Refresh reads live cloud state and this runner has no credentials; the
+               deploy stage does it where they exist.
+            5. Prove it before you write the build notes:
+               `uip solution pack . /tmp/buildcheck --name ${{ github.event.repository.name }} --version 0.0.1 --output json`
+               must succeed. If it fails, fix the solution here - do not hand a broken
+               one to the Test stage.
+
+            `.uipx` and `resources/solution_folder/` are generated. Never hand-edit
+            either; they desync and fail silently. Use `projects add` / `remove`.
+
             ## Step 2 - write build notes
 
             Write `${{ env.CODE_DIR }}/build-notes.md`:
@@ -544,6 +576,28 @@ jobs:
             exit 1
           fi
           echo "Project files found:"; echo "$FOUND"
+
+          # A solution is mandatory. Deployment can fall back to per-project packages,
+          # but that path is barely exercised, and with no .uipx the Test stage's
+          # `uip solution pack` gate has nothing to iterate over and passes silently -
+          # a build reaching review with deploy readiness unproven. Fail here instead.
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          SOLUTION_DIR=$(find "$CODE_DIR" -maxdepth 3 -type f -name '*.uipx' \
+                           -not -path "*/dist/*" -not -path "*/obj/*" \
+                           -exec dirname {} \; | sort -u | head -1)
+          if [ -z "$SOLUTION_DIR" ]; then
+            echo "::error::No .uipx under $CODE_DIR/ - every build ships as a solution."
+            echo "::error::Create it with 'uip solution init $REPO_NAME' and register each project with 'uip solution projects add'."
+            find "$CODE_DIR" -type f | head -40
+            exit 1
+          fi
+          # The solution name is the repository name, verbatim - deploy packs under it.
+          SOLUTION_NAME=$(basename "$(find "$SOLUTION_DIR" -maxdepth 1 -name '*.uipx' | head -1)" .uipx)
+          if [ "$SOLUTION_NAME" != "$REPO_NAME" ]; then
+            echo "::error::Solution is named '$SOLUTION_NAME' but must be '$REPO_NAME' (the repository name) - deploy publishes under that name."
+            exit 1
+          fi
+          echo "Solution: $SOLUTION_DIR ($SOLUTION_NAME.uipx)"
 
           BLOCKED=$(grep -ci 'blocked' "$CODE_DIR/build-notes.md" || true)
           {
@@ -665,12 +719,19 @@ jobs:
             # DIRECTORY. Handing run_in_projects a bare file-based verb exits 3
             # with "missing required argument 'file'".
             api-workflows)
+              # NO `uip api-workflow run` here. `--no-auth` means no Integration
+              # Service credentials and no connection context, so any HTTP Request
+              # with `authentication: "connector"` dies on `baseUrl is required and
+              # cannot be empty` however correct the workflow is. It is an
+              # unsatisfiable gate for every design that calls a connector, and it
+              # cost a repair round-trip that fixed the real defect and still failed.
+              # build + validate + validate-build.sh + `uip solution pack` is the
+              # offline gate; a live run belongs to deploy, where credentials exist.
               run_in_projects 'project.uiproj' bash -c '
                 MAIN=$(python3 -c "import json;print(json.load(open(\"project.uiproj\")).get(\"MainFile\") or \"Workflow.json\")")
                 echo "MainFile: $MAIN"
                 uip api-workflow build . &&
-                uip api-workflow validate "$MAIN" &&
-                uip api-workflow run "$MAIN" --no-auth
+                uip api-workflow validate "$MAIN"
               '
               ;;
             rpa-process|rpa-library|rpa-test-automation)
@@ -731,7 +792,10 @@ jobs:
               | tee -a "$LOG" || { echo "::error::solution pack failed in $sol" | tee -a "$LOG"; RC=1; }
           done < <(find "$CODE_DIR" -maxdepth 3 -type f -name '*.uipx' -exec dirname {} \; | sort -u)
           if [ "$PACKED" -eq 0 ]; then
-            echo "::warning::no .uipx under $CODE_DIR - deploy readiness not proven" | tee -a "$LOG"
+            # Not a warning. A silent pass here is exactly how a project-only build
+            # reached review with its deploy path never tested.
+            echo "::error::no .uipx under $CODE_DIR - every build ships as a solution, so there is nothing to prove deploy readiness with" | tee -a "$LOG"
+            RC=1
           fi
 
           if grep -qiE "unknown command|unknown option" "$LOG"; then
@@ -760,7 +824,7 @@ jobs:
 
             ## Your only job
 
-            Make these four things pass, in this order:
+            Make these three things pass, in this order:
 
             1. **Structurally sound** - the product's `validate` command is clean.
             2. **Runnable** - `validate-build.sh` is clean. It reports things the
@@ -774,8 +838,13 @@ jobs:
                connection ids come from the §4 table; if the value you need is not
                there, stop and record it, do not invent one.
             3. **Packs** - `uip solution pack` succeeds (this is the deploy gate).
-            4. **Runs** - the product's local run (`--no-auth` where it applies)
-               completes without an unhandled fault.
+
+            There is deliberately no local-run gate. `--no-auth` has no Integration
+            Service credentials, so a connector-authenticated call always fails with
+            `baseUrl is required and cannot be empty` no matter how correct the
+            workflow is. If you see that error in an old log, it is not a defect -
+            do not chase it, and never weaken a connector activity to make a local
+            run succeed.
             5. Nothing else. An activity-count WARNING is not yours to fix -
                the size of the design is the PDD's business, not a repair job.
 
@@ -839,15 +908,22 @@ jobs:
           }
           case "$PRODUCT" in
             # validate takes the workflow FILE, not the project directory.
-            # Mirror the first pass exactly, run included - the repair agent is told
-            # the gate is validate + pack + run, so re-validating less than that would
-            # let a project through that still faults at runtime.
+            # Mirror the first pass exactly - the repair agent is told the gate is
+            # validate + validate-build.sh + pack, so re-validating less than that
+            # would let a project through that the first pass had rejected.
             api-workflows)
+              # NO `uip api-workflow run` here. `--no-auth` means no Integration
+              # Service credentials and no connection context, so any HTTP Request
+              # with `authentication: "connector"` dies on `baseUrl is required and
+              # cannot be empty` however correct the workflow is. It is an
+              # unsatisfiable gate for every design that calls a connector, and it
+              # cost a repair round-trip that fixed the real defect and still failed.
+              # build + validate + validate-build.sh + `uip solution pack` is the
+              # offline gate; a live run belongs to deploy, where credentials exist.
               run_in_projects 'project.uiproj' bash -c '
                 MAIN=$(python3 -c "import json;print(json.load(open(\"project.uiproj\")).get(\"MainFile\") or \"Workflow.json\")")
                 uip api-workflow build . &&
-                uip api-workflow validate "$MAIN" &&
-                uip api-workflow run "$MAIN" --no-auth
+                uip api-workflow validate "$MAIN"
               '
               ;;
             rpa-process|rpa-library|rpa-test-automation)
@@ -859,14 +935,28 @@ jobs:
             coded-apps)      run_in_projects 'package.json' npm run build ;;
           esac
 
+          # Runnability, same check that caught the defect on the first pass. Without
+          # it the re-validate pass never confirms the repair actually landed.
+          if [ -f .github/scripts/validate-build.sh ]; then
+            echo "=== validate-build.sh ==="
+            bash .github/scripts/validate-build.sh "$CODE_DIR" \
+              "$DOCS_DIR/architectural-considerations.md" 2>&1 || RC=1
+          fi
+
           # Deploy readiness, same gate as the first pass.
+          PACKED=0
           while IFS= read -r sol; do
             [ -n "$sol" ] || continue
+            PACKED=1
             echo "=== uip solution pack (in $sol) ==="
             ( cd "$sol" && uip solution pack . "$RUNNER_TEMP/packcheck2" \
                 --name "$(basename "$sol")" --version 0.0.1 --output json ) 2>&1 \
               || { echo "::error::solution pack still fails in $sol"; RC=1; }
           done < <(find "$CODE_DIR" -maxdepth 3 -type f -name '*.uipx' -exec dirname {} \; | sort -u)
+          if [ "$PACKED" -eq 0 ]; then
+            echo "::error::still no .uipx under $CODE_DIR after the repair pass"
+            RC=1
+          fi
 
           if [ "$RC" -ne 0 ]; then
             echo "::error::The project still does not validate after one repair pass."

@@ -382,14 +382,21 @@ jobs:
                it `[SME REVIEW]` - never default to O365. For document storage, never assume
                SharePoint.
             8. Business Rules - table `ID | Rule | Source | Applies at step`.
-               IDs are `BR-01`, `BR-02`, ... `BR-nn`: the letters BR, a hyphen, and EXACTLY
-               TWO digits, zero-padded. Never `BR-1`, never `BR-001`. Use that one form
-               every single time you write a rule ID - in this table, in step remarks, in
-               section 9, in prose, in parentheses, anywhere. Mixing `BR-01` and `BR-001`
-               for the same rule turns one rule into two for every stage that reads this
-               document: they match IDs as exact strings, so the SDD hunts for rules that
-               do not exist and the review stage reviews phantoms. The validator rejects a
-               PDD that mixes widths.
+               YOUR rule IDs are `BR-01`, `BR-02`, ... `BR-nn`: the letters BR, a hyphen,
+               and EXACTLY TWO digits, zero-padded. Never `BR-1`, never `BR-003`. Use that
+               one form every single time you refer to one of YOUR rules - in the ID column,
+               in step remarks, in section 9, in section 15, in prose, in parentheses,
+               anywhere. Two widths for the same rule turn one rule into two for every stage
+               that reads this document: they match IDs as exact strings, so the SDD hunts
+               for rules that do not exist and the review stage reviews phantoms. The
+               validator rejects a section 8 ID column that mixes widths.
+               The SME document usually numbers its own rules, and often differently
+               (`BR-001`, `R5`, `Rule 3`). Quote that number EXACTLY as the source wrote it,
+               and ONLY inside a `Source` cell - that is what makes the rule traceable. Never
+               carry a source number into prose or into any other column: write
+               `contradicts BR-07` in section 15, not `contradicts BR-007`, even when you are
+               discussing the sentence the source numbered BR-007. Source cell = their
+               numbering, everywhere else = yours.
                Extract rules buried in prose and in step remarks. Every rule must be traceable to
                a sentence in the source; a rule you cannot trace does not belong here.
             9. Business Exceptions - table `ID | Name | Trigger step | Trigger condition | Action`,
