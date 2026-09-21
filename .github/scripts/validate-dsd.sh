@@ -1,122 +1,39 @@
 #!/usr/bin/env bash
-# Validates that the generated DSD(s) are honest AS-BUILT documentation.
-# Reports every problem it finds (not just the first) and exits 1 if any.
+# Checks that the as-built DSD(s) EXIST and are viable markdown - nothing more.
 #
 # Usage: .github/scripts/validate-dsd.sh <architecture.json>
 #
-# Docs runs AFTER Development, so the DSD documents the delivered code rather than
-# specifying work to come. The check that makes that real is the code-reference test:
-# every `code/...` path the document names must exist on disk. A DSD that describes
-# the design instead of the delivery fails it, which is the exact failure mode of an
-# agent that read the SDD and paraphrased it.
+# This used to enforce a nine-section contract, per-section table minimums, code-path
+# existence, document-control fields and rule traceability. All of it is gone on
+# purpose. Nothing downstream reads the DSD: it is generated after the build was built,
+# tested and reviewed, so it can never be the thing that blocks a delivery, and every
+# rule it enforced was a rule an agent had to spend generation time satisfying. One
+# run lost 238 seconds - over half the stage - to two checks that were themselves
+# wrong.
 #
-# The DSD paths are derived from architecture.json AND the repository name exactly as
-# uipath-dsd.yml derives them (docs/dsd-<repo>.md), so the validator and the workflow
-# cannot disagree about which files exist.
+# What is left is the question actually worth asking: is there a file, and can I open
+# it in front of someone without it looking broken? So: it exists, it is not a stub,
+# it has a title and some sections, no code fence is left hanging (which would swallow
+# the rest of the page when rendered) and no table is a header with no rows.
+#
+# The DSD path comes from the REPOSITORY name, derived exactly as uipath-dsd.yml
+# derives it, so the validator and the workflow cannot disagree about which file
+# should exist.
 set -uo pipefail
 
 ARCH_FILE="${1:?usage: validate-dsd.sh <architecture.json>}"
 
-# The DSD name comes from the REPOSITORY, never the process name - the same rule
-# uipath-dsd.yml applies, and for the same reason: a process name is not unique
-# across the estate and changes when the process is renamed. Deriving it from
-# process_kebab here is what made this script and the workflow disagree about the
-# filename and fail a run whose document was perfectly good.
-# Optional 2nd argument wins, then $DSD_REPO_NAME, then the GitHub repo, then git.
 REPO_NAME="${2:-${DSD_REPO_NAME:-}}"
 [ -n "$REPO_NAME" ] || REPO_NAME="${GITHUB_REPOSITORY:-}"
 REPO_NAME="${REPO_NAME##*/}"
 [ -n "$REPO_NAME" ] || REPO_NAME="$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")"
 
-# 600, not 700: as-built sections are largely tables (config, rules, troubleshooting)
-# and are legitimately more compact than the build-spec prose this stage used to hold.
-BYTES_PER_SECTION="${MIN_DSD_BYTES_PER_SECTION:-600}"
-CODE_DIR="${CODE_DIR:-code}"
+# A document this small is a stub, not a page you would show anyone.
+MIN_BYTES="${MIN_DSD_BYTES:-1200}"
 FAILURES=0
-WARNINGS=0
 
 fail() { echo "::error::$*"; FAILURES=$((FAILURES + 1)); }
-warn() { echo "::warning::$*"; WARNINGS=$((WARNINGS + 1)); }
 ok()   { echo "  ok  - $*"; }
-# Advisory: printed and annotated, never counted toward the exit code.
-soft_note() { echo "::warning::[advisory] $*"; }
-
-# ── Document History: the record of what changed and why ─────────────────────
-# The lifecycle documents are LIVING files at fixed repository-based names - never
-# renamed, never superseded by a second file - so this table is the only
-# human-readable record of which change request caused which revision. Git has the
-# diff; this has the reason.
-#
-# Two severities on purpose: the table's EXISTENCE and its rows are hard, because a
-# document without one loses its history permanently. Whether a revision NAMES its
-# change request is advisory, so a first-run document - which has no CR to name -
-# can never fail on it.
-check_document_history() {
-  local f="$1" label="${2:-$1}"
-
-  if ! grep -qxF '## Document History' "$f"; then
-    fail "$label is missing '## Document History' - without it a revision leaves no record of what changed."
-    return
-  fi
-
-  # Data rows only: everything after the table's separator line, up to the next H2.
-  local rows n
-  rows=$(awk '
-    /^## Document History$/           { inside = 1; next }
-    inside && /^## /                  { exit }
-    inside && /^\|[ :|-]+\|[ :|-]*$/  { sep = 1; next }
-    inside && sep && /^\|/            { print }
-  ' "$f")
-  n=$(printf '%s' "$rows" | grep -c . || true)
-
-  if [ "${n:-0}" -lt 1 ]; then
-    fail "$label has an empty Document History table - it needs at least one row."
-    return
-  fi
-
-  # Every row must actually say something. A dated row with no comment records that
-  # a change happened while hiding what it was, which is worse than no row at all.
-  local blank
-  # The COMMENTS column specifically - the last cell before the trailing pipe -
-  # not merely "the last non-empty cell", which a row ending `| Architect | |`
-  # would satisfy while saying nothing about what changed.
-  blank=$(printf '%s\n' "$rows" | awk -F'|' '{
-    if (NF < 3) { print NR; next }
-    c = $(NF - 1); gsub(/^[ \t]+|[ \t]+$/, "", c);
-    if (c == "") print NR
-  }')
-  if [ -n "$blank" ]; then
-    fail "$label Document History has row(s) with an empty Comments cell: row(s) $(echo "$blank" | tr '\n' ' ')"
-  else
-    ok "Document History has ${n} row(s), all with comments"
-  fi
-
-  # Two or more rows means a revision happened, so the newest row should name what
-  # caused it - a CR document, a story key, or a filename.
-  if [ "${n:-0}" -ge 2 ]; then
-    local newest
-    newest=$(printf '%s\n' "$rows" | tail -1)
-    if ! printf '%s' "$newest" \
-         | grep -qiE '\.md|\.docx|[a-z]+-[0-9]+|change[ -]request|\bCR\b'; then
-      soft_note "$label newest Document History row does not name the change request that caused it: ${newest}"
-    fi
-  fi
-}
-
-# ── the section contract ─────────────────────────────────────────────────────
-# Kept in sync with the section list in uipath-dsd.yml's agent prompt.
-# Component Reference, Data and Interface Reference and Business Rules Implemented
-# were dropped: they restated the SDD instead of recording what only the build knows,
-# and together they were ~105s of generation on the critical path.
-REQUIRED_SECTIONS=(
-  "Solution Overview"
-  "As-Built Architecture"
-  "Configuration Reference"
-  "Exception and Error Handling"
-  "Operations Runbook"
-)
-SECTION_COUNT=${#REQUIRED_SECTIONS[@]}
-FLOOR=$(( SECTION_COUNT * BYTES_PER_SECTION ))
 
 # ── architecture.json ────────────────────────────────────────────────────────
 if [ ! -f "$ARCH_FILE" ]; then
@@ -155,9 +72,7 @@ if [ -z "$DECLARED" ]; then
 fi
 
 echo "Validating $(printf '%s\n' "$DECLARED" | grep -c .) as-built DSD file(s) derived from $ARCH_FILE"
-echo "Section floor: ${SECTION_COUNT} sections x ${BYTES_PER_SECTION} bytes = ${FLOOR}"
 echo
-
 while IFS=$'\t' read -r DSD SDD PRODUCT SKILL PROJECT; do
   [ -n "$DSD" ] || continue
   echo "── $DSD  [$PROJECT / $PRODUCT]"
@@ -169,200 +84,51 @@ while IFS=$'\t' read -r DSD SDD PRODUCT SKILL PROJECT; do
     continue
   fi
 
-  # --- size ----------------------------------------------------------------
   BYTES=$(wc -c < "$DSD" | tr -d ' ')
-  if [ "$BYTES" -lt "$FLOOR" ]; then
-    fail "$DSD is only ${BYTES} bytes (minimum ${FLOOR}) - not usable documentation."
+  if [ "$BYTES" -lt "$MIN_BYTES" ]; then
+    fail "$DSD is only ${BYTES} bytes (minimum ${MIN_BYTES}) - that is a stub, not a document."
   else
-    ok "size ${BYTES} bytes"
+    ok "exists, ${BYTES} bytes"
   fi
 
-  # --- title and document control -----------------------------------------
-  grep -qE '^# Detailed Solution Design — .+' "$DSD" \
-    || fail "$DSD has no '# Detailed Solution Design — <name>' H1 title."
+  grep -qE '^# .+' "$DSD" || fail "$DSD has no '# ' H1 title line."
 
-  if ! grep -qF '<!-- dsd-handoff:v1 -->' "$DSD"; then
-    fail "$DSD is missing the '<!-- dsd-handoff:v1 -->' marker."
-  elif [ "$(grep -nF '<!-- dsd-handoff:v1 -->' "$DSD" | head -1 | cut -d: -f1)" -gt 50 ]; then
-    fail "$DSD has the dsd-handoff marker below line 50."
+  SECTIONS=$(grep -c '^## ' "$DSD" || true)
+  if [ "${SECTIONS:-0}" -lt 3 ]; then
+    fail "$DSD has only ${SECTIONS} '## ' section(s) - it does not read as a document."
   else
-    ok "dsd-handoff marker present and early"
+    ok "${SECTIONS} sections"
   fi
 
-  grep -qxF '## Document Control' "$DSD" \
-    || fail "$DSD is missing the exact heading '## Document Control'."
-
-  if grep -qiE '\*\*Status\*\*[^|]*\|[[:space:]]*draft' "$DSD"; then
-    fail "$DSD says 'Status: draft' - the release gate reads this document."
-  elif ! grep -qiE '\*\*Status\*\*[^|]*\|[[:space:]]*ready' "$DSD"; then
-    fail "$DSD has no 'Status | ready' row."
+  # An odd number of fences means one is never closed, and everything after it
+  # renders as a single grey block.
+  FENCES=$(grep -c '^```' "$DSD" || true)
+  if [ $(( FENCES % 2 )) -ne 0 ]; then
+    fail "$DSD has an unclosed code fence (${FENCES} fence lines) - the rest of the page renders as one code block."
   else
-    ok "Status is ready"
+    ok "code fences balanced"
   fi
 
-  grep -qiE '\*\*Documents\*\*[^|]*\|[[:space:]]*as-built' "$DSD" \
-    || fail "$DSD does not declare '| **Documents** | as-built |' - this stage documents the delivery, not the design."
-
-  for field in 'Source SDD' 'Source architecture' 'Project' 'Product' 'Build skill' \
-               'Generated by' 'Generation date'; do
-    grep -qF "**$field**" "$DSD" || fail "$DSD Document Control is missing the '$field' row."
-  done
-
-  if [ -n "$SDD" ] && ! grep -qF "$SDD" "$DSD"; then
-    fail "$DSD does not name the SDD '$SDD' it is measured against."
-  fi
-
-  grep -qxF '## Table of Contents' "$DSD" || fail "$DSD is missing '## Table of Contents'."
-  check_document_history "$DSD"
-
-  # --- numbered sections: present, in order, contiguous, with content -----
-  SECTION_FAILS=0
-  for section in "${REQUIRED_SECTIONS[@]}"; do
-    if ! grep -qE "^## ([0-9]+\. )?$(printf '%s' "$section" | sed 's/[][\\.*^$]/\\&/g')$" "$DSD"; then
-      fail "$DSD is missing section '$section'."
-      SECTION_FAILS=$((SECTION_FAILS + 1))
-      continue
-    fi
-    CONTENT=$(awk -v want="$section" '
-      $0 ~ "^## ([0-9]+\\. )?"want"$" { inside = 1; next }
-      inside && /^## / { exit }
-      inside && NF && !/^<!--/ { print }
-    ' "$DSD" | wc -l | tr -d ' ')
-    if [ "${CONTENT:-0}" -lt 2 ]; then
-      fail "$DSD section '$section' is empty or has only one line of content."
-      SECTION_FAILS=$((SECTION_FAILS + 1))
-    fi
-  done
-  [ "$SECTION_FAILS" -eq 0 ] && ok "all ${SECTION_COUNT} sections present with content"
-
-  ORDER=$(grep -oE '^## [0-9]+\.' "$DSD" | grep -oE '[0-9]+')
-  if [ -n "$ORDER" ]; then
-    [ "$(echo "$ORDER" | tr '\n' ' ')" = "$(echo "$ORDER" | sort -n | tr '\n' ' ')" ] \
-      || fail "$DSD numbered sections are out of order: $(echo "$ORDER" | tr '\n' ' ')"
-    EXPECTED=$(seq 1 "$(echo "$ORDER" | wc -l | tr -d ' ')" | tr '\n' ' ')
-    [ "$(echo "$ORDER" | tr '\n' ' ')" = "$EXPECTED" ] \
-      || fail "$DSD section numbering is not contiguous from 1: got $(echo "$ORDER" | tr '\n' ' ')"
-    LAST=$(grep -E '^## [0-9]+\.' "$DSD" | tail -1)
-    case "$LAST" in
-      *"Operations Runbook") ok "document ends on Operations Runbook" ;;
-      *) fail "$DSD last numbered section is '$LAST' - a DSD must end on 'Operations Runbook'." ;;
-    esac
-  fi
-
-  # ── the as-built test ───────────────────────────────────────────────────
-  # Every code path the document names must exist. This is what separates
-  # documentation of the delivery from a paraphrase of the design.
-  REFS=$(grep -oE '`'"$CODE_DIR"'/[^`]+`' "$DSD" | tr -d '`' | sort -u || true)
-  REF_COUNT=$(printf '%s\n' "$REFS" | grep -c . || true)
-  if [ "${REF_COUNT:-0}" -lt 3 ]; then
-    fail "$DSD references only ${REF_COUNT} path(s) under $CODE_DIR/ - it is not describing the delivered build."
-  else
-    GHOSTS=""
-    for r in $REFS; do
-      # Trim a trailing slash so a directory reference resolves.
-      c="${r%/}"
-      [ -e "$c" ] || GHOSTS="$GHOSTS $c"
-    done
-    if [ -n "$GHOSTS" ]; then
-      fail "$DSD references path(s) that do not exist - it documents the design, not the delivery:$GHOSTS"
-    else
-      ok "all ${REF_COUNT} referenced $CODE_DIR/ paths exist"
-    fi
-  fi
-
-  # --- the sections support actually opens --------------------------------
-  rows_in() {
-    awk -v want="$1" '
-      $0 ~ "^## ([0-9]+\\. )?"want"$" { inside = 1; next }
-      inside && /^## / { exit }
-      inside && /^\|/ && $0 !~ /^\|[ :|-]+\|[ :|-]*$/ { n++ }
-      END { print n + 0 }
-    ' "$DSD"
-  }
-
-  for section in "Configuration Reference"; do
-    ROWS=$(rows_in "$section")
-    if [ "${ROWS:-0}" -lt 3 ]; then
-      fail "$DSD section '$section' has only ${ROWS} table row(s) - it must be a real table."
-    else
-      ok "'$section' has ${ROWS} table rows"
-    fi
-  done
-
-  # --- documentation, not a code dump -------------------------------------
-  if grep -qE '<Activity|xmlns:ui=|xmlns:x="http://schemas.microsoft.com' "$DSD"; then
-    fail "$DSD contains XAML - reference the file, do not paste it."
-  else
-    ok "no pasted implementation"
-  fi
-
-  # --- unfilled scaffolding ------------------------------------------------
-  if LEFTOVERS=$(grep -nE '<[A-Z][A-Z0-9_]{2,}>|<placeholder|<one-line|<PATH_TO|<project name>|<product>|<skill>|<the measured-against|<YYYY-MM-DD>|<DATE>|<AUTHOR>' "$DSD"); then
-    fail "$DSD has unfilled placeholders:"
-    echo "$LEFTOVERS" | head -20
-  else
-    ok "no placeholders"
-  fi
-
-  if LEFTOVERS=$(grep -nEi '(\bTBD\b|Lorem ipsum|\bFIXME\b|\bX{4,}\b)' "$DSD"); then
-    fail "$DSD has placeholder text left in it:"
-    echo "$LEFTOVERS" | head -20
-  else
-    ok "no placeholder text"
-  fi
-
+  # A header with no rows under it renders as a broken table.
   EMPTY_TABLES=$(awk '
     /^\|[ :|-]+\|[ :|-]*$/ { sep = NR; next }
     sep && NR == sep + 1 && $0 !~ /^\|/ { print sep; sep = 0; next }
     sep && NR == sep + 1 { sep = 0 }
   ' "$DSD")
   if [ -n "$EMPTY_TABLES" ]; then
-    fail "$DSD has empty table(s) at line(s): $(echo "$EMPTY_TABLES" | tr '\n' ' ')"
+    fail "$DSD has a table with no data rows at line(s): $(echo "$EMPTY_TABLES" | tr '\n' ' ')"
   else
     ok "all tables have data rows"
   fi
 
-  # --- traceability against the SDD ---------------------------------------
-  # There is deliberately NO per-BR-xx check here any more. It grepped every
-  # `BR-<digits>` out of the SDD and demanded each one appear in the DSD - but the
-  # SDD cites the PDD's own numbering (BR-001 ...) alongside its own (BR-01 ...), so
-  # the check demanded BOTH forms. The only way to pass was a traceability table
-  # writing every rule twice, `BR-01 / BR-001`, which turned 10 rules into 20 and
-  # taught a reader nothing. The SDD already maps each rule to the step that enforces
-  # it; that is where rule traceability lives.
-  if [ -z "$SDD" ] || [ ! -f "$SDD" ]; then
-    warn "source SDD '$SDD' not available - skipping traceability for $DSD"
-  else
-    IDS=$(grep -oE '\b[BS][0-9]+\b' "$SDD" | sort -u | tr '\n' ' ')
-    if [ -n "${IDS// /}" ]; then
-      PRESENT=0; MISSING_IDS=""
-      for id in $IDS; do
-        if grep -qE "\b$id\b" "$DSD"; then PRESENT=$((PRESENT + 1)); else MISSING_IDS="$MISSING_IDS $id"; fi
-      done
-      TOTAL=$(printf '%s' "$IDS" | wc -w | tr -d ' ')
-      if [ "$PRESENT" -eq 0 ]; then
-        fail "none of the ${TOTAL} exception/error IDs in $SDD appear in $DSD - 'Exception and Error Handling' is decorative."
-      elif [ -n "$MISSING_IDS" ]; then
-        warn "exception/error IDs not documented in $DSD (renamed, or not built?):$MISSING_IDS"
-      else
-        ok "all ${TOTAL} exception/error IDs are documented"
-      fi
-    fi
-  fi
   echo
 done <<< "$DECLARED"
 
-if [ "$WARNINGS" -gt 0 ]; then
-  echo "DSD validation raised ${WARNINGS} warning(s)."
-fi
-# The exit code exists to DRIVE the repair pass, not to reject a delivery. A DSD is
-# generated documentation written AFTER the build was tested and reviewed - it must
-# never be the thing that fails a release. DSD_NEVER_FAIL=1 makes that explicit for
-# callers that only report (the Verify step); leave it UNSET for the repair loop,
-# which needs a non-zero exit to know there is work to do.
+# The exit code drives the repair pass; it is not a release gate. A DSD is generated
+# after the build was tested and the PR reviewed - it must never fail a good delivery.
 if [ "$FAILURES" -gt 0 ]; then
-  echo "DSD validation FAILED with ${FAILURES} problem(s)."
+  echo "DSD check FAILED with ${FAILURES} problem(s)."
   [ "${DSD_NEVER_FAIL:-0}" = "1" ] && { echo "DSD_NEVER_FAIL=1 - reporting only."; exit 0; }
   exit 1
 fi
-echo "DSD validation passed."
+echo "DSD check passed - the document exists and is viable markdown."
