@@ -152,19 +152,66 @@ else
 fi
 
 # --- business rule IDs use ONE format --------------------------------------
-# Every downstream stage (SDD, DSD, review) matches these as exact strings, so
-# BR-01 and BR-001 are two different rules to all of them. A PDD that mixes the
-# two turned 11 rules into 22 in a previous run and sent the SDD agent hunting
-# for the phantoms - 90 seconds of find-and-replace that never converged.
-BR_IDS=$(grep -oE '\bBR-[0-9]+\b' "$PDD_FILE" | sort -u || true)
-if [ -n "$BR_IDS" ]; then
-  BR_WIDTHS=$(printf '%s\n' "$BR_IDS" | sed 's/^BR-//' | awk '{ print length($0) }' | sort -u)
+# Every downstream stage (SDD, DSD, review) matches rule IDs as exact strings, so
+# BR-01 and BR-001 are two different rules to all of them. The ID column of
+# section 8 is the authority, and it is the only place this check can fail:
+# a PDD traces every rule back to the SME document, and that document numbers its
+# own rules (BR-001 ...). Those citations belong in `Source` cells and are correct
+# there. Failing the build over them buys nothing and costs a repair round-trip
+# that rewrites real citations into references the source document does not have.
+BR_CANON=$(awk '
+  $0 == "## 8. Business Rules" { inside = 1; next }
+  inside && /^## / { exit }
+  inside && /^\|/ && $0 !~ /^\|[ :|-]+\|[ :|-]*$/ {
+    n = split($0, cell, "|")
+    id = cell[2]; gsub(/^[ \t]+|[ \t]+$/, "", id)
+    if (id ~ /^BR-[0-9]+$/) print id
+  }
+' "$PDD_FILE" | sort -u)
+
+if [ -z "$BR_CANON" ]; then
+  fail "Section 8 has no row whose first column is a BR-nn rule ID - the SDD reads that column as the rule list."
+else
+  BR_WIDTHS=$(printf '%s\n' "$BR_CANON" | sed 's/^BR-//' | awk '{ print length($0) }' | sort -u)
   BR_NWIDTH=$(printf '%s\n' "$BR_WIDTHS" | grep -c . || true)
   if [ "${BR_NWIDTH:-0}" -gt 1 ]; then
-    fail "Business rule IDs mix digit widths ($(printf '%s' "$BR_WIDTHS" | tr '\n' '/' | sed 's:/$::')) - use BR-01 .. BR-nn everywhere, including every mention in prose."
-    echo "    ids found: $(printf '%s' "$BR_IDS" | tr '\n' ' ')"
+    fail "Section 8 rule IDs mix digit widths ($(printf '%s' "$BR_WIDTHS" | tr '\n' '/' | sed 's:/$::')) - use one zero-padded width, BR-01 .. BR-nn."
+    echo "    ids found: $(printf '%s' "$BR_CANON" | tr '\n' ' ')"
   else
-    ok "business rule IDs use one format ($(printf '%s\n' "$BR_IDS" | grep -c . || true) unique)"
+    ok "section 8 rule IDs use one format ($(printf '%s\n' "$BR_CANON" | grep -c . || true) rules)"
+  fi
+
+  # Rule IDs mentioned anywhere else should resolve to that column, otherwise the
+  # SDD hunts for a rule that does not exist. Advisory only: `Source` cells are
+  # already excluded, so what is left is prose the next revision can tidy - not a
+  # reason to spend a minute of agent time re-running the document.
+  BR_REFS=$(awk '
+    /^\|/ {
+      if (!intable) { intable = 1; hdr = 0; split("", skip) }  # split() clears: portable to mawk
+      if ($0 ~ /^\|[ :|-]+\|[ :|-]*$/) next
+      n = split($0, cell, "|")
+      if (!hdr) {
+        hdr = 1
+        for (i = 2; i < n; i++) {
+          t = tolower(cell[i]); gsub(/^[ \t]+|[ \t]+$/, "", t)
+          if (t ~ /source|traceab|reference/) skip[i] = 1
+        }
+        next
+      }
+      for (i = 2; i < n; i++) if (!(i in skip)) print cell[i]
+      next
+    }
+    { intable = 0; print }
+  ' "$PDD_FILE" | grep -oE '\bBR-[0-9]+\b' | sort -u || true)
+
+  BR_DANGLING=""
+  for ref in $BR_REFS; do
+    printf '%s\n' "$BR_CANON" | grep -qxF "$ref" || BR_DANGLING="$BR_DANGLING $ref"
+  done
+  if [ -n "$BR_DANGLING" ]; then
+    soft_note "Rule references outside section 8 that are not in its ID column:${BR_DANGLING} - downstream stages resolve rule IDs against that column only. If these are the SME document's own numbers, they belong in a 'Source' cell."
+  else
+    ok "all rule references resolve to section 8"
   fi
 fi
 

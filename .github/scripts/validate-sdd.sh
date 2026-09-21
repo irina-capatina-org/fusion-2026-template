@@ -550,14 +550,17 @@ while IFS=$'\t' read -r SDD TEMPLATE ROLE PRODUCT; do
 
   # --- resource naming ----------------------------------------------------
   # Names come from the repository's epic key, never from the process name.
+  #
+  # There is deliberately NO "the epic prefix must appear N times" check here.
+  # It counted lines containing the prefix string, not resources, so a design that
+  # legitimately owns nothing - all headless API calls over pre-existing shared IS
+  # connections, which must never be renamed - could not pass it honestly. It also
+  # counted an open question ASKING what the epic key should be as a hit. The only
+  # way through was an agent padding the document with the prefix to move a counter,
+  # which cost a repair round-trip and taught the next stage nothing. Nothing
+  # downstream reads the prefix; the convention is stated in the architect prompt,
+  # where it belongs.
   if [ -n "$RESOURCE_PREFIX" ] && [ "$ROLE" != "solution-root" ]; then
-    PREFIX_HITS=$(grep -cF "$RESOURCE_PREFIX" "$SDD" || true)
-    if [ "${PREFIX_HITS:-0}" -lt 2 ]; then
-      advise "$SDD names no resources with the epic prefix '$RESOURCE_PREFIX' (found ${PREFIX_HITS}) - assets, credentials, queues and connections must be '<epic_key>_<thing>'."
-    else
-      ok "resource names carry the epic prefix '$RESOURCE_PREFIX' (${PREFIX_HITS})"
-    fi
-
     # The old convention: a process-name prefix. Not unique across the estate, and it
     # changes whenever the process is renamed.
     BADNAMES=$(grep -oE '\b[A-Z][a-z][A-Za-z0-9]*_[A-Za-z0-9_]+\b' "$SDD" | sort -u || true)
