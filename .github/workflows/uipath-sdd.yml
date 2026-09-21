@@ -680,6 +680,16 @@ jobs:
             Level 2.5 -> Level 3. Skip its Step 2.5 tenant/estate `uip` discovery - this
             runner is not logged in; record that as an unverified reuse assumption.
 
+            **When PINNED product above is non-empty, do NOT read
+            references/product-selection-guide.md and do NOT walk Levels 0, 1, 1.5 or
+            1.75.** Those levels exist to CHOOSE a product, and the choice has already
+            been made and is enforced by a gate that rejects any other answer - a
+            previous run spent two minutes deliberating its way to the value it had been
+            handed in the first line of this prompt. Go straight to Level 2.5 (how many
+            independently deployed projects the process needs) and Level 3 (capability
+            add-ons), which are still genuinely yours to decide. Record the pinned
+            product as a `decisions[]` row per Step 0.5 and move on.
+
             If the skill is NOT installed, apply the rules restated in Step 2 below.
             Either way the output contract in Step 3 is identical.
 

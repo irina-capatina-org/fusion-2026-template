@@ -47,7 +47,9 @@ env:
   ASSIGNEE: irina-capatina-uipath
   AGENT_MODEL: claude-sonnet-4-6
   CLI_VERSION: '1.202.0'
-  MIN_DSD_BYTES_PER_SECTION: '600'
+  # Floor for the whole document, not per section: validate-dsd.sh no longer has a
+  # section contract to scale against. Below this it is a stub, not a page to show.
+  MIN_DSD_BYTES: '1200'
   WORK_DIR: build-work
 
 permissions:
