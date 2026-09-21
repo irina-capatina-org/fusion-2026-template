@@ -422,7 +422,8 @@ jobs:
             so the code on disk is the truth and the SDD is only what was intended. Every
             statement you write must be checkable against a file under
             ${{ env.CODE_DIR }}/. Where the build differs from the SDD, the build is what
-            you document, and the difference goes in the Deviations section.
+            you document. Where it differs from the SDD in a way that changes how the thing
+            is operated, say so in one line in As-Built Architecture.
 
             The validator checks this literally: every `code/...` path you reference must
             exist on disk. A DSD that describes the design instead of the delivery will
@@ -450,7 +451,8 @@ jobs:
 
             Read the build notes if present - its *Deviations from the SDD* and *Left for a
             human* sections are the two things as-built documentation most often misses.
-            Carry every open TODO forward into section 12.
+            Carry every open TODO forward into the Operations Runbook's prerequisites,
+            each with its file path.
 
             On a revision run, read every prior DSD and UPDATE it in place: keep the
             structure, change what the new build changed, add a Document History row
@@ -492,56 +494,87 @@ jobs:
                 3. Configuration Reference
                 4. Exception and Error Handling
                 5. Operations Runbook
-                6. Troubleshooting Guide
-                7. Monitoring and Logging
-                8. Deviations from Design
-                9. Handover and Support
+
+            Five sections, and the document ENDS on Operations Runbook. Troubleshooting
+            Guide, Monitoring and Logging, Deviations from Design, Handover and Support
+            and the rule-traceability table were removed on purpose - together they were
+            roughly half the document and about four minutes of generation on the
+            critical path. Do not reintroduce them under any heading.
+
+            ## Length budget - read this before you write anything
+
+            The whole document is about 6 KB. Not a target to reach: a ceiling to stay
+            under. The previous DSD was 28 KB and took eight minutes to write, which is
+            most of this stage's runtime.
+
+            Length is not a quality signal here. This document is read by a human
+            skimming it on a screen, and nothing downstream parses it - no stage reads
+            the DSD, so a fact stated at length is worth exactly what the same fact is
+            worth in one line. A tight document with a diagram and four clean tables is
+            better documentation AND a better demo than twenty-eight kilobytes nobody
+            scrolls through.
+
+            So: stop when a section has said its thing. Prefer a table row to a
+            paragraph, a path to a description of a path, and one clear sentence to
+            three careful ones. Never restate in section N what section N-1 already
+            said. Do not pad a section to look thorough - the validator's size floor is
+            3 KB across the whole document and you will clear it easily.
+
+            Each section carries its own budget below. They are approximate; the 6 KB
+            total is the one that matters.
+
+            Two things a budget must never do: leave a table with a header and no data
+            rows (the validator fails that), and drop a business exception or system
+            error ID that the SDD lists (the validator checks those are all documented).
+            Trim words, not rows, when those two are at stake.
 
             What each section must contain:
 
             1. **Solution Overview** - what this automation does for the business, in
                plain language a support engineer who has never seen it can follow, plus a
                table of what was delivered (projects, their roles, their entry points).
+               BUDGET: one paragraph plus that table. Roughly 800 bytes.
             2. **As-Built Architecture** - the shape of what exists: the projects, how they
                call each other, what they talk to. A short diagram in a fenced block is
                welcome. Describe the delivered topology, not the SDD's.
-               End it with a COMPACT rule-traceability table - `Rule | Enforced in` - with
-               one row per `BR-xx` in the source SDD and nothing but the file path and the
-               step or activity name in the second cell. Every `BR-xx` must appear; the
-               validator checks. No prose, no restating the rule text - that is what made
-               the old *Business Rules Implemented* section 4 KB. A rule that is NOT
-               implemented gets `not implemented` here and a full row in section 8.
-            3. **Configuration Reference** - every asset, credential, queue, bucket,
-               connection and config key the code actually reads, with its exact name,
-               type, where it is read, and who owns the value. Names come from the code.
-            4. **Exception and Error Handling** - a table mapping each business exception
-               and system error ID to where it is handled in the code, the retry
-               behaviour, and the resulting state.
+               No rule-traceability table. The SDD already maps every `BR-xx` to the
+               step that enforces it, and the old table here forced every rule to be
+               written twice - once as `BR-01` and once as the PDD's `BR-001` - to get
+               past a grep. If a rule from the SDD was NOT implemented, say so in
+               section 2 in one line; that is the only rule fact the build knows and
+               the design does not.
+               BUDGET: a fenced diagram plus about ten lines. Roughly 1,200 bytes.
+            3. **Configuration Reference** - the assets, credentials, queues, buckets,
+               connections and config keys the code actually reads, with exact name, type,
+               where it is read and who owns the value. Names come from the code.
+               BUDGET: at most 10 rows, and they are the 10 someone would realistically
+               change or get wrong - connections, credentials, schedules, tunable values.
+               Not every variable the workflow declares. The last one ran to 24 rows.
+               Roughly 1,200 bytes. Make it ONE table - if trimming leaves a sub-table
+               with a header and no data rows the validator fails the document, so merge
+               rather than split.
+            4. **Exception and Error Handling** - ONE table mapping each business
+               exception and system error ID to where it is handled in the code, the
+               retry behaviour, and the resulting state. No prose around it.
+               BUDGET: roughly 1,200 bytes.
             5. **Operations Runbook** - how this thing is run: trigger and schedule, how to
                start it manually, expected runtime and volume, what a normal run looks like
                in the logs, and the prerequisites that must be in place before it will run
                at all.
-            6. **Troubleshooting Guide** - a table `Symptom | Likely cause | How to confirm
-               | Action`. Derive rows from the real failure modes in the code: each caught
-               exception, each external dependency, each configuration item that can be
-               missing or wrong. This is the section support will actually open.
-            7. **Monitoring and Logging** - what the code logs and at which level, which
-               fields identify a transaction, what must never appear in the logs, and
-               where to look (Orchestrator job logs, Insights, connector history).
-            8. **Deviations from Design** - a table `SDD reference | Designed | As built |
-               Why`. Every difference between the SDD and the delivery, including anything
-               the build notes declared, and any `BR-xx` from the SDD that is NOT
-               implemented - a silently missing rule is the worst possible outcome here.
-               "No deviations" is a valid answer only if you actually checked - say so.
-            9. **Handover and Support** - who owns what, the runtime prerequisites, known
-               limitations, every open TODO left in the code with its file path, and what
-               a future change would most likely touch.
+               BUDGET: roughly 1,400 bytes, prerequisites included.
 
-            Sections 2, 3, 6 and 9 must between them cite at least three real paths under
+            Anything a human must still do before the first run - an unresolved value, an
+            open TODO in the code, a prerequisite nobody has set up - goes in the
+            Operations Runbook's prerequisites, with its file path. It is the one part of
+            the removed sections that the build knows and nothing else records.
+
+            Sections 2, 3 and 5 must between them cite at least three real paths under
             `${{ env.CODE_DIR }}/` in backticks - the validator checks every one exists.
-            Component Reference, Data and Interface Reference and Business Rules
-            Implemented were removed on purpose: they restated the SDD rather than
-            recording anything only knowable after the build. Do not reintroduce them.
+            Component Reference, Data and Interface Reference, Business Rules Implemented,
+            Troubleshooting Guide, Monitoring and Logging, Deviations from Design and
+            Handover and Support were all removed on purpose: they restated the SDD, the
+            code or the org's own runbook rather than recording anything only knowable
+            after the build. Do not reintroduce them.
 
             ## Hard rules
 
@@ -565,7 +598,12 @@ jobs:
 
                 bash .github/scripts/validate-dsd.sh ${{ env.WORK_DIR }}/architecture.json
 
-            Fix everything it reports and re-run until it exits 0.
+            Fix what it reports and re-run until it exits 0. It is a narrow check - the
+            file exists, is not a stub, has a title and sections, has no unclosed code
+            fence and no table with a header but no rows. Clearing it is not a quality
+            bar and passing it is not a reason to keep writing: the section contract and
+            the length budget above are what the document is judged on, and they are
+            yours to honour without being checked.
 
       - name: Validate DSD
         id: check
@@ -581,17 +619,28 @@ jobs:
           timeout_minutes: '30'
           allowed_tools: "Read,Write,Edit,Glob,Grep,Bash,Skill"
           prompt: |
-            The as-built DSD(s) for this build failed validation.
+            The as-built DSD(s) for this build are missing or are not viable markdown.
 
-            Run the validator to see exactly what is wrong:
+            Run the check to see what is wrong:
 
                 bash .github/scripts/validate-dsd.sh ${{ env.WORK_DIR }}/architecture.json
 
-            Then read ${{ env.WORK_DIR }}/manifest.json, the code under
-            ${{ env.CODE_DIR }}/ and the SDD, and fix the DSD(s) until it exits 0. Common
-            causes: a referenced `code/...` path that does not exist (you described the
-            design instead of the delivery), a missing numbered section, a thin Component
-            Reference, an SDD business rule with no row in section 6, or an empty table.
+            It only ever reports one of five things, and each has a small, local fix:
+
+            - the file does not exist -> write it, following the section contract and the
+              length budget in the generation prompt
+            - it is under the byte minimum -> it is a stub; write the real document
+            - no `# ` H1 title line -> add one
+            - fewer than three `## ` sections -> the document is incomplete; finish it
+            - an unclosed code fence -> close it
+            - a table with a header and no data rows -> give it rows, or delete the table
+
+            This check is deliberately narrow. It does NOT check sections by name, code
+            paths, business rules, document-control fields or table sizes any more, so do
+            NOT go looking for those problems or "improve" the document while you are
+            here. Make the smallest edit that clears what the check reports, re-run it,
+            and stop the moment it exits 0. Every extra minute here is a minute on the
+            pipeline clock for a document nothing downstream reads.
 
             Do not modify ${{ env.CODE_DIR }}/ or ${{ env.WORK_DIR }}/. Do not run git or gh.
 
@@ -858,8 +907,8 @@ jobs:
 
           **Before you merge**
           - [ ] The as-built DSD matches what you expect was built
-          - [ ] *Deviations from Design* in the DSD is acceptable
-          - [ ] Every open TODO in *Handover and Support* is acceptable to ship
+          - [ ] Every open TODO listed in the DSD's *Operations Runbook* prerequisites
+                is acceptable to ship
           - [ ] The Orchestrator resources the DSD lists exist in the target folder
           EOF_RELEASE
 

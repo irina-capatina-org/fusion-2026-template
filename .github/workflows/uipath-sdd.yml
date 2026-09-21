@@ -1157,8 +1157,8 @@ jobs:
 
             Read architecture.json in full. It decides scope, products, projects, queues,
             components, file paths and templates - do NOT re-open those decisions. If you
-            believe a decision is wrong, write the SDD as decided and add your objection as
-            an `[ARCHITECT REVIEW]` row in the Action Required table.
+            believe a decision is wrong, write the SDD as decided and mark your objection
+            inline with `[ARCHITECT REVIEW]` where it bites.
 
             Read `considerations_markdown` from the manifest - the org's platform facts
             and house preferences, and AUTHORITATIVE. The architect already applied it to
@@ -1168,9 +1168,10 @@ jobs:
               region, folder structure, logging target, system base URLs, auth pattern.
               Never emit an `[ARCHITECT REVIEW]` for something this file answers, even
               when the PDD marked the same thing `[SME REVIEW]`; the PDD did not know.
-              Cite "org architectural considerations" as the source in *Recommended Scope*.
-            - `[UNCONFIRMED]` there means unanswered: normal default plus an
-              `[ARCHITECT REVIEW]` row.
+              Cite "org architectural considerations" inline as the source, in the
+              section that states the fact.
+            - `[UNCONFIRMED]` there means unanswered: normal default plus an inline
+              `[ARCHITECT REVIEW]` marker.
             - Its naming rules are BINDING and the validator checks them. Every asset,
               credential, queue, bucket and connection is `<epic_key>_<thing>`, lowercase
               with underscores, where the epic key is the REPOSITORY name's prefix - not
@@ -1230,15 +1231,55 @@ jobs:
                 | **Generation date** | <YYYY-MM-DD> |
                 | **Template validation** | passed |
 
-                ## Decisions Made
-                (the decisions[] table from architecture.json - this run had no human
-                 checkpoint, so the record of what was picked and why is mandatory)
+            Nothing else between the handoff table and the numbered body.
 
-                ## Recommended Scope
-                (Recommendation / Delivery model / Blocked by platform / Need profile)
+            ## Sections the template contains that you must NOT write
 
-                ## Action Required — Architect Review Items
-                (only when architect_review_items is non-empty)
+            The template you are handed still carries these. Skip them - every byte you
+            write is a second on the demo clock, and each of these restates something
+            a machine-readable file already holds:
+
+            - `## Decisions Made` - architecture.json already carries `decisions[]`, and
+              it is committed alongside this SDD.
+            - `## Recommended Scope` - architecture.json already carries `sdd_scope`,
+              `projects[]`, `blocked_products[]` and `need_profile`.
+            - `## Action Required — Architect Review Items` - architecture.json already
+              carries `architect_review_items[]`. Keep the inline `[ARCHITECT REVIEW]`
+              markers where the open question actually bites; drop only the summary table.
+            - `### Out of Scope` under section 1 - the PDD owns the scope boundary and
+              the build stage never reads this back.
+            - The whole of `## Security & Authentication`, including its
+              `### Rate Limits` and `### Non-Functional Requirements` subsections. Its
+              rows cite their own sources - "org considerations §7", "§1", "(BR-08)" -
+              which makes it a table of pointers, and its external-systems table repeats
+              the connection rows in `Connectors & External Calls`. A `[DEFAULT]` row
+              saying "standard API rate limits apply" tells a developer nothing. If a
+              real, named rate limit constrains the design, state it in that connector's
+              own row in section 5 instead.
+
+            ## Never re-type the org's fixed JSON
+
+            `architectural-considerations.md` §4 carries the canonical HTTP Request
+            activity shape, its `bindings_v2.json` entry and the solution
+            connection-resource file, and marks their fields "fixed - byte for byte".
+            Do NOT copy any of them into the SDD. A previous SDD spent 4,450 bytes -
+            two thirds of its entire Connectors section - re-typing those three blocks.
+
+            Two reasons, and the second one matters more than the clock:
+
+            - The build stage reads `architectural-considerations.md` directly, and
+              `validate-build.sh` judges the built workflow against §4 - never against
+              the SDD's copy. A copy that drifts sends the developer one way while the
+              validator marks it wrong the other.
+            - It is a design document. Its job is to say WHICH connector, WHICH
+              connection id and WHICH endpoint each step calls. The byte-level shape of
+              the activity is the build stage's business.
+
+            So in Connectors & External Calls, write the connector key, the connection
+            name, the connection id, the operation, the endpoint and the parameters as
+            table rows, then one line: "Activity shape, `bindings_v2.json` entry and
+            connection-resource file: `docs/architectural-considerations.md` §4,
+            verbatim." No fenced JSON.
 
             For a `solution-root` file add these handoff rows too: `Solution root SDD` (its
             own filename), `Solution ID`, `Project SDD role: root`. Every `project` file
@@ -1296,12 +1337,18 @@ jobs:
             **api-workflow-sdd-template.md**
             1. API Workflow Overview · 2. Input Schema · 3. Output Schema ·
             4. Execution Flow · 5. Connectors & External Calls · 6. Error Handling ·
-            7. Security & Authentication · 8. Project Structure · 9. Testing Strategy ·
-            10. Next Steps
+            7. Project Structure · 8. Testing Strategy · 9. Next Steps
 
-            For this template the sections `Performance & Scaling` and `Consumers` are
-            DELIBERATELY OMITTED - do not emit them even if the template file lists them.
-            They are the one case where the generated SDD is a subset of its template.
+            For this template the sections `Performance & Scaling`, `Consumers` and
+            `Security & Authentication` are DELIBERATELY OMITTED - do not emit them even
+            if the template file lists them. They are the case where the generated SDD is
+            a subset of its template. Nothing is lost by dropping
+            `Security & Authentication`: which connection each call uses and where its
+            credentials live is already a row in `Connectors & External Calls`, and the
+            credential policy, logging target, data residency and runtime environment are
+            stated once, authoritatively, in `architectural-considerations.md` §4, §5 and
+            §7 - which the build stage reads directly. Numbering stays contiguous from 1,
+            so renumber the sections after it; the validator rejects a gap.
 
             ## Keep Testing Strategy short
 
@@ -1340,7 +1387,7 @@ jobs:
               outcome only when a human does something different because of it.
             - Cap: this section is a compact table - failure, detection, response, who is
               told. If it needs more than that, the process genuinely is that complex and
-              *Decisions Made* must say which PDD statement forced it.
+              the section itself must say which PDD statement forced it.
 
             The same restraint applies to `Execution Flow`: it describes the happy path
             plus the deviations the PDD names, in the fewest steps that express the
@@ -1396,8 +1443,9 @@ jobs:
             - **Never invent** a business rule, threshold, volume, system, URL, person,
               selector or credential value. A gap is `[DEFAULT]` (a standard engineering
               default you applied - retries, timeouts, logging) or `[ARCHITECT REVIEW]` (business
-              knowledge only a human has). Both markers stay in the document and every
-              `[ARCHITECT REVIEW]` also gets a row in the Action Required table.
+              knowledge only a human has). Both markers stay inline in the document,
+              at the point the gap actually affects the design. There is no summary
+              table - architecture.json carries `architect_review_items[]`.
             - **Open items are `[ARCHITECT REVIEW]`, never `[SME REVIEW]`.** The PDD uses
               `[SME REVIEW]` because its open questions go to the business; an SDD's go to
               an architect. When you carry a PDD item across, rewrite the marker AS YOU
@@ -1646,7 +1694,7 @@ jobs:
           - [ ] Queue / data schemas are concrete enough to build from
           - [ ] Named Orchestrator resources (assets, credentials, queues) are correct
           - [ ] Testing Strategy covers every business exception and system error
-          - [ ] Every `[ARCHITECT REVIEW]` item in *Action Required* is answered or accepted
+          - [ ] Every inline `[ARCHITECT REVIEW]` item is answered or accepted
           EOF_BODY
 
           {

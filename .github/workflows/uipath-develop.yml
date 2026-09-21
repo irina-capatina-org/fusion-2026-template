@@ -416,6 +416,7 @@ jobs:
             Architecture:  ${{ needs.identify.outputs.arch_file }}
             SDD(s):        ${{ needs.identify.outputs.sdd_files }}
             Task list:     ${{ env.WORK_DIR }}/${{ needs.identify.outputs.tasks_file }}
+            Org rules:     ${{ env.DOCS_DIR }}/architectural-considerations.md
             Build skills:  ${{ needs.identify.outputs.skills }}
             Primary:       ${{ needs.identify.outputs.product }}
             Scope:         ${{ needs.identify.outputs.scope }}
@@ -449,6 +450,26 @@ jobs:
             build order. The SDD is the specification: its schemas, named resources,
             business rules and process steps are what you implement. Where the SDD and
             your instinct disagree, the SDD wins - it was reviewed and approved.
+
+            Read `Org rules` above in full as well - it is the org's own platform facts,
+            and it is AUTHORITATIVE. The SDD deliberately does NOT repeat what is in it.
+
+            **§4 "Connection and credential patterns" is binding, and you must read it
+            BEFORE you write a single connector activity.** It carries, verbatim and
+            marked fixed byte for byte: the approved HTTP Request activity shape with
+            `authentication: "connector"`, the matching `bindings_v2.json` entry, and
+            the solution connection-resource file. Copy those shapes from there and fill
+            in the connector key, connection id and endpoint the SDD names for that
+            step. `validate-build.sh` checks your output against §4, so §4 is what you
+            build to. The SDD tells you WHICH connection each step uses; §4 tells you
+            HOW to write the activity. A previous build guessed the shape instead of
+            reading §4, wrote `connectionId: "ImplicitConnection"` on every HTTP
+            activity, and the whole workflow failed at runtime on
+            `baseUrl is required and cannot be empty`.
+
+            §8 is binding on simplicity, and the rest of the file answers delivery
+            model, region, folder, logging target and system base URLs - a plain value
+            there is a confirmed fact, so state it rather than inventing one.
 
             The implementation-level calls are yours to make - argument names, file
             layout, where a try/catch sits. Record each non-obvious one in the build
