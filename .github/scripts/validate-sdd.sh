@@ -24,7 +24,10 @@ MIN_ROOT_BYTES="${MIN_SOLUTION_SDD_BYTES:-3000}"
 # -> jactiv-572 -> the resource prefix jactiv_572_. It is the only identifier stable
 # across the whole lifecycle: every stage has its own story key, so naming resources
 # off a story key means a change-request replay renames live Orchestrator resources.
-# The repository name is also the solution name, verbatim.
+# The SOLUTION name is no longer the repository name: it is
+# <process-base>-<epic-number>, decided by the Architecture stage and carried in
+# architecture.json as `solution_name`. It is resolved below, once the contract
+# has been read. See architectural-considerations.md §4 "Naming".
 REPO_NAME="${EPIC_REPO_NAME:-${GITHUB_REPOSITORY##*/}}"
 EPIC_KEY="${EPIC_KEY:-$(printf '%s' "$REPO_NAME" | grep -oiE '^[a-z]+-[0-9]+' || true)}"
 RESOURCE_PREFIX=""
@@ -285,6 +288,17 @@ if ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$ARCH_FILE" 2>/
 fi
 
 SCOPE=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('sdd_scope',''))" "$ARCH_FILE")
+# Fall back for a contract written before `solution_name` existed.
+SOLUTION_NAME=$(python3 - "$ARCH_FILE" <<'EOF_SOLNAME'
+import json, sys
+d = json.load(open(sys.argv[1]))
+n = d.get("solution_name")
+if not n:
+    base, epic = d.get("process_kebab") or "", d.get("epic_number") or ""
+    n = (base + "-" + epic) if base and epic else base
+print(n or "")
+EOF_SOLNAME
+)
 TASKS_FILE=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('tasks_file',''))" "$ARCH_FILE")
 # one "path<TAB>template<TAB>role<TAB>product" line per declared document. The product
 # comes from the project that owns the file, falling back to the primary - it is what
@@ -570,9 +584,10 @@ while IFS=$'\t' read -r SDD TEMPLATE ROLE PRODUCT; do
     fi
   fi
 
-  # The solution name is the repository name, verbatim - deployment packs under it.
-  if [ "$ROLE" = "solution-root" ] && [ -n "$REPO_NAME" ] && ! grep -qF "$REPO_NAME" "$SDD"; then
-    advise "$SDD is the solution root but never names the solution '$REPO_NAME' (= the repository name)."
+  # The solution name is architecture.json's `solution_name` - deployment packs the
+  # package under it AND names the Orchestrator sub-folder after it.
+  if [ "$ROLE" = "solution-root" ] && [ -n "$SOLUTION_NAME" ] && ! grep -qF "$SOLUTION_NAME" "$SDD"; then
+    advise "$SDD is the solution root but never names the solution '$SOLUTION_NAME' (architecture.json solution_name)."
   fi
 
   # --- the sections development actually needs ----------------------------

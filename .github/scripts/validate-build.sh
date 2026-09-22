@@ -187,6 +187,35 @@ for key, act in walk(doc):
                             f"chat.postMessage needs a member ID or channel ID (e.g. WLX9BD8FN). "
                             f"See architectural-considerations.md §4.")
 
+        # The message is Block Kit. §4 shows a SHORTENED one-line body next to the
+        # activity shape so the shape stays readable, and a build copied that and
+        # shipped an unformatted wall of prose to a live Slack channel. The real
+        # payload is §4's "The Slack message is Block Kit" object: channel + text +
+        # blocks together as the value of bodyParameters.body.
+        if "chat.postmessage" in (str(bp.get("path", "")) + str(bp.get("url", ""))).lower():
+            if '"blocks"' not in body and "blocks:" not in body and "'blocks'" not in body:
+                problems.append(
+                    f"{key}: the chat.postMessage body has no `blocks` - this renders as "
+                    f"unformatted prose in Slack. bodyParameters.body must be the whole "
+                    f"Block Kit payload (channel + text + blocks together) from "
+                    f"architectural-considerations.md §4 \"The Slack message is Block Kit, "
+                    f"and it goes in `body`\", not the shortened one-line form shown next "
+                    f"to the activity shape.")
+            else:
+                # `text` is also a key on every nested header/button element, so a
+                # naive substring search always finds one. The top-level fallback is
+                # the one that appears BEFORE `blocks` in the canonical payload
+                # (channel, text, blocks). Advisory, not fatal: the ordering is a
+                # convention, and a false failure here would block a good build over
+                # a push-notification string.
+                pre = body.split("blocks", 1)[0]
+                if not re.search(r"['\"]?text['\"]?\s*:", pre):
+                    print(f"::warning::{wf_path} {key}: the chat.postMessage body has "
+                          f"`blocks` but no top-level `text` ahead of them. With blocks "
+                          f"present, `text` is the push-notification fallback; without "
+                          f"it the notification reads \"This content can't be displayed\". "
+                          f"See architectural-considerations.md §4.")
+
 # ── activity names are resolved as exact strings, case included ─────────────
 # `$context.outputs.http_request_slack` against an activity named
 # HTTP_Request_Slack reads undefined: no build error, no validate error, a
