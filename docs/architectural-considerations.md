@@ -207,7 +207,7 @@ connection, verb and path — and the payload in `body`.
         "method": "POST",
         "path": "chat.postMessage",
         "url": "chat.postMessage",
-        "body": "${{ /* SHORTENED - ship the Block Kit payload below */ }}"
+        "body": "${{ channel: 'WLX9BD8FN', text: `...`, blocks: [ ... ] }}"
       }
     },
     "export": {
@@ -278,59 +278,67 @@ notification preview and screen-reader fallback. Send plain `text` alone and you
 a wall of prose with a raw URL in it; send `blocks` and you get a title, icon-led
 lines and a real button.
 
-The WHOLE payload below - `channel`, `text` and `blocks` together - is the value of
-`bodyParameters.body` on the Slack HTTP Request activity. Not a separate `blocks`
-field, not a nested object: one body.
+`bodyParameters.body` is a UiPath expression, NOT a JSON document. Its delimiters are
+`${` and `}`, and the thing you write between them is a JavaScript object literal, so
+the value always reads `${{ ... }}`: the OUTER brace of that pair belongs to `${ }` and
+the INNER one opens the object. **You write the object's key/value pairs directly. You
+do NOT add another `{ }` around them.**
 
-```json
-{
-  "channel": "WLX9BD8FN",
-  "text": ":receipt: ${invoiceCount} invoices from the last seven days have no purchase order linked",
-  "blocks": [
-    {
-      "type": "header",
-      "text": { "type": "plain_text", "text": ":receipt: ${invoiceCount} invoices need a purchase order", "emoji": true }
-    },
-    {
-      "type": "section",
-      "text": { "type": "mrkdwn", "text": ":warning:  *${invoiceCount} invoices* from the last seven days have no purchase order linked.\n:no_entry:  An invoice without a linked PO cannot be matched or paid under our *no-PO-no-pay policy*, and payment to the supplier stalls until it is fixed.\n:point_right:  Please make sure a purchase order exists for these invoices and is correctly linked to each one." }
-    },
-    {
-      "type": "actions",
-      "elements": [
-        {
-          "type": "button",
-          "text": { "type": "plain_text", "text": "Open the list in Coupa", "emoji": true },
-          "url": "${coupaUrl}",
-          "style": "primary"
-        }
-      ]
-    },
-    { "type": "divider" },
-    {
-      "type": "context",
-      "elements": [
-        { "type": "mrkdwn", "text": ":calendar: Invoices dated *${windowStart}* to *${windowEnd}*  ·  :robot_face: No-PO Invoice Chaser  ·  checked *${runDate}*" }
-      ]
-    }
-  ]
-}
 ```
+correct    "body": "${{ channel: 'WLX9BD8FN', text: `...`, blocks: [ ... ] }}"
+WRONG      "body": "${{ { channel: 'WLX9BD8FN', text: `...`, blocks: [ ... ] } }}"
+```
+
+That second form is a real failure from a real run, not a hypothetical. Pasting a JSON
+payload in whole adds its outer braces on top of the ones `${{` already supplies, the
+Studio Web expression editor reports `SyntaxError: Unexpected token '{'`, and the
+activity fails at run time after a clean build and a clean deployment.
+
+It is an expression, so it is JavaScript and not JSON: keys are unquoted, strings use
+single quotes or backticks (never `"`, which would have to be escaped inside the JSON
+file), and a value is interpolated with `${$context.variables.<name>}` inside a
+backtick string or written bare outside one.
+
+This is the whole `body` value, copy it and change only the variable names:
+
+```
+${{ channel: 'WLX9BD8FN', text: `:receipt: ${$context.variables.qualifyingCount} invoices from the last seven days have no purchase order linked`, blocks: [ { type: 'header', text: { type: 'plain_text', text: `:receipt: ${$context.variables.qualifyingCount} invoices need a purchase order`, emoji: true } }, { type: 'section', text: { type: 'mrkdwn', text: `:warning:  *${$context.variables.qualifyingCount} invoices* from the last seven days have no purchase order linked.\n:no_entry:  An invoice without a linked PO cannot be matched or paid under our *no-PO-no-pay policy*, and payment to the supplier stalls until it is fixed.\n:point_right:  Please make sure a purchase order exists for these invoices and is correctly linked to each one.` } }, { type: 'actions', elements: [ { type: 'button', text: { type: 'plain_text', text: 'Open the list in Coupa', emoji: true }, url: $context.variables.coupaUrl, style: 'primary' } ] }, { type: 'divider' }, { type: 'context', elements: [ { type: 'mrkdwn', text: `:calendar: Invoices dated *${$context.variables.windowStart}* to *${$context.variables.windowEnd}*  ·  :robot_face: No-PO Invoice Chaser  ·  checked *${$context.variables.runDate}*` } ] } ] }}
+```
+
+The braces INSIDE the payload - around each block, around each nested `text` - are
+ordinary object literals and are all required. Only the outermost pair is the one that
+must not be doubled.
 
 Five things about this that are not obvious and cost a rebuild each if you get them
 wrong:
 
 | Rule | Why |
 |---|---|
+| `${{ ... }}` already opens the object - never add another `{ }` | The outer brace is the `${ }` expression delimiter, the inner one is the object literal. A pasted JSON payload brings its own pair and you get `${{ { ... } }}`, which is `SyntaxError: Unexpected token '{'` at run time, after the build and the deploy have both gone green. |
 | The three body lines are ONE `section` separated by `\n` | One section per line looked right in the JSON and rendered with a large gap between every line. Slack puts a margin between blocks, not between lines. |
 | Top-level `text` is required | With `blocks` present it is the push-notification text. Omit it and the notification reads "This content can't be displayed". |
 | `url` on a button must be a real absolute URL | Block Kit validates it. A templated value that has not been substituted is rejected outright, so the failure is at send time, not at build time. |
 | `header` is `plain_text` only | No `mrkdwn`, no bold. Emoji work through `:name:` with `"emoji": true`. |
 | `channel` is the member ID | See the member-ID note above. An email is rejected by Slack. |
 
-Composition belongs in the script step that builds the message, not in the activity:
-compose the whole JSON string into a variable and reference it once. The count appears
-twice on purpose - the title is what shows in the Slack sidebar unopened.
+**Write the payload inline in `body`. Do NOT compose it in a script step.** An earlier
+version of this section said the opposite - "compose the whole JSON string into a
+variable and reference it once" - and a build followed it: it added a
+`Javascript_ComposeSlackPayload` script and an `Assign_SlackPayload`, then put a bare
+variable reference in `body`. The payload was correct, but `validate-build.sh` reads
+`body` and found no `blocks` there, failed the build, and a repair agent spent 197
+seconds putting the payload back where this section wanted it. Inline is the only
+approved shape, for three reasons:
+
+- `validate-build.sh` checks `bodyParameters.body`. A payload assembled somewhere else
+  is invisible to it, so the one gate that protects this message cannot see it.
+- Two extra activities exist only to move a string, and each is a place for the
+  case-sensitivity bug below to bite.
+- What you read in the activity is what Slack receives. Nothing to trace through.
+
+Interpolate the workflow's values with `${$context.variables.<name>}` directly inside
+the payload, exactly as the example above does. The count appears twice on purpose -
+the title is what shows in the Slack sidebar unopened.
 
 #### Activity names are CASE SENSITIVE, everywhere they appear
 
@@ -509,6 +517,48 @@ Rules:
 - **Connections are shared program infrastructure.** One per system, listed above,
   referenced by name and id — never recreated per project.
 
+### Before you say the build is finished — read your own `Workflow.json` against this
+
+Every line below is a defect that actually shipped on a real run of this programme and
+had to be fixed by hand or by a repair pass. `uip api-workflow validate` passes all of
+them: it checks structure, not any of this. Walk the list against the file you just
+wrote, activity by activity, before you write the build notes. It takes under a minute
+and it is the difference between a demo that runs and one that does not.
+
+**Every HTTP Request activity**
+
+- [ ] `bodyParameters.url` is filled in, and is the resource path RELATIVE to the
+      connector's base URL — `invoices`, not `https://…/api/invoices`, and no leading
+      slash. A shipped build left it empty and the call had nowhere to go.
+- [ ] `bodyParameters.path` is present and identical to `url`.
+- [ ] `bodyParameters.authentication` is `"connector"`, `targetConnector` names the
+      vendor connector, and `connectionId` is a real id from §4's table — never
+      `ImplicitConnection`, which fails at run time on `baseUrl is required`.
+
+**The Slack call**
+
+- [ ] `channel` is a member ID (`WLX9BD8FN`), never an email address.
+- [ ] `body` contains the Block Kit payload INLINE — `channel`, `text` and `blocks`
+      together. Not composed in a script step, not referenced through a variable.
+- [ ] `body` has a top-level `text` as well as `blocks`.
+- [ ] `body` reads `${{ channel: … }}`, NOT `${{ { channel: … } }}`. The doubled brace
+      is a run-time SyntaxError that build, validate and deploy all pass.
+
+**Names**
+
+- [ ] Every `$context.outputs.<Name>` matches its activity key character for
+      character, INCLUDING case. `http_request` against an activity named
+      `HTTP_Request` reads as undefined, silently, at run time.
+- [ ] The solution is named `solution_name` from the architecture contract, the project
+      is `projects[0].name`, and `project.uiproj`'s `"Name"` matches the directory.
+
+**Then actually run the gate.** `bash .github/scripts/validate-build.sh <code dir>
+docs/architectural-considerations.md` is the same script the Test stage runs. Running it
+yourself, here, while the file is still open and you still have the context, costs
+seconds. Letting it fail in the Test stage costs a fresh agent three minutes, most of it
+spent working out where the files are — and a repair written without this context is how
+the doubled brace got introduced in the first place.
+
 ---
 
 ## 5. Runtime and environment
@@ -604,9 +654,29 @@ expected shape is roughly:
 read from source  →  filter/decide  →  format  →  act on destination  →  respond
 ```
 
-Five to eight activities. If the design exceeds **twelve** activities, or introduces a
-second loop, the SDD must say in *Decisions Made* which PDD statement forced it. "Good
-practice", "robustness" and "production-grade" are not PDD statements.
+Five to eight *steps*. But an API Workflow spends more than one activity per step, so
+count activities against **twenty**, not twelve.
+
+The twelve was a guess made before a workflow of this shape had been built, and a real
+build came in at nineteen with nothing wrong with it. Where the extra ones go:
+
+| | |
+|---|---|
+| `Sequence`, `WorkflowStart`, `Response` | three structural activities every workflow has |
+| one `Assign` per value a script returns | a `JsInvoke` returning three fields is followed by three `Assign` steps that alias `$context.outputs.<Script>.<field>` to `$context.variables.<field>` |
+
+The aliasing `Assign` steps are **deliberate, and they stay**. They look like padding
+and they are not: they concentrate every case-sensitive `$context.outputs.<ActivityName>`
+reference into one place per script, so the rest of the workflow uses a short, stable
+`$context.variables.<name>`. Removing them would mean spelling the activity name
+correctly at every use instead of once - and a mis-cased reference reads as `undefined`
+at run time with no build error and no validation error. That trade is not worth two
+fewer rows in a count.
+
+So: twenty is the number, and it is a *reporting* threshold, not a build failure. Above
+it, check that a retry loop, a per-call try/catch or a third outcome has not crept in,
+and that the SDD names the PDD statement that forced whatever did. "Good practice",
+"robustness" and "production-grade" are not PDD statements.
 
 ### What this does not mean
 
