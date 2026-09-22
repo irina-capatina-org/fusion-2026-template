@@ -67,6 +67,25 @@ unavailable: recommend the documented alternative instead and record the block i
 
 ---
 
+## 2.5 The shape every delivery takes
+
+A UiPath **Solution** containing exactly **one API Workflow project**.
+
+This is a decision, not an outcome to be re-derived per request. The use cases in this
+programme are deliberately simple, and a design that quietly splits into two or three
+projects produces a shape nobody rehearsed and a deployment nobody tested.
+
+| Term | What it means here |
+|---|---|
+| `sdd_scope: single-product` | ONE project, inside the solution. **Never** "no solution". |
+| `sdd_scope: solution` | two or more independently deployed projects. Not used here. |
+| the delivery | always a solution: `uip solution pack` -> `publish` -> `deploy run` |
+
+Reading `single-product` as "no solution wrapper" is what made a deploy step look for
+`.nupkg` files that a solution build never produces, and then skip the deploy entirely
+while the run stayed green. If a process genuinely needs a second project, that is an
+`[ARCHITECT REVIEW]` item - not a decision to take mid-run.
+
 ## 3. Preferred project types, and when
 
 House defaults for product selection. They narrow the choice; they do not override the
@@ -136,7 +155,8 @@ Everything here is fixed except the five marked lines. Copy it, change those, do
         "targetConnector": "uipath-coupa-coupa",
         "connection": "5fadfc73-a372-46ae-a27c-2481741eed07",
         "method": "GET",
-        "url": "https://uipath-test.coupahost.com/api/invoices",
+        "path": "invoices",
+        "url": "invoices",
         "query": {
           "status[in]": "draft,new",
           "invoice-date[gt_or_eq]": "${$context.variables.windowStart}",
@@ -148,7 +168,7 @@ Everything here is fixed except the five marked lines. Copy it, change those, do
       }
     },
     "export": {
-      "as": "{ ...$context, outputs: { ...$context?.outputs, \"http_request_1\": $output } }"
+      "as": "{ ...$context, outputs: { ...$context?.outputs, \"HTTP_Request_1\": $output } }"
     },
     "metadata": {
       "activityType": "Connector",
@@ -161,7 +181,7 @@ Everything here is fixed except the five marked lines. Copy it, change those, do
 ```
 
 The Slack call is the same activity with four lines different — target connector,
-connection, verb and URL — and the payload in `body`:
+connection, verb and path — and the payload in `body`:
 
 ```json
 {
@@ -178,12 +198,13 @@ connection, verb and URL — and the payload in `body`:
         "targetConnector": "uipath-salesforce-slack",
         "connection": "43d506f7-7de2-4798-aac1-9522e2e45dbb",
         "method": "POST",
-        "url": "https://slack.com/api/chat.postMessage",
-        "body": "${{ channel: $workflow.input.slackChannel, text: $context.variables.message }}"
+        "path": "chat.postMessage",
+        "url": "chat.postMessage",
+        "body": "${{ channel: 'WLX9BD8FN', text: $context.variables.message }}"
       }
     },
     "export": {
-      "as": "{ ...$context, outputs: { ...$context?.outputs, \"http_request_2\": $output } }"
+      "as": "{ ...$context, outputs: { ...$context?.outputs, \"HTTP_Request_2\": $output } }"
     },
     "metadata": {
       "activityType": "Connector",
@@ -203,16 +224,122 @@ call you are actually making — `GET` for Coupa, `POST` for Slack.
 |---|---|
 | `call`, `connector`, `method: "POST"`, `endpoint: "/http-request"` | **fixed** — this is the HTTP connector's own operation, never the target's |
 | `uiPathActivityTypeId`, `metadata.configuration` | **fixed** — byte for byte, for every HTTP Request activity |
-| `HTTP_Request_1` and the `http_request_1` export key | yours — unique per activity, export key is the activity key lowercased |
+| `HTTP_Request_1` and its export key | yours — unique per activity. The export key is the activity key **character for character, same case**. Never lowercase it. |
 | `connectionId` / `connectionResourceId` / `bodyParameters.connection` | yours — the **same** connection id in all three, from the table below |
 | `bodyParameters.targetConnector` | yours — the connector key of the system being called |
-| `bodyParameters.method` + `url` | yours — the real verb and URL of the call you are making |
+| `bodyParameters.method` + `path` + `url` | yours — the real verb, and the resource path **relative to the connector's base URL**. Not an absolute URL. |
 
-`bodyParameters` accepts: `authentication`, `targetConnector`, `connection`, `method`
-and `url` (all required), plus `path`, `headers`, `query` and `body` (optional). They
-are flat keys taking **bare literals** — `"url": "https://…"`, never `"${'https://…'}"`,
+`bodyParameters` accepts: `authentication`, `targetConnector`, `connection`, `method`,
+`path` and `url` (all required), plus `headers`, `query` and `body` (optional). They
+are flat keys taking **bare literals** — `"url": "invoices"`, never `"${'invoices'}"`,
 which clears the field when Studio Web saves. A real reference stays wrapped:
 `"body": "${$context.variables.payload}"`.
+
+#### The URL is RELATIVE, and `path` and `url` must both carry it
+
+This is the single most expensive mistake in this file's history. `targetConnector`
+already identifies the system, and the Integration Service connection already knows its
+base URL — so the activity supplies only the resource path after it, in **both** `path`
+and `url`, with the same value and no leading slash:
+
+| Call | `path` and `url` | NOT |
+|---|---|---|
+| Coupa list invoices | `invoices` | `https://uipath-test.coupahost.com/api/invoices` |
+| Slack post message | `chat.postMessage` | `https://slack.com/api/chat.postMessage` |
+
+Write an absolute URL and the request URL arrives **empty** in Studio Web - the field
+looks unfilled, the workflow validates and packs clean, and it fails at run time. A
+built solution had to be opened and fixed by hand for exactly this.
+
+#### Slack `chat.postMessage` needs a member ID, not an email
+
+The `channel` field takes a Slack **member ID** or **channel ID**. An email address is
+rejected by the Slack API even though it looks right in the document and in the PDD.
+
+| Recipient | `channel` value |
+|---|---|
+| Irina Capatina (irina.capatina@uipath.com) | `WLX9BD8FN` |
+
+If a design names a Slack recipient by email and no member ID is recorded here, that is
+an `[ARCHITECT REVIEW]` item - do not pass the email through as `channel`, and do not
+invent an ID.
+
+#### The Slack message is Block Kit, and it goes in `body`
+
+`chat.postMessage` renders `blocks` and uses the top-level `text` only as the
+notification preview and screen-reader fallback. Send plain `text` alone and you get
+a wall of prose with a raw URL in it; send `blocks` and you get a title, icon-led
+lines and a real button.
+
+The WHOLE payload below - `channel`, `text` and `blocks` together - is the value of
+`bodyParameters.body` on the Slack HTTP Request activity. Not a separate `blocks`
+field, not a nested object: one body.
+
+```json
+{
+  "channel": "WLX9BD8FN",
+  "text": ":receipt: ${invoiceCount} invoices from the last seven days have no purchase order linked",
+  "blocks": [
+    {
+      "type": "header",
+      "text": { "type": "plain_text", "text": ":receipt: ${invoiceCount} invoices need a purchase order", "emoji": true }
+    },
+    {
+      "type": "section",
+      "text": { "type": "mrkdwn", "text": ":warning:  *${invoiceCount} invoices* from the last seven days have no purchase order linked.\n:no_entry:  An invoice without a linked PO cannot be matched or paid under our *no-PO-no-pay policy*, and payment to the supplier stalls until it is fixed.\n:point_right:  Please make sure a purchase order exists for these invoices and is correctly linked to each one." }
+    },
+    {
+      "type": "actions",
+      "elements": [
+        {
+          "type": "button",
+          "text": { "type": "plain_text", "text": "Open the list in Coupa", "emoji": true },
+          "url": "${coupaUrl}",
+          "style": "primary"
+        }
+      ]
+    },
+    { "type": "divider" },
+    {
+      "type": "context",
+      "elements": [
+        { "type": "mrkdwn", "text": ":calendar: Invoices dated *${windowStart}* to *${windowEnd}*  ·  :robot_face: No-PO Invoice Chaser  ·  checked *${runDate}*" }
+      ]
+    }
+  ]
+}
+```
+
+Five things about this that are not obvious and cost a rebuild each if you get them
+wrong:
+
+| Rule | Why |
+|---|---|
+| The three body lines are ONE `section` separated by `\n` | One section per line looked right in the JSON and rendered with a large gap between every line. Slack puts a margin between blocks, not between lines. |
+| Top-level `text` is required | With `blocks` present it is the push-notification text. Omit it and the notification reads "This content can't be displayed". |
+| `url` on a button must be a real absolute URL | Block Kit validates it. A templated value that has not been substituted is rejected outright, so the failure is at send time, not at build time. |
+| `header` is `plain_text` only | No `mrkdwn`, no bold. Emoji work through `:name:` with `"emoji": true`. |
+| `channel` is the member ID | See the member-ID note above. An email is rejected by Slack. |
+
+Composition belongs in the script step that builds the message, not in the activity:
+compose the whole JSON string into a variable and reference it once. The count appears
+twice on purpose - the title is what shows in the Slack sidebar unopened.
+
+#### Activity names are CASE SENSITIVE, everywhere they appear
+
+An API Workflow resolves `$context.outputs.<Name>` as an exact string. Three places
+must agree character for character, including case:
+
+1. the activity's key in the `do` tree — `HTTP_Request_Slack`
+2. the string inside its `export.as` — `"HTTP_Request_Slack": $output`
+3. every later reference — `$context.outputs.HTTP_Request_Slack`
+
+`http_request_slack` is a different, non-existent output. It does not error at build or
+validate time: the script step simply reads `undefined` and the workflow fails at run
+time on a confusing message. A built solution needed this fixed by hand.
+
+Pick one spelling per activity and reuse it by copy-paste. Never re-type an activity
+name, and never "normalise" the case of one.
 
 **Reading the response.** The activity outputs
 `{ statusCode, statusText, headers, ok, request, content, vendorProcessingTimeMs }`.
