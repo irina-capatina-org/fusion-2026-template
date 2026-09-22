@@ -22,7 +22,12 @@ CONSIDERATIONS="${2:-docs/architectural-considerations.md}"
 
 # §8's sizing expectation. Over this is reported, never fatal — see the note at
 # the size check for why.
-ACTIVITY_BUDGET="${MAX_WORKFLOW_ACTIVITIES:-12}"
+# Twenty, not twelve. Twelve predated any real build of this shape; a correct one
+# came in at nineteen. An API Workflow carries three structural activities (Sequence,
+# WorkflowStart, Response) plus one aliasing Assign per value each script returns -
+# see §8 "Sizing expectation", which explains why those Assigns are deliberate.
+# Reported, never fatal.
+ACTIVITY_BUDGET="${MAX_WORKFLOW_ACTIVITIES:-20}"
 
 FATAL=0
 WARNED=0
@@ -181,6 +186,21 @@ for key, act in walk(doc):
     # the build, and rejected by Slack at run time.
     if "slack" in target.lower():
         body = json.dumps(bp.get("body", ""))
+
+        # `${{ ... }}` is the expression delimiter `${ }` plus the object literal's
+        # own brace. Pasting a JSON payload in whole brings a SECOND pair, giving
+        # `${{ { ... } }}` - a SyntaxError the expression editor reports as
+        # "Unexpected token '{'". Build and deploy both pass; the activity fails at
+        # run time. Checked on the RAW value, before json.dumps escapes anything.
+        raw_body = bp.get("body", "")
+        if isinstance(raw_body, str) and re.match(r'^\s*\$\{\{\s*\{', raw_body):
+            problems.append(
+                f"{key}: bodyParameters.body starts `${{{{ {{` - the object literal is "
+                f"wrapped in a second pair of braces. `${{{{` already opens the object, "
+                f"so write the key/value pairs directly: "
+                f"`${{{{ channel: '...', text: `...`, blocks: [ ... ] }}}}`. "
+                f"See architectural-considerations.md §4, \"The Slack message is Block Kit\".")
+
         m = re.search(r"channel\s*:\s*['\"]?([^'\",}\s]+)", body)
         if m and "@" in m.group(1):
             problems.append(f"{key}: Slack channel is {m.group(1)!r}, an email address. "

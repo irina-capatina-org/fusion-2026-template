@@ -88,11 +88,14 @@ REQUIRED_SECTIONS=(
   "9. Business Exceptions"
   "10. System Errors"
   "11. Data Definitions"
-  "12. Environment and Constraint Signals"
-  "13. Canonical Test Data"
-  "14. Decomposition Signals"
-  "15. Assumptions, Dependencies and Open Questions"
-  "16. Success Criteria"
+  # Sections 12-14 of the old contract - Environment and Constraint Signals,
+  # Canonical Test Data, Decomposition Signals - were dropped. They existed to feed
+  # the architecture decision's Constraint Gate and Level 2.5 decomposition call,
+  # and that decision is now derived deterministically in uipath-sdd.yml from the
+  # pins and architectural-considerations.md. Nothing downstream read them, and
+  # generating them cost ~29 seconds of write time per run.
+  "12. Assumptions, Dependencies and Open Questions"
+  "13. Success Criteria"
 )
 
 echo "Validating $PDD_FILE"
