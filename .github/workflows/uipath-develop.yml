@@ -91,6 +91,8 @@ jobs:
       scope:      ${{ steps.resolve.outputs.scope }}
       skills:     ${{ steps.resolve.outputs.skills }}
       project_count: ${{ steps.resolve.outputs.project_count }}
+      solution_name: ${{ steps.resolve.outputs.solution_name }}
+      project_name:  ${{ steps.resolve.outputs.project_name }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -175,6 +177,30 @@ jobs:
           print(' '.join(seen))")
           PROJECT_COUNT=$(python3 -c "import json;print(len(json.load(open('$ARCH_FILE'))['projects']))")
 
+          # The solution name and the API Workflow project name are decided once, by
+          # the Architecture stage, and carried in the contract - see
+          # architectural-considerations.md §4 "Naming". Deriving them again here is how
+          # they drift: deploy used to name the deployment after `process_name` while
+          # this stage enforced the repository name, so the packed solution and the
+          # deployment never agreed. Older contracts predate the fields, so fall back.
+          SOLUTION_NAME=$(python3 -c "
+          import json,re
+          d=json.load(open('$ARCH_FILE'))
+          n=d.get('solution_name')
+          if not n:
+              base=d.get('process_kebab') or ''
+              epic=d.get('epic_number') or ''
+              n=(base+'-'+epic) if base and epic else (base or '${GITHUB_REPOSITORY##*/}')
+          print(n)")
+          PROJECT_NAME=$(python3 -c "
+          import json
+          d=json.load(open('$ARCH_FILE'))
+          ps=sorted(d['projects'], key=lambda x: x.get('build_order',99))
+          print(ps[0]['name'] if ps else '')")
+          [ -n "$SOLUTION_NAME" ] || { echo "::error::$ARCH_FILE yields no solution name."; exit 1; }
+          [ -n "$PROJECT_NAME" ]  || { echo "::error::$ARCH_FILE declares no project."; exit 1; }
+          echo "Solution: $SOLUTION_NAME   first project: $PROJECT_NAME"
+
           # ── the Planner Handoff gate ───────────────────────────────────────────
           # A draft SDD, or one the planner cannot even detect, must not reach a build.
           MISSING=""
@@ -212,6 +238,8 @@ jobs:
             echo "scope=$SCOPE"
             echo "skills=$SKILLS"
             echo "project_count=$PROJECT_COUNT"
+            echo "solution_name=$SOLUTION_NAME"
+            echo "project_name=$PROJECT_NAME"
           } >> "$GITHUB_OUTPUT"
 
           {
@@ -469,6 +497,29 @@ jobs:
             activity, and the whole workflow failed at runtime on
             `baseUrl is required and cannot be empty`.
 
+            **The Slack message is Block Kit, and the whole payload goes in
+            `bodyParameters.body`.** §4's HTTP Request example shows a shortened
+            one-line `body` so the ACTIVITY shape stays readable - that shortened line
+            is not the payload. The payload is the full JSON object under §4's *"The
+            Slack message is Block Kit, and it goes in `body`"*, with `channel`, `text`
+            and `blocks` together as one value, and the `${...}` placeholders in it
+            replaced by your workflow's actual values. Read that subsection to the end,
+            including its table of non-obvious rules, before you write the Slack
+            activity:
+
+            - `channel` is the member id from §4's table, never an email address
+            - top-level `text` must be present - with `blocks` it is the push
+              notification, and omitting it renders "This content can't be displayed"
+            - the three body lines are ONE `section` separated by `\n`, not three
+              sections; Slack puts a margin between blocks, not between lines
+            - the button `url` must resolve to a real absolute URL at send time - Block
+              Kit rejects an unsubstituted placeholder outright
+            - `header` is `plain_text` only; emoji via `:name:` with `"emoji": true`
+
+            A real run has already shipped the shortened form and produced an
+            unformatted wall of prose in Slack. `validate-build.sh` now fails the build
+            when a Slack `chat.postMessage` body carries no `blocks`.
+
             §8 is binding on simplicity, and the rest of the file answers delivery
             model, region, folder, logging target and system base URLs - a plain value
             there is a confirmed fact, so state it rather than inventing one.
@@ -546,17 +597,34 @@ jobs:
             1. Probe the surface: `uip solution init --help --output json`. `Success`
                means the verb is `init`; `unknown command` means this CLI still calls it
                `new`. Never invent a verb.
-            2. Create the solution with its name EXACTLY the repository name -
-               `${{ github.event.repository.name }}`. Deployment packs and publishes
-               under that name; a different one orphans the package.
-            3. Register EVERY project you built, one `uip solution projects add` call
-               per project directory. Coded-app directories are the one exception - they
-               are never part of a `.uipx`.
+            2. Create the solution with its name EXACTLY
+               `${{ needs.identify.outputs.solution_name }}`. That string is decided by
+               the Architecture stage and carried in the contract; it is
+               `<process-base>-<epic-number>`, NOT the repository name and NOT the
+               process name. Deployment publishes the package under it AND names the
+               Orchestrator sub-folder after it, so a different one here orphans the
+               package and collides with the previous epic's folder. The step after you
+               fails the build if the packed `.uipx` is named anything else.
+            3. Register the project with `uip solution projects add`. There is exactly
+               ONE API Workflow project and its name is
+               `${{ needs.identify.outputs.project_name }}` - the contract's
+               `projects[0].name`. That one string has to appear in THREE places or the
+               build is rejected:
+                 * the project DIRECTORY name
+                 * `project.uiproj`'s `"Name"` field - this is the one Orchestrator
+                   displays, and getting it wrong is how a solution ended up reading
+                   one name in git and a different one in the tenant
+                 * consequently `resources/solution_folder/process/api/<name>.json`
+               If you rename a project after registering it, use
+               `uip solution projects remove <old>` then `add` - deleting the directory
+               by hand leaves a stale process resource that deploys as a phantom second
+               process, and the step after you fails the build for it.
+               Coded-app directories are the one exception - they are never in a `.uipx`.
             4. Do NOT run `uip solution resources refresh` and do NOT run `uip login`.
                Refresh reads live cloud state and this runner has no credentials; the
                deploy stage does it where they exist.
             5. Prove it before you write the build notes:
-               `uip solution pack . /tmp/buildcheck --name ${{ github.event.repository.name }} --version 0.0.1 --output json`
+               `uip solution pack . /tmp/buildcheck --name ${{ needs.identify.outputs.solution_name }} --version 0.0.1 --output json`
                must succeed. If it fails, fix the solution here - do not hand a broken
                one to the Test stage.
 
@@ -605,23 +673,71 @@ jobs:
           # but that path is barely exercised, and with no .uipx the Test stage's
           # `uip solution pack` gate has nothing to iterate over and passes silently -
           # a build reaching review with deploy readiness unproven. Fail here instead.
-          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          WANT_SOLUTION="${{ needs.identify.outputs.solution_name }}"
           SOLUTION_DIR=$(find "$CODE_DIR" -maxdepth 3 -type f -name '*.uipx' \
                            -not -path "*/dist/*" -not -path "*/obj/*" \
                            -exec dirname {} \; | sort -u | head -1)
           if [ -z "$SOLUTION_DIR" ]; then
             echo "::error::No .uipx under $CODE_DIR/ - every build ships as a solution."
-            echo "::error::Create it with 'uip solution init $REPO_NAME' and register each project with 'uip solution projects add'."
+            echo "::error::Create it with 'uip solution init $WANT_SOLUTION' and register each project with 'uip solution projects add'."
             find "$CODE_DIR" -type f | head -40
             exit 1
           fi
-          # The solution name is the repository name, verbatim - deploy packs under it.
-          SOLUTION_NAME=$(basename "$(find "$SOLUTION_DIR" -maxdepth 1 -name '*.uipx' | head -1)" .uipx)
-          if [ "$SOLUTION_NAME" != "$REPO_NAME" ]; then
-            echo "::error::Solution is named '$SOLUTION_NAME' but must be '$REPO_NAME' (the repository name) - deploy publishes under that name."
+          # The solution name is the contract's `solution_name` - <process-base>-<epic
+          # number>. Deploy publishes the package under it and names the Orchestrator
+          # sub-folder after it, so the two must be the same string or the deployment
+          # lands beside its package instead of on it.
+          GOT_SOLUTION=$(basename "$(find "$SOLUTION_DIR" -maxdepth 1 -name '*.uipx' | head -1)" .uipx)
+          if [ "$GOT_SOLUTION" != "$WANT_SOLUTION" ]; then
+            echo "::error::Solution is named '$GOT_SOLUTION' but must be '$WANT_SOLUTION' (architecture.json solution_name) - deploy publishes and creates its Orchestrator folder under that name."
             exit 1
           fi
-          echo "Solution: $SOLUTION_DIR ($SOLUTION_NAME.uipx)"
+          echo "Solution: $SOLUTION_DIR ($GOT_SOLUTION.uipx)"
+
+          # ── the API Workflow project: one of them, named the contract's name ────
+          # Orchestrator shows the project under `project.uiproj`'s "Name", NOT under
+          # the directory name and NOT under the solution name. A build that got this
+          # wrong shipped a solution that read `jactiv-707-no-po-invoice-chaser` in git
+          # and `NoPoInvoiceChaser` in Orchestrator - the two swapped relative to each
+          # other, which is impossible to talk through on stage. Gate all three so the
+          # repository and the tenant always read the same.
+          WANT_PROJECT="${{ needs.identify.outputs.project_name }}"
+          PROJ_DIRS=$(find "$SOLUTION_DIR" -mindepth 2 -maxdepth 2 -name 'project.uiproj' \
+                        -not -path "*/dist/*" -not -path "*/obj/*" \
+                        -exec dirname {} \; | sort)
+          PROJ_COUNT=$(printf '%s\n' "$PROJ_DIRS" | grep -c . || true)
+
+          if [ "${{ needs.identify.outputs.scope }}" = "single-product" ] && [ "$PROJ_COUNT" -ne 1 ]; then
+            echo "::error::The solution holds $PROJ_COUNT API Workflow project(s); single-product scope means exactly ONE."
+            echo "::error::Fold the extra work into the one project - a second HTTP call is another activity, not another project."
+            printf '%s\n' "$PROJ_DIRS" | sed 's/^/  - /'
+            exit 1
+          fi
+
+          if [ -n "$WANT_PROJECT" ] && [ "$PROJ_COUNT" -eq 1 ]; then
+            PROJ_DIR=$(printf '%s\n' "$PROJ_DIRS" | head -1)
+            GOT_DIR=$(basename "$PROJ_DIR")
+            GOT_NAME=$(python3 -c "import json;print(json.load(open('$PROJ_DIR/project.uiproj')).get('Name') or '')")
+            if [ "$GOT_DIR" != "$WANT_PROJECT" ]; then
+              echo "::error::The project directory is '$GOT_DIR' but must be '$WANT_PROJECT' (architecture.json projects[0].name)."
+              exit 1
+            fi
+            if [ "$GOT_NAME" != "$WANT_PROJECT" ]; then
+              echo "::error::$PROJ_DIR/project.uiproj has \"Name\": '$GOT_NAME' but must be '$WANT_PROJECT' - that field is what Orchestrator displays, so git and the tenant would disagree."
+              exit 1
+            fi
+            # The solution's process resource is written from the project name, so a
+            # stale one left behind by a rename ships a second, phantom process.
+            STALE=$(find "$SOLUTION_DIR/resources/solution_folder/process" -name '*.json' 2>/dev/null \
+                      -not -name "$WANT_PROJECT.json" | sort)
+            if [ -n "$STALE" ]; then
+              echo "::error::Stale process resource(s) under resources/solution_folder/process - a rename left them behind and they deploy as extra processes:"
+              printf '%s\n' "$STALE" | sed 's/^/  - /'
+              echo "::error::Remove them with 'uip solution projects remove <old-name>' rather than deleting the files by hand."
+              exit 1
+            fi
+            echo "Project: $PROJ_DIR (uiproj Name '$GOT_NAME')"
+          fi
 
           BLOCKED=$(grep -ci 'blocked' "$CODE_DIR/build-notes.md" || true)
           {

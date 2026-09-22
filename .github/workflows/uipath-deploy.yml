@@ -191,7 +191,27 @@ jobs:
 
           SCOPE=$(python3   -c "import json;print(json.load(open('$ARCH_FILE'))['sdd_scope'])")
           PRODUCT=$(python3 -c "import json;print(json.load(open('$ARCH_FILE'))['primary_product'])")
-          NAME=$(python3    -c "import json;print(json.load(open('$ARCH_FILE'))['process_name'])")
+          # The solution package, the deployment and the Orchestrator sub-folder all
+          # take architecture.json's `solution_name` - <process-base>-<epic-number>,
+          # see architectural-considerations.md §4 "Naming". This used to read
+          # `process_name` (PascalCase, no epic number) while uipath-develop packed
+          # under the repository name, so the published package and the deployment
+          # disagreed; and because the name carried no epic number, a second lifecycle
+          # of the same process hit a folder `deploy run` refuses to recreate and had
+          # to be upgraded by hand. Older contracts predate the field, so fall back.
+          NAME=$(python3 -c "
+          import json
+          d=json.load(open('$ARCH_FILE'))
+          n=d.get('solution_name')
+          if not n:
+              base=d.get('process_kebab') or ''
+              epic=d.get('epic_number') or ''
+              n=(base+'-'+epic) if base and epic else (base or d.get('process_name',''))
+          print(n)")
+          if [ -z "$NAME" ]; then
+            echo "::error::$ARCH_FILE yields no solution name - it has neither solution_name nor process_kebab."
+            exit 1
+          fi
           VERSION="1.0.${{ github.run_number }}"
 
           FOLDER_PATH="${{ inputs.folder_path }}"

@@ -585,10 +585,11 @@ jobs:
           name: pdd-corpus
           path: ${{ env.WORK_DIR }}
 
-      # Best effort. When it lands, the agent gets the real uipath-planner
-      # Constraint Gate / Level 1 / 1.75 / 2.5 logic and the seven SDD templates.
-      # When it does not, the rules inlined in the prompts below carry the run -
-      # they are the same contract, restated.
+      # Best effort, and only the SDD agent needs it now: what it wants from
+      # uipath-planner is the seven SDD templates. The product-selection levels
+      # the skill also carries are no longer exercised here - the architecture
+      # is derived deterministically in the next step. When the install fails,
+      # the section contracts inlined in the prompt below carry the run.
       - name: Install UiPath skills
         id: skills
         continue-on-error: true
@@ -609,331 +610,343 @@ jobs:
             || { echo "::warning::uipath-planner not among the installed skills"; exit 1; }
           echo "planner=true" >> "$GITHUB_OUTPUT"
 
-      - name: Run uipath-architect agent
-        uses: anthropics/claude-code-base-action@beta
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: ${{ env.AGENT_MODEL }}
-          timeout_minutes: '25'
-          allowed_tools: "Read,Write,Edit,Glob,Grep,Bash,Skill"
-          prompt: |
-            You are uipath-architect, a UiPath solution architect. You read the approved
-            PDD(s) for a process and decide the architecture - which UiPath products,
-            how many projects, how they relate. You do NOT write the SDD in this step and
-            you do NOT write any automation code.
+      # ── 3. Derive the architecture ──────────────────────────────────────
+      # This used to be a second agent call, and dropping it is a reliability
+      # improvement before it is a two-minute saving. With FORCED_PRODUCT and
+      # FORCED_SCOPE pinned there was exactly one field in architecture.json
+      # the agent could not have been handed outright (`need_profile`); the
+      # rest was it retyping values from the first lines of its own prompt,
+      # and then a gate below checking it had retyped them correctly. A step
+      # that cannot disagree with the pin cannot fail the gate that enforces
+      # the pin.
+      #
+      # Every value comes from one of four sources, each already guaranteed by
+      # an earlier job or by a validator:
+      #   * the pins in `env` - primary_product and sdd_scope
+      #   * the identify job's outputs - story key, branch, revision, SDD path
+      #   * the repository name, which IS the org's naming rule; see
+      #     architectural-considerations.md "Naming - derived from the
+      #     repository, never from the process name"
+      #   * validator-stable markdown tables: the considerations file's §1
+      #     Delivery model, §2 Licensed products and §4 connection list, and
+      #     the PDD's §3 Process Overview and §15 open questions, all of which
+      #     validate-pdd.sh already requires to exist
+      #
+      # A parse miss on any of those is a ::warning:: and a safe default, never
+      # a hard stop - the run must not die on prose. The one hard stop is a
+      # cleared pin, because then the architecture is genuinely undecided and
+      # this step is the wrong tool: restore the uipath-architect agent from
+      # git history instead.
+      #
+      # What is deliberately NOT derived: Level 0 suitability is recorded as
+      # `proceed` rather than re-litigated. A PDD that reached this stage was
+      # approved, and that approval is the decision to automate.
+      - name: Derive architecture
+        id: derive
+        env:
+          STORY_KEY:   ${{ needs.identify.outputs.story_key }}
+          ARCH_BRANCH: ${{ needs.identify.outputs.branch }}
+          REVISION:    ${{ needs.identify.outputs.revision }}
+          SDD_FILE:    ${{ needs.identify.outputs.sdd_file }}
+          REPO_NAME:   ${{ github.event.repository.name }}
+          STEER:       ${{ inputs.product_steer }}
+          DELIVERY_IN: ${{ inputs.delivery_model }}
+        run: |
+          set -euo pipefail
+          # github.event.repository.name is empty on some event payloads;
+          # GITHUB_REPOSITORY always carries owner/name.
+          export REPO_NAME="${REPO_NAME:-${GITHUB_REPOSITORY##*/}}"
+          python3 - <<'EOF_DERIVE'
+          import json, os, re, sys
 
-            PDD corpus:      ${{ env.WORK_DIR }}/manifest.json  (read this first)
-            Current PDD:     the manifest entry with "role": "current"
-            Prior SDD(s):    ${{ env.WORK_DIR }}/prior/  (empty on a first design)
-            Human steer:     the manifest "steer_markdown" (empty when none)
-            Org platform:    the manifest "considerations_markdown" (empty when none)
-            Story key:       ${{ needs.identify.outputs.story_key }}
-            Branch:          ${{ needs.identify.outputs.branch }}
-            Revision:        ${{ needs.identify.outputs.revision }}
-            OUTPUT (only file you write): ${{ env.WORK_DIR }}/architecture.json
+          # Deterministic architecture derivation. Replaces an agent call that, with the
+          # product and scope pinned, had nothing left to decide. Every value below comes
+          # from the pins, the identify job, the repository name, or a validator-stable
+          # table in the PDD / considerations file. Nothing here can disagree with the
+          # gate that runs next, which is the point.
 
-            MANDATED SDD PATH: ${{ needs.identify.outputs.sdd_file }}
-            SDD PATH PREFIX:   ${{ needs.identify.outputs.sdd_prefix }}
-            You do NOT get to name these files. See Step 3.
+          def warn(m):
+              print("::warning::derive-architecture: " + m)
 
-            Dispatch steer:  ${{ inputs.product_steer }}
-            Delivery model:  ${{ inputs.delivery_model }}
-            PINNED product:  ${{ env.FORCED_PRODUCT }}   (empty = you decide)
-            PINNED scope:    ${{ env.FORCED_SCOPE }}     (empty = you decide)
+          def read(p):
+              try:
+                  return open(p, encoding="utf-8").read()
+              except Exception:
+                  return ""
 
-            When scope is pinned to `single-product` it means: ONE project, and that
-            project is an API Workflow, inside a UiPath Solution. It does NOT mean
-            "no solution" - the build always produces a solution and deployment always
-            ships one. Do not split the work across two or three projects to be
-            thorough; if you believe it genuinely needs a peer project, write the
-            design for the one project and record the objection as an inline
-            `[ARCHITECT REVIEW]`.
+          work     = os.environ["WORK_DIR"]
+          story    = os.environ.get("STORY_KEY", "")
+          branch   = os.environ.get("ARCH_BRANCH", "")
+          sdd_file = os.environ["SDD_FILE"]
+          repo     = os.environ["REPO_NAME"]
+          product  = os.environ.get("FORCED_PRODUCT", "")
+          scope    = os.environ.get("FORCED_SCOPE", "")
+          steer    = (os.environ.get("STEER") or "").strip()
+          deliv_in = (os.environ.get("DELIVERY_IN") or "").strip()
+          try:
+              revision = int(os.environ.get("REVISION") or 1)
+          except ValueError:
+              revision = 1
 
-            ## Step 0.1 - the org's architectural considerations
+          if not product or not scope:
+              sys.exit("::error::Derive architecture needs FORCED_PRODUCT and FORCED_SCOPE. "
+                       "Clearing either one means the architecture is no longer determined - "
+                       "restore the uipath-architect agent step instead of running this one.")
 
-            Read `considerations_markdown` from the manifest BEFORE the Constraint Gate.
-            It is the org's own platform facts and house preferences, and it is
-            AUTHORITATIVE - it exists precisely so you stop guessing at things somebody
-            has already decided. Its own "How the agents must use this file" section is
-            binding; in short:
+          man  = json.load(open(os.path.join(work, "manifest.json")))
+          pdd  = read(man.get("current_pdd_markdown") or "")
+          cons = read(man.get("considerations_markdown") or "")
+          if not pdd:
+              warn("the current PDD markdown could not be read; need_profile and review items "
+                   "will be thin.")
+          if not cons:
+              warn("the considerations file could not be read; delivery model and the blocked "
+                   "product list fall back to defaults.")
 
-            - **a plain value is a confirmed fact.** State it. Do NOT raise an
-              `[ARCHITECT REVIEW]` for something this file already answers, and record
-              "org architectural considerations" as the decision's source.
-            - **`[UNCONFIRMED]` means nobody has confirmed it.** Treat it exactly as if
-              the file were silent: apply your normal default and carry the
-              `[ARCHITECT REVIEW]` item.
-            - **a preference (its §3-§4) is a house default, not a law.** Apply it and
-              record where it came from. Where the PDD's real need contradicts it, follow
-              the PDD and note the deviation and its reason. A preference never forces a
-              design the process cannot use.
-            - **its licensing section is the only thing that can BLOCK a product.** An
-              unlicensed product goes in `blocked_products` with the alternative you
-              applied; "partially available" or "limited" may be used but the design must
-              justify it and name the limit.
-            - **never invent a value it does not contain.** An absent row is an
-              `[ARCHITECT REVIEW]`, not permission to assume.
+          # ── markdown helpers ────────────────────────────────────────────────────────
+          def section(text, pattern):
+              """Body of the '## <pattern> ...' section, up to the next '## ' heading.
+              '### ' subsections stay inside, because '#' is not whitespace."""
+              m = re.search(r'(?mi)^##[ \t]+' + pattern + r'.*$', text)
+              if not m:
+                  return ""
+              rest = text[m.end():]
+              n = re.search(r'(?m)^##[ \t]', rest)
+              return rest[:n.start()] if n else rest
 
-            It is also where the naming rules live - resource names come from the
-            REPOSITORY's epic key, never from the process name. If the file is empty or
-            missing, say so in `revision_impact` and fall back to your own defaults.
+          def rows(block):
+              """Table rows as trimmed cell lists, separator rows dropped."""
+              out = []
+              for line in block.splitlines():
+                  line = line.strip()
+                  if not line.startswith("|"):
+                      continue
+                  cells = [c.strip() for c in line.strip("|").split("|")]
+                  body = [c for c in cells if c]
+                  if body and all(re.fullmatch(r':?-{2,}:?', c) for c in body):
+                      continue
+                  out.append(cells)
+              return out
 
-            ## Step 0 - load the planner skill if it is installed
+          def cell(cells, i):
+              return cells[i].strip().strip("`*").strip() if len(cells) > i else ""
 
-            Run: `ls ~/.claude/skills`
+          # ── names: the org rule is that names come from the REPOSITORY ──────────────
+          # architectural-considerations.md, "Naming - derived from the repository, never
+          # from the process name". The leading <epic>-<number>- prefix is stripped.
+          kebab = re.sub(r'^[A-Za-z]+-\d+-', '', repo.strip().lower())
+          kebab = re.sub(r'[^a-z0-9]+', '-', kebab).strip('-') or re.sub(r'[^a-z0-9]+', '-', repo.lower()).strip('-')
+          name  = "".join(w[:1].upper() + w[1:] for w in kebab.split('-') if w)
+          
+          # The solution, the deployment and the Orchestrator sub-folder all take the
+          # SAME name: <process-base>-<epic-number>. The epic number is what stops two
+          # lifecycles of one process colliding on a folder `deploy run` refuses to
+          # recreate, which is what forces a manual upgrade. The API Workflow project
+          # inside the solution is <process-base>-api. Both rules are stated in
+          # architectural-considerations.md §4 "Naming".
+          m_epic  = re.match(r'^[A-Za-z]+-(\d+)-', repo.strip())
+          epic_no = m_epic.group(1) if m_epic else ""
+          if epic_no:
+              solution_name = kebab + "-" + epic_no
+          else:
+              solution_name = kebab
+              warn("the repository name has no <epic>-<number>- prefix, so the solution "
+                   "name carries no epic number and a second lifecycle of this process "
+                   "will collide with it on the Orchestrator folder.")
+          project_name = kebab + "-api" if product == "api-workflows" else name
 
-            If `uipath-planner` is there, READ
-            `~/.claude/skills/uipath-planner/SKILL.md` with the Read tool - NEVER via the
-            Task tool, whose subagent spawn fails here with
-            `404 not_found_error - model: claude-sonnet-4-20250514` - and follow its
-            **Phase D, Phase 1** in AUTONOMOUS mode
-            (never ask a question - there is no human in this run). Its
-            references/product-selection-guide.md is the authority for every decision
-            below: Constraint Gate -> Level 0 -> Level 1 -> Level 1.5 -> Level 1.75 ->
-            Level 2.5 -> Level 3. Skip its Step 2.5 tenant/estate `uip` discovery - this
-            runner is not logged in; record that as an unverified reuse assumption.
+          # ── delivery model: dispatch input > considerations §1 > Automation Cloud ───
+          DELIVERY = {"automation cloud": "cloud", "cloud": "cloud",
+                      "automation suite": "automation-suite", "standalone": "standalone",
+                      "on-premise": "standalone", "on premise": "standalone"}
+          delivery, delivery_src = "", ""
+          if deliv_in and deliv_in.lower() != "unspecified":
+              delivery = DELIVERY.get(deliv_in.lower(), deliv_in.lower())
+              delivery_src = "dispatch input"
+          if not delivery:
+              for c in rows(section(cons, r'1\.\s*Delivery model')):
+                  if cell(c, 0).lower().startswith("deployment type"):
+                      delivery = DELIVERY.get(cell(c, 1).lower(), "")
+                      delivery_src = "considerations §1"
+                      break
+          if not delivery:
+              delivery, delivery_src = "cloud", "default"
+              warn("no delivery model stated anywhere; assuming Automation Cloud.")
 
-            **When PINNED product above is non-empty, do NOT read
-            references/product-selection-guide.md and do NOT walk Levels 0, 1, 1.5 or
-            1.75.** Those levels exist to CHOOSE a product, and the choice has already
-            been made and is enforced by a gate that rejects any other answer - a
-            previous run spent two minutes deliberating its way to the value it had been
-            handed in the first line of this prompt. Go straight to Level 2.5 (how many
-            independently deployed projects the process needs) and Level 3 (capability
-            add-ons), which are still genuinely yours to decide. Record the pinned
-            product as a `decisions[]` row per Step 0.5 and move on.
+          # ── blocked products: considerations §2 is the only thing that can block ────
+          PRODUCT_KEY = [
+              (r'maestro.*bpmn',                  'maestro-bpmn'),
+              (r'case management|maestro.*case',  'case-management'),
+              (r'maestro.*flow',                  'maestro-flow'),
+              (r'ixp|document understanding',     'ixp'),
+              (r'coded app',                      'coded-apps'),
+              (r'agent',                          'agents'),
+              (r'api workflow',                   'api-workflows'),
+              (r'\brpa\b',                        'rpa-process'),
+          ]
+          blocked = []
+          for c in rows(section(cons, r'2\.\s*Licensed products')):
+              label, lic = cell(c, 0).lower(), cell(c, 1).lower()
+              if not label or "not available" not in lic:
+                  continue
+              for pat, key in PRODUCT_KEY:
+                  if re.search(pat, label):
+                      if key != product and not any(b["product"] == key for b in blocked):
+                          blocked.append({"product": key, "reason": "platform matrix",
+                                          "alternative_applied": product + " covers the need"})
+                      break
 
-            If the skill is NOT installed, apply the rules restated in Step 2 below.
-            Either way the output contract in Step 3 is identical.
+          # ── integrated components: §4's connection table, kept when the PDD names the
+          # system. Informational - the SDD and build stages read §4 directly - so a miss
+          # here is a warning, never a stop.
+          components = []
+          pdd_low = pdd.lower()
+          for c in rows(section(cons, r'4\.\s*Connection and credential patterns')):
+              cname, system, ckey = cell(c, 0), cell(c, 1), cell(c, 2)
+              cid = cell(c, 3)
+              if not re.fullmatch(r'[a-z0-9][a-z0-9._-]{2,}', cname):
+                  continue                                   # header rows and prose
+              if ckey == 'uipath-uipath-orchestrator':
+                  continue                                   # the platform itself, never an integration
+              token = re.split(r'[\s—–-]', system.strip())[0].lower()
+              if len(token) < 3 or not re.search(r'\b' + re.escape(token) + r'\b', pdd_low):
+                  continue
+              components.append({
+                  "type": "integration-service", "name": cname, "host_project": project_name,
+                  "skill": "uipath-platform",
+                  "why": "existing " + system.split()[0] + " connection (" + (cid or "id in §4") + ")",
+              })
+          if not components:
+              warn("no connection in considerations §4 matches a system named in the PDD - "
+                   "integrated_components is empty. The SDD stage still reads §4 directly.")
 
-            ## Step 0.5 - the pin, when there is one
+          # ── need profile: PDD §3 is a validator-guaranteed table ────────────────────
+          def overview(label):
+              for c in rows(section(pdd, r'3\.\s*Process Overview')):
+                  if cell(c, 0).lower().startswith(label):
+                      return cell(c, 1)
+              return ""
+          need = "; ".join(x for x in (overview("short description"), overview("trigger and schedule")) if x)
+          if not need:
+              need = overview("process full name") or (name + " - see the PDD for the business need")
+              warn("PDD §3 has no 'Short description' row; need_profile is a fallback.")
+          need = re.sub(r'\s+', ' ', need).strip()
+          if len(need) > 260:                      # trim on a word boundary, never mid-word
+              need = need[:260].rsplit(' ', 1)[0].rstrip(' ,;.') + ' ...' 
 
-            If PINNED product above is non-empty, the PRIMARY PRODUCT is ALREADY DECIDED
-            and you do not get to re-open it. Set `primary_product` to exactly that
-            value. A `decisions[]` row records it with `level: "Level 1"`,
-            `source: "steer"` and a reason naming the pin.
+          # ── open items: the PDD's own §15 open-questions list ───────────────────
+          # That section is a validator-guaranteed numbered list and it is exactly what
+          # architect_review_items means: the gaps a human still has to close. Scanning
+          # for [SME REVIEW] markers instead drags in table-cell fragments, which is
+          # noise the SDD stage would dutifully carry into the document.
+          numbered = []
+          for line in section(pdd, r'15\.\s*Assumptions').splitlines():
+              m = re.match(r'^\s*\d+\.\s+(.*\S)', line)
+              if m:
+                  numbered.append(re.sub(r'\s+', ' ', m.group(1)).strip())
+          # The section mixes open questions with assumptions and dependencies. Only the
+          # open questions are review items; the rest are decisions already taken.
+          questions = [b for b in numbered if re.search(r'\bOQ-\d+', b)] or numbered
+          review = []
+          for body in questions:
+              head = re.match(r'\*\*(.+?)\*\*\s*(.*)', body)
+              item, rest = (head.group(1), head.group(2)) if head else (body, "")
+              item = re.sub(r'\[(SME REVIEW|DEFAULT|ARCHITECT REVIEW)\]', '', item)
+              item = re.sub(r'\s+', ' ', item).strip(' .\u2014-')
+              if not item:
+                  continue
+              review.append({
+                  "section": "PDD §15",
+                  "item": item.strip(' .—-')[:110],
+                  "question": (rest or item).strip()[:200] or "confirm with the SME",
+                  "default_applied": "carried forward as the PDD states it",
+                  "blocking": False,
+              })
+              if len(review) >= 12:
+                  break
+          if not review:
+              # No numbered list to read - fall back to counting the markers so the
+              # reviewer is still told there are unconfirmed values, without the noise.
+              n = pdd.count("[SME REVIEW]")
+              if n:
+                  review.append({"section": "PDD", "item": "%d unconfirmed value(s) marked [SME REVIEW]" % n,
+                                 "question": "confirm the marked values with the SME",
+                                 "default_applied": "carried forward as the PDD states them",
+                                 "blocking": False})
 
-            PINNED scope is a SEPARATE pin. When it is non-empty, set `sdd_scope` to
-            exactly that value too. When it is EMPTY - which is the normal
-            configuration - the scope is yours to decide on the evidence: fold the
-            step->executor map as Level 1 describes, and if what is left is one host,
-            say `single-product`; if it is two or more independently deployed peers,
-            say `solution` and give each peer its own project. A product pin does not
-            imply a scope pin. An `api-workflows` primary that genuinely needs an RPA
-            peer for a UI step is a `solution` whose primary is still the API Workflow.
+          SKILL_FOR = {"rpa-process": "uipath-rpa", "rpa-library": "uipath-rpa",
+                       "rpa-test-automation": "uipath-rpa", "maestro-flow": "uipath-maestro",
+                       "maestro-bpmn": "uipath-maestro", "case-management": "uipath-maestro",
+                       "agents": "uipath-agent", "coded-apps": "uipath-coded-app",
+                       "api-workflows": "uipath-api-workflow"}
+          TEMPLATE_FOR = {"rpa-process": "rpa-sdd-template.md", "rpa-library": "rpa-sdd-template.md",
+                          "rpa-test-automation": "rpa-sdd-template.md",
+                          "maestro-flow": "flow-sdd-template.md", "maestro-bpmn": "bpmn-sdd-template.md",
+                          "case-management": "case-sdd-template.md", "agents": "agent-sdd-template.md",
+                          "coded-apps": "coded-app-sdd-template.md",
+                          "api-workflows": "api-workflow-sdd-template.md"}
 
-            You still do all the real work - Level 0 suitability, the step->executor map,
-            components, queues, project decomposition, the data contracts - you just do it
-            INSIDE the pinned product instead of choosing one. So with `api-workflows`
-            pinned: the API Workflow is the host, and every step in the PDD becomes either
-            an activity in it, a connector/HTTP call it makes, or an integrated component
-            it invokes. Anything the pinned product genuinely cannot do does NOT become a
-            different primary - it becomes an `integrated_components` row (an RPA process
-            the workflow calls for UI work, an IXP model for extraction, a Coded Function
-            for compute) or, if it truly cannot be served at all, a BLOCKING
-            `architect_review_items` row that names the step and why.
-
-            The job that runs after you FAILS if `primary_product` or `sdd_scope` does not
-            match the pin, so there is no point arguing with it in the file.
-
-            ## Step 1 - read everything
-
-            Read the manifest, then every markdown file it lists. The CURRENT PDD is the
-            one the architecture must satisfy. Older PDDs are change-request history:
-            read them to understand what changed and why, never to re-introduce dropped
-            scope.
-
-            The PDDs use load-bearing markers written by the analysis stage - `[ARCHITECT REVIEW]`
-            means a business decision nobody has made yet, `[DEFAULT]` means an engineering
-            default was applied. Treat an `[ARCHITECT REVIEW]` value as unconfirmed: design
-            around it and carry it forward, never silently promote it to fact.
-
-            Read these PDD sections with particular care - they are the architecture input:
-
-            - section 3 Process Overview - volume, handling time, exception rate -> sizing
-            - section 7 Detailed Process Steps -> the step-by-step executor map
-            - section 8 Applications and Systems -> API-vs-UI, so RPA-vs-API Workflow
-            - section 13 Environment and Constraint Signals -> the Constraint Gate input
-              (delivery model, product exclusions, orchestration constraints, attendance)
-            - section 16 Decomposition Signals -> stages, per-item transactions,
-              document understanding, human validation, multiple output channels
-
-            On a revision run, read every prior SDD in ${{ env.WORK_DIR }}/prior/ and its
-            Planner Handoff header. Keep the existing architecture unless the new PDD
-            genuinely breaks it - a change request that adds a field does NOT justify
-            re-platforming. When you do change it, the reason goes in
-            `revision_impact` and must name the PDD sentence that forced it.
-
-            A human steer, when present, OUTRANKS your own analysis: a forced product is
-            forced, an excluded product is blocked for the whole design and never
-            re-offered. Record it as the source of that decision.
-
-            ## Step 2 - decide (the rules, restated)
-
-            **Constraint Gate first.** The delivery model gates everything. Take it from
-            the org considerations file when that file states it - a value there is a
-            fact and needs no `[ARCHITECT REVIEW]`, and its licensing table is a hard
-            block list you apply here. Only when neither the considerations file nor the
-            PDD nor the dispatch input gives one is it `unspecified`, which
-            gates nothing - assume Automation Cloud and carry an `[ARCHITECT REVIEW]` saying so.
-            On Automation Suite or standalone, treat the cloud-modern products (Maestro,
-            Coded Apps, IXP, Agents, Solutions) as needing verification before you
-            recommend them, and name the alternative you applied. A user exclusion is a
-            block, identical to a platform block. Never substitute silently.
-
-            **Level 0 - should this be automated at all?** Native capability in the target
-            system, an existing deployed automation that covers steps, a process mid-change,
-            waste that should be redesigned away, missing access, thin economics. Outcome is
-            one of `proceed` / `proceed-with-redesign` / `partial` / `do-not-automate`.
-            If it is genuinely `do-not-automate`, still emit the json with that outcome and
-            a populated `level_0_findings` - do not invent a design to fill the file.
-
-            **Level 1 - the coordination host.** Type every step from PDD section 7 with an
-            executor, then FOLD the map: a capability a host can invoke in-process is an
-            integrated component, not a reason to orchestrate. RPA absorbs IXP extraction,
-            LLM activities, connector and HTTP calls, synchronous child process/agent calls,
-            and ONE in-flight approval (long-running + Action Center). API Workflows absorb
-            connector and nested API calls. After folding:
-
-            - one host left -> that host is the primary, single-product scope
-            - two or more independently deployed peers left, OR a coordination shape no
-              single host can hold (case stages + SLA, formal gateways/events/parallel
-              branches, long-running waits across automations) -> the primary is a Maestro
-              host (Case -> BPMN -> Flow, in that order of specificity) and every peer
-              becomes a Solution project
-
-            Pick the host from the NEED, never from a keyword:
-
-            - judgment or reasoning not expressible as fixed rules, or runtime tool
-              planning -> Agents. "AI" over a rule set is RPA, not an Agent.
-            - one fixed generative step inside a known path -> an LLM activity in the host
-            - fixed document classification / extraction -> IXP as a component
-            - a user-facing screen as the deliverable -> Coded Apps
-            - headless system-to-system, no UI, no bot -> API Workflows
-            - staged lifecycle with SLA / approvals -> Case Management
-            - formal gateways / events / subprocesses, no case -> Maestro BPMN
-            - a plain multi-automation pipeline -> Maestro Flow
-            - one human approval inside ONE process -> long-running RPA + Action Center
-            - headless deterministic compute -> a Coded Function component
-            - UI automation, or machine-local work (Excel, files, on-prem DB, desktop
-              email, terminal/mainframe) -> RPA
-
-            The dominant correct answer is HYBRID: a deterministic primary, an Agent only
-            for the steps that need judgment, HITL gating the risky ones. A fixed process
-            containing judgment steps is a deterministic primary with an Agent component -
-            never an Agent-primary design.
-
-            **Level 1.5 (RPA only)** - Process / Library / Test Automation.
-            **Level 2 (RPA only)** - XAML / Coded C# / Hybrid.
-            **Level 2.5 Part A (RPA only)** - single project, or a Master Project of
-            queue-connected sub-projects (Dispatcher / Performer / Reporting). Per-item
-            transactional volume with a distinct selection step is the signal for the split;
-            a Master Project implies a queue, and every queue needs a name and item schema
-            owner.
-            **Level 3 - capability add-ons**: HITL, Integration Service, an API Workflow as
-            a component, a custom connector when the catalog has none.
-
-            Size the design against the PDD's real numbers. A 40-items-a-day process does
-            not need a Master Project; 4,000 does.
-
-            ## Step 3 - write architecture.json
-
-            Write EXACTLY this shape to ${{ env.WORK_DIR }}/architecture.json. Every key
-            present; use `[]`, `""` or `null` for genuinely-empty values, never omit a key.
-            `sdd_files` drives job 4 and the validator, so its paths and templates must be
-            exact.
-
-            ```json
-            {
-              "story_key": "${{ needs.identify.outputs.story_key }}",
-              "branch": "${{ needs.identify.outputs.branch }}",
-              "revision": ${{ needs.identify.outputs.revision }},
-              "process_name": "PascalCase name from PDD section 2 'Process Full Name'",
-              "process_kebab": "kebab-case of process_name",
-              "delivery_model": "cloud | automation-suite | standalone | unspecified",
-              "level_0_outcome": "proceed | proceed-with-redesign | partial | do-not-automate",
-              "level_0_findings": ["one line per failed suitability gate, [] when proceed"],
-              "need_profile": "one line: the core need and the target KPI",
-              "sdd_scope": "single-product | solution",
-              "primary_product": "rpa-process | rpa-library | rpa-test-automation | maestro-flow | maestro-bpmn | case-management | agents | coded-apps | api-workflows",
-              "blocked_products": [
-                {"product": "", "reason": "platform matrix | user exclusion | steer", "alternative_applied": ""}
-              ],
-              "projects": [
-                {
-                  "name": "e.g. NoPoInvoiceFinder.Performer",
-                  "kebab": "no-po-invoice-finder-performer",
-                  "product": "rpa-process",
-                  "skill": "uipath-rpa",
-                  "role": "primary | dispatcher | performer | reporting | library | component",
-                  "authoring_mode": "xaml | coded | hybrid | n/a",
-                  "framework": "reframework | sequence | n/a",
-                  "sdd_file": "the mandated path, or the shared RPA-group file for a Master Project",
-                  "build_order": 1,
-                  "why": "one line tying this project to the PDD"
-                }
-              ],
-              "integrated_components": [
-                {"type": "integration-service | ixp | coded-function | api-workflow | hitl | custom-connector | llm-activity",
-                 "name": "", "host_project": "", "skill": "", "why": ""}
-              ],
-              "queues": [
-                {"name": "", "producer_project": "", "consumer_project": "", "item_schema_summary": "", "why": ""}
-              ],
-              "capability_addons": ["hitl", "integration-service"],
-              "sdd_files": [
-                {"path": "the mandated path - see the naming rules below",
-                 "template": "rpa-sdd-template.md | flow-sdd-template.md | bpmn-sdd-template.md | case-sdd-template.md | agent-sdd-template.md | coded-app-sdd-template.md | api-workflow-sdd-template.md | solution-overview",
-                 "role": "single-product | solution-root | project",
-                 "project": "project name, or the solution name for solution-root"}
-              ],
-              "tasks_file": "<process_kebab>-tasks.md, or <solution_kebab>-tasks.md for solution scope",
+          blocked_txt = ", ".join(b["product"] for b in blocked) or "nothing"
+          arch = {
+              "story_key": story,
+              "branch": branch,
+              "revision": revision,
+              "process_name": name,
+              "process_kebab": kebab,
+              # Read by uipath-develop (which enforces it on the packed .uipx) and by
+              # uipath-deploy (which names the deployment and its folder after it).
+              "solution_name": solution_name,
+              "epic_number": epic_no,
+              "delivery_model": delivery,
+              # Level 0 suitability is not re-litigated on a pinned run: the PDD reached
+              # this stage approved, which is the decision to automate.
+              "level_0_outcome": "proceed",
+              "level_0_findings": [],
+              "need_profile": need,
+              "sdd_scope": scope,
+              "primary_product": product,
+              "blocked_products": blocked,
+              "projects": [{
+                  "name": project_name, "kebab": project_name, "product": product,
+                  "skill": SKILL_FOR.get(product, "uipath-platform"), "role": "primary",
+                  "authoring_mode": "n/a" if product == "api-workflows" else "coded",
+                  "framework": "n/a" if product == "api-workflows" else "sequence",
+                  "sdd_file": sdd_file, "build_order": 1,
+                  "why": "single pinned project inside the solution",
+              }],
+              "integrated_components": components,
+              "queues": [],
+              "capability_addons": ["integration-service"] if components else [],
+              "sdd_files": [{"path": sdd_file, "template": TEMPLATE_FOR[product],
+                             "role": "single-product", "project": project_name}],
+              "tasks_file": kebab + "-tasks.md",
               "decisions": [
-                {"level": "Constraint Gate | Level 0 | Level 1 | Level 1.5 | Level 2 | Level 2.5 | Level 3",
-                 "picked": "", "reason": "", "source": "pdd | steer | default"}
+                  {"level": "Constraint Gate", "picked": delivery + ", modern folders",
+                   "reason": "org fact; blocked: " + blocked_txt, "source":
+                   "steer" if delivery_src == "dispatch input" else "default"},
+                  {"level": "Level 1", "picked": product,
+                   "reason": "pinned by FORCED_PRODUCT" + (" and the dispatch steer" if steer else ""),
+                   "source": "steer"},
+                  {"level": "Level 2.5", "picked": "one project, no dispatcher/performer split",
+                   "reason": "pinned by FORCED_SCOPE", "source": "steer"},
+                  {"level": "Level 3", "picked": "Integration Service connector calls",
+                   "reason": "considerations §4 is the only approved shape for external calls",
+                   "source": "default"},
               ],
-              "architect_review_items": [
-                {"section": "", "item": "", "question": "", "default_applied": "", "blocking": false}
-              ],
-              "revision_impact": "first design | what the new PDD changed and why the architecture did or did not move"
-            }
-            ```
+              "architect_review_items": review,
+              "revision_impact": "first design" if revision <= 1 else
+                  "revision %d - product and scope are pinned, so the architecture does not move" % revision,
+          }
 
-            Naming and file rules - these are contracts, not preferences:
-
-            - **The filename is given to you, never chosen.** It is an SDD already in
-              `docs/` when there is one (adopted, so a revision updates it instead of
-              orphaning it), otherwise it is derived from this branch's key
-              (`${{ needs.identify.outputs.file_key }}`) so every document for this
-              story sorts with its PDD. Either way it is the MANDATED SDD PATH above and
-              never the process name.
-            - `single-product` scope -> exactly ONE entry in `sdd_files`, role
-              `single-product`, path EXACTLY `${{ needs.identify.outputs.sdd_file }}`.
-            - `solution` scope -> ONE entry with role `solution-root`, template
-              `solution-overview`, path `${{ needs.identify.outputs.sdd_file }}`, PLUS one
-              `project` entry per buildable project at
-              `${{ needs.identify.outputs.sdd_prefix }}-<project-kebab>.md`.
-            - Any other path is rejected by the job that runs after you.
-            - An RPA Master Project's sub-projects SHARE one RPA SDD file - do not emit one
-              per sub-project.
-            - Component rows (Coded Function, IXP model, custom connector) get NO SDD file.
-              They live in `integrated_components` and in the host SDD's tables.
-            - `decisions` must contain a Constraint Gate row even when nothing is blocked.
-            - Every project needs a `build_order`; components come before their consumers.
-
-            ## Step 4 - self-check
-
-            ```
-            python3 -c "import json;d=json.load(open('${{ env.WORK_DIR }}/architecture.json'));\
-            print(d['sdd_scope'],d['primary_product'],len(d['projects']),len(d['sdd_files']))"
-            ```
-
-            It must print without error, and: a `solution` scope must have exactly one
-            `solution-root` in `sdd_files`; a `single-product` scope exactly one file and no
-            `solution-root`. Fix and re-run until it holds.
-
-            Do NOT modify anything under ${{ env.WORK_DIR }} other than architecture.json.
-            Do NOT write the SDD - that is the next job. Do NOT run git, gh, or `uip login`.
+          out = os.path.join(work, "architecture.json")
+          with open(out, "w", encoding="utf-8") as fh:
+              json.dump(arch, fh, indent=2, ensure_ascii=False)
+              fh.write("\n")
+          print("derived %s: solution '%s', project '%s', %s / %s, "
+                "%d component(s), %d open item(s), %d byte(s)"
+                % (out, solution_name, project_name, product, scope,
+                   len(components), len(review), os.path.getsize(out)))
+          EOF_DERIVE
 
       - name: Verify architecture decision
         id: arch
@@ -1183,9 +1196,16 @@ jobs:
             believe a decision is wrong, write the SDD as decided and mark your objection
             inline with `[ARCHITECT REVIEW]` where it bites.
 
+            Its `architect_review_items[]` is the PDD's own open-questions list copied
+            forward verbatim, NOT a list of things that are still open. Several of those
+            questions are answered outright by the considerations file below - the PDD
+            asked them before anyone had read it. Carry an item into the document only
+            after checking it there and finding no answer. An item the considerations
+            file settles is written as a FACT with its source, not as a marker.
+
             Read `considerations_markdown` from the manifest - the org's platform facts
-            and house preferences, and AUTHORITATIVE. The architect already applied it to
-            the architecture; you apply it to the DOCUMENT:
+            and house preferences, and AUTHORITATIVE. The derivation step already applied
+            it to the architecture; you apply it to the DOCUMENT:
 
             - A plain value there is a CONFIRMED FACT. Write it as fact - delivery model,
               region, folder structure, logging target, system base URLs, auth pattern.
@@ -1193,13 +1213,34 @@ jobs:
               when the PDD marked the same thing `[SME REVIEW]`; the PDD did not know.
               Cite "org architectural considerations" inline as the source, in the
               section that states the fact.
+
+              Concretely - these are ANSWERED, and a marker on any of them is a defect
+              however the PDD marked it:
+                * delivery model, region, tenant version, folder structure (§1)
+                * which products are licensed and which are blocked (§2)
+                * for every system in §4's connection table: that the connection
+                  already EXISTS, its name, its id, its connector key, and that the
+                  interface is that connector's REST API rather than a UI
+                * the call shape for those systems - an HTTP Request activity with
+                  connector authentication, a RELATIVE resource path, and no token
+                  anywhere in the document (§4)
+                * the Slack destination, which is a member id, never an email (§4)
+                * the resource naming rules (§4)
+
+              This is not a style note. The last run wrote markers on three of these,
+              then spent 56 seconds of wall clock grepping them back out of a file it
+              had just written. Decide it once, as you write the line.
             - `[UNCONFIRMED]` there means unanswered: normal default plus an inline
               `[ARCHITECT REVIEW]` marker.
             - Its naming rules are BINDING and the validator checks them. Every asset,
               credential, queue, bucket and connection is `<epic_key>_<thing>`, lowercase
               with underscores, where the epic key is the REPOSITORY name's prefix - not
-              the story key, not the process name. The solution name is the repository
-              name verbatim.
+              the story key, not the process name. The solution name, the deployment
+              name and the Orchestrator sub-folder are all the one string
+              `<process-base>-<epic-number>`, and the API Workflow project inside the
+              solution is `<process-base>-api`. Both are already decided for you and
+              carried in architecture.json as `solution_name` and `projects[0].name` -
+              use those values verbatim and never re-derive them.
             - An Integration Service connection being *available* is not the same as it
               *existing*: record each named connection as a deployment prerequisite a
               human must create and authorise.
@@ -1373,14 +1414,42 @@ jobs:
             §7 - which the build stage reads directly. Numbering stays contiguous from 1,
             so renumber the sections after it; the validator rejects a gap.
 
-            ## Keep Testing Strategy short
+            ## Length budget - this is a contract, not a suggestion
 
-            `Testing Strategy` is capped at exactly three `###` subsections - happy path,
-            business exceptions, system errors - each a compact table or bullet list. It
-            was the largest section in the last SDD at 8 KB. Do NOT expand it into
-            acceptance-criteria matrices, test-data appendices or eval-set scaffolding:
-            the project's own eval/test mechanism owns those, and the build stage reads
-            the code, not this section.
+            You write this document in ONE `Write` call, and that call streams at about
+            46 characters per second. The last SDD was 19,090 characters, so the write
+            alone took 114 seconds - more than half the whole stage. Every character you
+            do not write is time the demo gets back, and none of the cuts below lose
+            anything the build stage reads.
+
+            Whole document: aim for **12 KB, hard ceiling 14 KB**. Per section, measured
+            against the last run so you can see where the weight actually is:
+
+            | Section | Last run | Budget | What changes |
+            | --- | --- | --- | --- |
+            | 1. API Workflow Overview | 3.1 KB | **1.2 KB** | It restates the PDD. A short paragraph plus the trigger, the schedule and the one-line outcome. No re-narration of the business problem. |
+            | 2. Input Schema | 1.1 KB | 1.1 KB | Already right. One table. |
+            | 3. Output Schema | 1.9 KB | 1.4 KB | One table. Drop the prose around it. |
+            | 4. Execution Flow | 3.1 KB | **2.8 KB** | The core of the document - do NOT squeeze this one. Every step, its activity type, its inputs and its outputs. |
+            | 5. Connectors & External Calls | 1.6 KB | 1.2 KB | One row per call. The patterns live in considerations §4; point at it, do not restate it. |
+            | 6. Error Handling | 1.9 KB | 0.9 KB | The PDD says no retry and no error notification. Saying that plainly is the complete answer. |
+            | 7. Project Structure | 3.4 KB | **1.0 KB** | A file tree and one short table, at least 10 lines. `uip` scaffolds the project; this section orients a human, it does not specify a generator. |
+            | 8. Testing Strategy | 1.8 KB | 0.8 KB | Exactly three `###` subsections - happy path, business exceptions, system errors - each a compact table. |
+            | 9. Next Steps | 0.5 KB | 0.4 KB | Already right. |
+
+            The budget is spent on the sections the Development stage reads to build the
+            workflow - 2, 3, 4 and 5. It is not spent on restating the PDD, the
+            considerations file, or the platform's own documentation.
+
+            Do NOT expand Testing Strategy into acceptance-criteria matrices, test-data
+            appendices or eval-set scaffolding: the project's own eval/test mechanism
+            owns those, and the build stage reads the code, not this section.
+
+            Two things the budget does NOT license. Do not drop a required section to
+            make room - all nine are mandatory and the validator fails a missing one.
+            Do not thin a table to hit a number: a step, a field, a business rule or a
+            call that the PDD names must appear, and it is the PROSE around the tables
+            that gives way.
 
             ## Keep Error Handling proportionate - it is not a licence to invent
 
@@ -1707,9 +1776,10 @@ jobs:
           cat > /tmp/pr-body.md <<'EOF_BODY'
           ## Solution Design Document for review
 
-          The architect agent read the approved PDD(s) on `develop`, decided the
-          architecture, and wrote the design. Merging this PR approves the SDD and releases
-          the case into development.
+          The architecture was derived from the approved PDD(s) on `develop` and the
+          org's architectural considerations, and the architect agent wrote the design
+          against it. Merging this PR approves the SDD and releases the case into
+          development.
 
           **Review checklist**
           - [ ] The architecture is right — product, scope and project split match the process
