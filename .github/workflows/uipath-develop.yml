@@ -495,14 +495,18 @@ jobs:
             including its table of non-obvious rules, before you write the Slack
             activity:
 
-            - **`${{ ... }}` already opens the object - do NOT add another `{ }`.** The
-              outer brace is the `${ }` expression delimiter, the inner one is the
-              object literal. Write `${{ channel: '...', text: `...`, blocks: [...] }}`.
-              Pasting a JSON payload in whole gives `${{ { ... } }}`, which is a
-              SyntaxError at run time - after the build and the deploy have both gone
-              green. That has happened on a real run. It is an EXPRESSION, not JSON:
-              unquoted keys, single quotes or backticks, `${$context.variables.x}` for
-              interpolation. `validate-build.sh` fails the build on the doubled brace.
+            - **The body's outer braces are already there - do NOT add another pair.**
+              `bodyParameters.body` is a UiPath expression: the `$`-brace delimiter
+              supplies the opening brace and the object literal supplies the second,
+              so you write the key/value pairs directly after them - `channel:`,
+              `text:`, `blocks:`. Wrapping the payload in one more `{ }` is a
+              SyntaxError at run time, after the build and the deploy have both gone
+              green, and it has happened on a real run. **§4 shows the correct and the
+              wrong form side by side under "The Slack message is Block Kit" - copy the
+              correct one from there rather than reconstructing it.** It is an
+              EXPRESSION, not JSON: unquoted keys, single quotes or backticks, and
+              `$context.variables.<name>` interpolated inside a backtick string.
+              `validate-build.sh` fails the build on the doubled brace.
             - `channel` is the member id from §4's table, never an email address
             - top-level `text` must be present - with `blocks` it is the push
               notification, and omitting it renders "This content can't be displayed"

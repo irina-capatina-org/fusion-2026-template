@@ -1152,7 +1152,7 @@ jobs:
 
       # The static half of the SDD agent's instructions lives in a file rather
       # than in the prompt. GitHub compiles any `with:` value containing a
-      # ${{ }} interpolation into a single template expression and caps it at
+      # dollar-brace-brace interpolation into one template expression and caps it at
       # 21,000 characters; the prompt hit that ceiling and the whole workflow
       # became unparseable - `Invalid workflow file ... Exceeded max expression
       # length 21000`. This block has no interpolations, so it is not compiled
