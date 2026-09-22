@@ -1147,6 +1147,338 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # The static half of the SDD agent's instructions lives in a file rather
+      # than in the prompt. GitHub compiles any `with:` value containing a
+      # ${{ }} interpolation into a single template expression and caps it at
+      # 21,000 characters; the prompt hit that ceiling and the whole workflow
+      # became unparseable - `Invalid workflow file ... Exceeded max expression
+      # length 21000`. This block has no interpolations, so it is not compiled
+      # and has no such limit, and the prompt keeps permanent headroom.
+      # WORK_DIR is scratch: the commit step adds only the SDD and the
+      # architecture json, so this file never reaches the repository.
+      - name: Write the SDD guidance
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK_DIR"
+          cat > "$WORK_DIR/sdd-guidance.md" <<'EOF_GUIDANCE'
+          # SDD guidance - the rest of your instructions
+
+          Read this file in full before you write anything. The step prompt carries
+          only the inputs and the hard rules; everything about HOW to write the
+          document is here.
+
+          ## Step 0 - load the planner skill if it is installed
+
+          Run `ls ~/.claude/skills`. If `uipath-planner` is there, READ
+          `~/.claude/skills/uipath-planner/SKILL.md` with the Read tool - NEVER via the
+          Task tool, whose subagent spawn fails here with
+          `404 not_found_error - model: claude-sonnet-4-20250514` - then for every file
+          in `sdd_files` LOCATE the
+          template it names by searching for it - the package nests some templates one
+          level deeper than others, so search rather than assume a flat path:
+
+              find ~/.claude/skills/uipath-planner/assets/templates -name '<template-name>'
+
+          READ the template you find and follow it exactly - its headings, its tables, its
+          placeholder semantics. The template is the authority. Your generated H2/H3
+          heading set MUST be a SUPERSET of the template's: a missing template heading is a
+          defect you fix, never an `[ARCHITECT REVIEW]` line.
+
+          Follow Phase D **Phase 3** in AUTONOMOUS mode. Never ask a question.
+
+          If the skill is NOT installed, use the section lists in Step 2 below.
+
+
+          ## Step 1 - read everything
+
+          Read architecture.json in full. It decides scope, products, projects, queues,
+          components, file paths and templates - do NOT re-open those decisions. If you
+          believe a decision is wrong, write the SDD as decided and mark your objection
+          inline with `[ARCHITECT REVIEW]` where it bites.
+
+          Its `architect_review_items[]` is the PDD's own open-questions list copied
+          forward verbatim, NOT a list of things that are still open. Several of those
+          questions are answered outright by the considerations file below - the PDD
+          asked them before anyone had read it. Carry an item into the document only
+          after checking it there and finding no answer. An item the considerations
+          file settles is written as a FACT with its source, not as a marker.
+
+          Read `considerations_markdown` from the manifest - the org's platform facts
+          and house preferences, and AUTHORITATIVE. The derivation step already applied
+          it to the architecture; you apply it to the DOCUMENT:
+
+          - A plain value there is a CONFIRMED FACT. Write it as fact - delivery model,
+            region, folder structure, logging target, system base URLs, auth pattern.
+            Never emit an `[ARCHITECT REVIEW]` for something this file answers, even
+            when the PDD marked the same thing `[SME REVIEW]`; the PDD did not know.
+            Cite "org architectural considerations" inline as the source, in the
+            section that states the fact.
+
+            Concretely - these are ANSWERED, and a marker on any of them is a defect
+            however the PDD marked it:
+              * delivery model, region, tenant version, folder structure (§1)
+              * which products are licensed and which are blocked (§2)
+              * for every system in §4's connection table: that the connection
+                already EXISTS, its name, its id, its connector key, and that the
+                interface is that connector's REST API rather than a UI
+              * the call shape for those systems - an HTTP Request activity with
+                connector authentication, a RELATIVE resource path, and no token
+                anywhere in the document (§4)
+              * the Slack destination, which is a member id, never an email (§4)
+              * the resource naming rules (§4)
+
+            This is not a style note. The last run wrote markers on three of these,
+            then spent 56 seconds of wall clock grepping them back out of a file it
+            had just written. Decide it once, as you write the line.
+          - `[UNCONFIRMED]` there means unanswered: normal default plus an inline
+            `[ARCHITECT REVIEW]` marker.
+          - Its naming rules are BINDING and the validator checks them. Every asset,
+            credential, queue, bucket and connection is `<epic_key>_<thing>`, lowercase
+            with underscores, where the epic key is the REPOSITORY name's prefix - not
+            the story key, not the process name. The solution name, the deployment
+            name and the Orchestrator sub-folder are all the one string
+            `<process-base>-<epic-number>`, and the API Workflow project inside the
+            solution is `<process-base>-api`. Both are already decided for you and
+            carried in architecture.json as `solution_name` and `projects[0].name` -
+            use those values verbatim and never re-derive them.
+          - An Integration Service connection being *available* is not the same as it
+            *existing*: record each named connection as a deployment prerequisite a
+            human must create and authorise.
+          - Never invent a value it does not contain, and never put a credential value
+            in the document - name the asset and its owner.
+
+          Read every PDD in the manifest. The document you write must account for ALL of
+          the current PDD's content: every step in its section 7, every `BR-xx` in its
+          section 9, every business exception, every system error, every field in its
+          section 12, every concrete value in its section 15. A PDD business rule that
+          appears nowhere in the SDD is a hole in the design.
+
+          On a revision run, read every prior SDD and UPDATE it in place rather than
+          replacing it: keep section structure and reviewed content, change what the new
+          PDD changed, and add a Document History row (version +0.1, or +1.0 when the
+          architecture moved) whose comment names the change request.
+
+          "In place" is literal. `sdd_files[].path` already points at the ADOPTED file
+          when there is one, so you are editing that document, not writing a new one
+          beside it. Do NOT create a second SDD under a different name, and do not
+          delete or rename the adopted one. Where the adopted document predates the
+          current rules - process-name-prefixed resource names, `[SME REVIEW]` markers,
+          another product's artifacts - fix those as part of the revision; they are
+          defects in a document you now own, not history to preserve.
+
+
+          ## Step 2 - write the SDD(s)
+
+          Write each `sdd_files[].path`. Nothing else. Universal front matter, in this
+          order, for EVERY file - the handoff block must stay inside the first 50 lines
+          because that is all the downstream planner reads to detect it:
+
+              # Solution Design Document — <process or project name>
+
+              ## Document History
+
+              | Date | Version | Author | Role | Comments |
+              (one row per revision, newest last)
+
+              <!-- DO NOT RENAME: uipath-planner detects SDDs via this exact heading or the marker below. -->
+              <!-- planner-handoff:v1 -->
+              ## Planner Handoff
+
+              | Field | Value |
+              |---|---|
+              | **Status** | ready |
+              | **Execution autonomy** | autonomous |
+              | **Delivery model** | <from architecture.json> |
+              | **SDD scope** | <single-product | solution> |
+              | **Project list section** | <the section number holding the project list> |
+              | **Tasks file** | `<tasks_file from architecture.json>` |
+              | **Generated by** | uipath-planner |
+              | **Generation date** | <YYYY-MM-DD> |
+              | **Template validation** | passed |
+
+          Nothing else between the handoff table and the numbered body.
+
+
+          ## Sections the template contains that you must NOT write
+
+          The template you are handed still carries these. Skip them - every byte you
+          write is a second on the demo clock, and each of these restates something
+          a machine-readable file already holds:
+
+          - `## Decisions Made` - architecture.json already carries `decisions[]`, and
+            it is committed alongside this SDD.
+          - `## Recommended Scope` - architecture.json already carries `sdd_scope`,
+            `projects[]`, `blocked_products[]` and `need_profile`.
+          - `## Action Required — Architect Review Items` - architecture.json already
+            carries `architect_review_items[]`. Keep the inline `[ARCHITECT REVIEW]`
+            markers where the open question actually bites; drop only the summary table.
+          - `### Out of Scope` under section 1 - the PDD owns the scope boundary and
+            the build stage never reads this back.
+          - The whole of `## Security & Authentication`, including its
+            `### Rate Limits` and `### Non-Functional Requirements` subsections. Its
+            rows cite their own sources - "org considerations §7", "§1", "(BR-08)" -
+            which makes it a table of pointers, and its external-systems table repeats
+            the connection rows in `Connectors & External Calls`. A `[DEFAULT]` row
+            saying "standard API rate limits apply" tells a developer nothing. If a
+            real, named rate limit constrains the design, state it in that connector's
+            own row in section 5 instead.
+
+
+          ## Never re-type the org's fixed JSON
+
+          `architectural-considerations.md` §4 carries the canonical HTTP Request
+          activity shape, its `bindings_v2.json` entry and the solution
+          connection-resource file, and marks their fields "fixed - byte for byte".
+          Do NOT copy any of them into the SDD. A previous SDD spent 4,450 bytes -
+          two thirds of its entire Connectors section - re-typing those three blocks.
+
+          Two reasons, and the second one matters more than the clock:
+
+          - The build stage reads `architectural-considerations.md` directly, and
+            `validate-build.sh` judges the built workflow against §4 - never against
+            the SDD's copy. A copy that drifts sends the developer one way while the
+            validator marks it wrong the other.
+          - It is a design document. Its job is to say WHICH connector, WHICH
+            connection id and WHICH endpoint each step calls. The byte-level shape of
+            the activity is the build stage's business.
+
+          So in Connectors & External Calls, write the connector key, the connection
+          name, the connection id, the operation, the endpoint and the parameters as
+          table rows, then one line: "Activity shape, `bindings_v2.json` entry and
+          connection-resource file: `docs/architectural-considerations.md` §4,
+          verbatim." No fenced JSON.
+
+          Then the numbered body sections. Use `## <n>. <Name>` exactly, numbered from 1,
+          contiguous, in this order, every one present with real content:
+
+          Only `api-workflow-sdd-template.md` is listed below. The other six templates
+          and `solution-overview` are unreachable: FORCED_PRODUCT pins the product to
+          api-workflows and FORCED_SCOPE pins the scope to a single project, and the
+          Derive architecture step hard-stops if either pin is cleared. If you ever do
+          clear them, the planner skill's own templates carry the full section lists.
+
+          **api-workflow-sdd-template.md**
+          1. API Workflow Overview · 2. Input Schema · 3. Output Schema ·
+          4. Execution Flow · 5. Connectors & External Calls · 6. Error Handling ·
+          7. Project Structure · 8. Testing Strategy · 9. Next Steps
+
+          For this template the sections `Performance & Scaling`, `Consumers` and
+          `Security & Authentication` are DELIBERATELY OMITTED - do not emit them even
+          if the template file lists them. They are the case where the generated SDD is
+          a subset of its template. Nothing is lost by dropping
+          `Security & Authentication`: which connection each call uses and where its
+          credentials live is already a row in `Connectors & External Calls`, and the
+          credential policy, logging target, data residency and runtime environment are
+          stated once, authoritatively, in `architectural-considerations.md` §4, §5 and
+          §7 - which the build stage reads directly. Numbering stays contiguous from 1,
+          so renumber the sections after it; the validator rejects a gap.
+
+
+          ## Length budget - this is a contract, not a suggestion
+
+          You write this document in ONE `Write` call, and that call streams at about
+          46 characters per second. The last SDD was 19,090 characters, so the write
+          alone took 114 seconds - more than half the whole stage. Every character you
+          do not write is time the demo gets back, and none of the cuts below lose
+          anything the build stage reads.
+
+          Whole document: aim for **12 KB, hard ceiling 14 KB**. Per section, measured
+          against the last run so you can see where the weight actually is:
+
+          | Section | Last run | Budget | What changes |
+          | --- | --- | --- | --- |
+          | 1. API Workflow Overview | 3.1 KB | **1.2 KB** | It restates the PDD. A short paragraph plus the trigger, the schedule and the one-line outcome. No re-narration of the business problem. |
+          | 2. Input Schema | 1.1 KB | 1.1 KB | Already right. One table. |
+          | 3. Output Schema | 1.9 KB | 1.4 KB | One table. Drop the prose around it. |
+          | 4. Execution Flow | 3.1 KB | **2.8 KB** | The core of the document - do NOT squeeze this one. Every step, its activity type, its inputs and its outputs. |
+          | 5. Connectors & External Calls | 1.6 KB | 1.2 KB | One row per call. The patterns live in considerations §4; point at it, do not restate it. |
+          | 6. Error Handling | 1.9 KB | 0.9 KB | The PDD says no retry and no error notification. Saying that plainly is the complete answer. |
+          | 7. Project Structure | 3.4 KB | **1.0 KB** | A file tree and one short table, at least 10 lines. `uip` scaffolds the project; this section orients a human, it does not specify a generator. |
+          | 8. Testing Strategy | 1.8 KB | 0.8 KB | Exactly three `###` subsections - happy path, business exceptions, system errors - each a compact table. |
+          | 9. Next Steps | 0.5 KB | 0.4 KB | Already right. |
+
+          The budget is spent on the sections the Development stage reads to build the
+          workflow - 2, 3, 4 and 5. It is not spent on restating the PDD, the
+          considerations file, or the platform's own documentation.
+
+          Do NOT expand Testing Strategy into acceptance-criteria matrices, test-data
+          appendices or eval-set scaffolding: the project's own eval/test mechanism
+          owns those, and the build stage reads the code, not this section.
+
+          Two things the budget does NOT license. Do not drop a required section to
+          make room - all nine are mandatory and the validator fails a missing one.
+          Do not thin a table to hit a number: a step, a field, a business rule or a
+          call that the PDD names must appear, and it is the PROSE around the tables
+          that gives way.
+
+
+          ## Keep Error Handling proportionate - it is not a licence to invent
+
+          `Error Handling` is a mandatory section, but a mandatory section does NOT
+          mean mandatory complexity. It documents how the process behaves when
+          something the PDD describes goes wrong. It is not an invitation to design
+          a resilience layer nobody asked for.
+
+          Apply `architectural-considerations.md` §8 (Design simplicity) here:
+
+          - **A failure mode the PDD does not name does not belong in this section.**
+            If the PDD says nothing about the source system being flaky, the SDD does
+            not specify retries for it. Write "No retry specified - the PDD describes
+            no transient-failure behaviour for this system" and move on. That is a
+            complete, correct answer.
+          - **Prefer the platform's own mechanism over designed-in control flow.** For
+            an API Workflow, transient HTTP failure is `httpRetryConfig` at the
+            workflow level - one config block. Do NOT specify a `Do_While` + `Wait` +
+            attempt-counter retry loop; that is three activities and a variable to
+            express what the runtime already does, and the build stage will faithfully
+            construct all of it.
+          - **One failure boundary is the default.** A single catch at the edge of the
+            process that reports and stops. Per-call `Try/Catch` needs a named business
+            fallback that differs from failing the run - otherwise it is noise.
+          - **Do not multiply terminal outcomes.** Each distinct outcome the SDD names
+            becomes a branch, a variable and a Response activity in the build. Name an
+            outcome only when a human does something different because of it.
+          - Cap: this section is a compact table - failure, detection, response, who is
+            told. If it needs more than that, the process genuinely is that complex and
+            the section itself must say which PDD statement forced it.
+
+          The same restraint applies to `Execution Flow`: it describes the happy path
+          plus the deviations the PDD names, in the fewest steps that express the
+          process. Every step you write becomes an activity someone has to build,
+          validate and maintain.
+
+
+          ## What "ready for development" means
+
+          This is the difference between a document and a design. Every one of these:
+
+          - **Traceability.** Every `BR-xx` from the current PDD appears in the SDD's
+            business-rules table with the step or component that enforces it. Every
+            business exception and system error from the PDD maps to a handler. Every
+            field in the PDD's data definitions appears in the SDD's schema.
+          - **Steps typed to executors.** Each process step says which project, workflow
+            or node performs it, and which application it touches. A developer must never
+            have to guess where a step lives.
+          - **Concrete schemas.** Queue item schemas, input/output arguments, entity or
+            data-object shapes, config keys - written out with names and types, not
+            described in prose.
+          - **Named resources.** Assets, credentials, queues, storage buckets, connections
+            with the exact names to create in Orchestrator, and who owns each value.
+            Names follow the process name; never invent a credential value.
+          - **Project structure.** The folder/file layout, the workflow inventory with one
+            line of purpose each, and the dependency direction between them.
+          - **Packages.** The dependency list per project, and Integration Service versus
+            NuGet where both could serve.
+          - **Testing Strategy is mandatory and thorough** - happy path assertions, edge
+            cases, every business exception, every system error, non-functional checks,
+            UAT acceptance criteria, and an end-to-end test when more than one project is
+            involved. Never offer "happy path only".
+          - **Environments.** DEV / UAT / PROD differences, robot attendance and why,
+            concurrency, and the runtime prerequisites.
+
+          EOF_GUIDANCE
+          echo "sdd-guidance.md: $(wc -c < "$WORK_DIR/sdd-guidance.md") bytes"
+
       - name: Run uipath-architect agent
         uses: anthropics/claude-code-base-action@beta
         with:
@@ -1168,351 +1500,13 @@ jobs:
             Adopted SDD:                ${{ needs.identify.outputs.adopted }}  (empty = first design)
             Today:                      run `date +%F` - use that as the generation date.
 
-            ## Step 0 - load the planner skill if it is installed
+            ## Step 0 - read your instructions
 
-            Run `ls ~/.claude/skills`. If `uipath-planner` is there, READ
-            `~/.claude/skills/uipath-planner/SKILL.md` with the Read tool - NEVER via the
-            Task tool, whose subagent spawn fails here with
-            `404 not_found_error - model: claude-sonnet-4-20250514` - then for every file
-            in `sdd_files` LOCATE the
-            template it names by searching for it - the package nests some templates one
-            level deeper than others, so search rather than assume a flat path:
-
-                find ~/.claude/skills/uipath-planner/assets/templates -name '<template-name>'
-
-            READ the template you find and follow it exactly - its headings, its tables, its
-            placeholder semantics. The template is the authority. Your generated H2/H3
-            heading set MUST be a SUPERSET of the template's: a missing template heading is a
-            defect you fix, never an `[ARCHITECT REVIEW]` line.
-
-            Follow Phase D **Phase 3** in AUTONOMOUS mode. Never ask a question.
-
-            If the skill is NOT installed, use the section lists in Step 2 below.
-
-            ## Step 1 - read everything
-
-            Read architecture.json in full. It decides scope, products, projects, queues,
-            components, file paths and templates - do NOT re-open those decisions. If you
-            believe a decision is wrong, write the SDD as decided and mark your objection
-            inline with `[ARCHITECT REVIEW]` where it bites.
-
-            Its `architect_review_items[]` is the PDD's own open-questions list copied
-            forward verbatim, NOT a list of things that are still open. Several of those
-            questions are answered outright by the considerations file below - the PDD
-            asked them before anyone had read it. Carry an item into the document only
-            after checking it there and finding no answer. An item the considerations
-            file settles is written as a FACT with its source, not as a marker.
-
-            Read `considerations_markdown` from the manifest - the org's platform facts
-            and house preferences, and AUTHORITATIVE. The derivation step already applied
-            it to the architecture; you apply it to the DOCUMENT:
-
-            - A plain value there is a CONFIRMED FACT. Write it as fact - delivery model,
-              region, folder structure, logging target, system base URLs, auth pattern.
-              Never emit an `[ARCHITECT REVIEW]` for something this file answers, even
-              when the PDD marked the same thing `[SME REVIEW]`; the PDD did not know.
-              Cite "org architectural considerations" inline as the source, in the
-              section that states the fact.
-
-              Concretely - these are ANSWERED, and a marker on any of them is a defect
-              however the PDD marked it:
-                * delivery model, region, tenant version, folder structure (§1)
-                * which products are licensed and which are blocked (§2)
-                * for every system in §4's connection table: that the connection
-                  already EXISTS, its name, its id, its connector key, and that the
-                  interface is that connector's REST API rather than a UI
-                * the call shape for those systems - an HTTP Request activity with
-                  connector authentication, a RELATIVE resource path, and no token
-                  anywhere in the document (§4)
-                * the Slack destination, which is a member id, never an email (§4)
-                * the resource naming rules (§4)
-
-              This is not a style note. The last run wrote markers on three of these,
-              then spent 56 seconds of wall clock grepping them back out of a file it
-              had just written. Decide it once, as you write the line.
-            - `[UNCONFIRMED]` there means unanswered: normal default plus an inline
-              `[ARCHITECT REVIEW]` marker.
-            - Its naming rules are BINDING and the validator checks them. Every asset,
-              credential, queue, bucket and connection is `<epic_key>_<thing>`, lowercase
-              with underscores, where the epic key is the REPOSITORY name's prefix - not
-              the story key, not the process name. The solution name, the deployment
-              name and the Orchestrator sub-folder are all the one string
-              `<process-base>-<epic-number>`, and the API Workflow project inside the
-              solution is `<process-base>-api`. Both are already decided for you and
-              carried in architecture.json as `solution_name` and `projects[0].name` -
-              use those values verbatim and never re-derive them.
-            - An Integration Service connection being *available* is not the same as it
-              *existing*: record each named connection as a deployment prerequisite a
-              human must create and authorise.
-            - Never invent a value it does not contain, and never put a credential value
-              in the document - name the asset and its owner.
-
-            Read every PDD in the manifest. The document you write must account for ALL of
-            the current PDD's content: every step in its section 7, every `BR-xx` in its
-            section 9, every business exception, every system error, every field in its
-            section 12, every concrete value in its section 15. A PDD business rule that
-            appears nowhere in the SDD is a hole in the design.
-
-            On a revision run, read every prior SDD and UPDATE it in place rather than
-            replacing it: keep section structure and reviewed content, change what the new
-            PDD changed, and add a Document History row (version +0.1, or +1.0 when the
-            architecture moved) whose comment names the change request.
-
-            "In place" is literal. `sdd_files[].path` already points at the ADOPTED file
-            when there is one, so you are editing that document, not writing a new one
-            beside it. Do NOT create a second SDD under a different name, and do not
-            delete or rename the adopted one. Where the adopted document predates the
-            current rules - process-name-prefixed resource names, `[SME REVIEW]` markers,
-            another product's artifacts - fix those as part of the revision; they are
-            defects in a document you now own, not history to preserve.
-
-            ## Step 2 - write the SDD(s)
-
-            Write each `sdd_files[].path`. Nothing else. Universal front matter, in this
-            order, for EVERY file - the handoff block must stay inside the first 50 lines
-            because that is all the downstream planner reads to detect it:
-
-                # Solution Design Document — <process or project name>
-
-                ## Document History
-
-                | Date | Version | Author | Role | Comments |
-                (one row per revision, newest last)
-
-                <!-- DO NOT RENAME: uipath-planner detects SDDs via this exact heading or the marker below. -->
-                <!-- planner-handoff:v1 -->
-                ## Planner Handoff
-
-                | Field | Value |
-                |---|---|
-                | **Status** | ready |
-                | **Execution autonomy** | autonomous |
-                | **Delivery model** | <from architecture.json> |
-                | **SDD scope** | <single-product | solution> |
-                | **Project list section** | <the section number holding the project list> |
-                | **Tasks file** | `<tasks_file from architecture.json>` |
-                | **Generated by** | uipath-planner |
-                | **Generation date** | <YYYY-MM-DD> |
-                | **Template validation** | passed |
-
-            Nothing else between the handoff table and the numbered body.
-
-            ## Sections the template contains that you must NOT write
-
-            The template you are handed still carries these. Skip them - every byte you
-            write is a second on the demo clock, and each of these restates something
-            a machine-readable file already holds:
-
-            - `## Decisions Made` - architecture.json already carries `decisions[]`, and
-              it is committed alongside this SDD.
-            - `## Recommended Scope` - architecture.json already carries `sdd_scope`,
-              `projects[]`, `blocked_products[]` and `need_profile`.
-            - `## Action Required — Architect Review Items` - architecture.json already
-              carries `architect_review_items[]`. Keep the inline `[ARCHITECT REVIEW]`
-              markers where the open question actually bites; drop only the summary table.
-            - `### Out of Scope` under section 1 - the PDD owns the scope boundary and
-              the build stage never reads this back.
-            - The whole of `## Security & Authentication`, including its
-              `### Rate Limits` and `### Non-Functional Requirements` subsections. Its
-              rows cite their own sources - "org considerations §7", "§1", "(BR-08)" -
-              which makes it a table of pointers, and its external-systems table repeats
-              the connection rows in `Connectors & External Calls`. A `[DEFAULT]` row
-              saying "standard API rate limits apply" tells a developer nothing. If a
-              real, named rate limit constrains the design, state it in that connector's
-              own row in section 5 instead.
-
-            ## Never re-type the org's fixed JSON
-
-            `architectural-considerations.md` §4 carries the canonical HTTP Request
-            activity shape, its `bindings_v2.json` entry and the solution
-            connection-resource file, and marks their fields "fixed - byte for byte".
-            Do NOT copy any of them into the SDD. A previous SDD spent 4,450 bytes -
-            two thirds of its entire Connectors section - re-typing those three blocks.
-
-            Two reasons, and the second one matters more than the clock:
-
-            - The build stage reads `architectural-considerations.md` directly, and
-              `validate-build.sh` judges the built workflow against §4 - never against
-              the SDD's copy. A copy that drifts sends the developer one way while the
-              validator marks it wrong the other.
-            - It is a design document. Its job is to say WHICH connector, WHICH
-              connection id and WHICH endpoint each step calls. The byte-level shape of
-              the activity is the build stage's business.
-
-            So in Connectors & External Calls, write the connector key, the connection
-            name, the connection id, the operation, the endpoint and the parameters as
-            table rows, then one line: "Activity shape, `bindings_v2.json` entry and
-            connection-resource file: `docs/architectural-considerations.md` §4,
-            verbatim." No fenced JSON.
-
-            For a `solution-root` file add these handoff rows too: `Solution root SDD` (its
-            own filename), `Solution ID`, `Project SDD role: root`. Every `project` file
-            carries `Solution root SDD` pointing at the root, the SAME `Solution ID`, the
-            SAME `Tasks file`, `Project SDD role: child` and
-            `Independently executable | no — Lane A derives tasks only via the Solution root`.
-
-            Then the numbered body sections. Use `## <n>. <Name>` exactly, numbered from 1,
-            contiguous, in this order, every one present with real content:
-
-            **solution-overview**
-            1. Solution Overview · 2. Project Inventory · 3. Cross-Project Data Flow ·
-            4. Shared Assets & Queues · 5. Per-Project SDD Index · 6. Next Steps
-
-            **rpa-sdd-template.md**
-            1. Process Overview · 2. Process Map · 3. Detailed Process Steps ·
-            4. Business Rules · 5. Data Definitions · 6. Value Mappings ·
-            7. Exception Handling · 8. Error Handling · 9. Application Inventory ·
-            10. Master Project Architecture · 11. Project Structure · 12. Queue Architecture ·
-            13. Implementation Mode · 14. Packages · 15. Credentials & Assets ·
-            16. Deployment Environment · 17. Testing Strategy · 18. Next Steps
-
-            **flow-sdd-template.md**
-            1. Flow Overview · 2. Flow Diagram · 3. Nodes Inventory · 4. Variables ·
-            5. Subflows · 6. Triggers · 7. Integrated Components · 8. Error Handling ·
-            9. Project Structure · 10. Testing Strategy · 11. Next Steps
-
-            **bpmn-sdd-template.md**
-            1. Process Overview · 2. Process Diagram · 3. Pools & Lanes ·
-            4. Activities Inventory · 5. Gateways & Sequence Flows · 6. Events ·
-            7. Data Objects & Variables · 8. Subprocesses & Call Activities ·
-            9. Integrated Components · 10. Error Handling & Retry · 11. Triggers ·
-            12. Project Structure · 13. Testing Strategy · 14. Next Steps
-
-            **case-sdd-template.md**
-            1. Case Overview · 2. Case Lifecycle Diagram · 3. Stages · 4. Tasks Grid ·
-            5. Entry / Exit Conditions · 6. Business Rules · 7. Data Definitions ·
-            8. SLA Rules · 9. Escalations · 10. Exception Handling ·
-            11. Compliance Constraints · 12. Roles & RACI Matrix · 13. Task Type Registry ·
-            14. Integrated Components · 15. Project Structure · 16. Testing Strategy ·
-            17. Next Steps
-
-            **agent-sdd-template.md**
-            1. Agent Overview · 2. Agent Framework · 3. Tools · 4. Memory / RAG ·
-            5. Evaluation Criteria · 6. Orchestrator Bindings ·
-            7. Error Handling & Escalation · 8. Integrated Components ·
-            9. Project Structure · 10. Testing Strategy · 11. Next Steps
-
-            **coded-app-sdd-template.md**
-            1. App Overview · 2. App Type & Tech Stack · 3. Pages & Routes · 4. Components ·
-            5. State Management · 6. API Integration · 7. User Flows · 8. Error Handling ·
-            9. Integrated Components · 10. Project Structure · 11. Testing Strategy ·
-            12. Next Steps
-
-            **api-workflow-sdd-template.md**
-            1. API Workflow Overview · 2. Input Schema · 3. Output Schema ·
-            4. Execution Flow · 5. Connectors & External Calls · 6. Error Handling ·
-            7. Project Structure · 8. Testing Strategy · 9. Next Steps
-
-            For this template the sections `Performance & Scaling`, `Consumers` and
-            `Security & Authentication` are DELIBERATELY OMITTED - do not emit them even
-            if the template file lists them. They are the case where the generated SDD is
-            a subset of its template. Nothing is lost by dropping
-            `Security & Authentication`: which connection each call uses and where its
-            credentials live is already a row in `Connectors & External Calls`, and the
-            credential policy, logging target, data residency and runtime environment are
-            stated once, authoritatively, in `architectural-considerations.md` §4, §5 and
-            §7 - which the build stage reads directly. Numbering stays contiguous from 1,
-            so renumber the sections after it; the validator rejects a gap.
-
-            ## Length budget - this is a contract, not a suggestion
-
-            You write this document in ONE `Write` call, and that call streams at about
-            46 characters per second. The last SDD was 19,090 characters, so the write
-            alone took 114 seconds - more than half the whole stage. Every character you
-            do not write is time the demo gets back, and none of the cuts below lose
-            anything the build stage reads.
-
-            Whole document: aim for **12 KB, hard ceiling 14 KB**. Per section, measured
-            against the last run so you can see where the weight actually is:
-
-            | Section | Last run | Budget | What changes |
-            | --- | --- | --- | --- |
-            | 1. API Workflow Overview | 3.1 KB | **1.2 KB** | It restates the PDD. A short paragraph plus the trigger, the schedule and the one-line outcome. No re-narration of the business problem. |
-            | 2. Input Schema | 1.1 KB | 1.1 KB | Already right. One table. |
-            | 3. Output Schema | 1.9 KB | 1.4 KB | One table. Drop the prose around it. |
-            | 4. Execution Flow | 3.1 KB | **2.8 KB** | The core of the document - do NOT squeeze this one. Every step, its activity type, its inputs and its outputs. |
-            | 5. Connectors & External Calls | 1.6 KB | 1.2 KB | One row per call. The patterns live in considerations §4; point at it, do not restate it. |
-            | 6. Error Handling | 1.9 KB | 0.9 KB | The PDD says no retry and no error notification. Saying that plainly is the complete answer. |
-            | 7. Project Structure | 3.4 KB | **1.0 KB** | A file tree and one short table, at least 10 lines. `uip` scaffolds the project; this section orients a human, it does not specify a generator. |
-            | 8. Testing Strategy | 1.8 KB | 0.8 KB | Exactly three `###` subsections - happy path, business exceptions, system errors - each a compact table. |
-            | 9. Next Steps | 0.5 KB | 0.4 KB | Already right. |
-
-            The budget is spent on the sections the Development stage reads to build the
-            workflow - 2, 3, 4 and 5. It is not spent on restating the PDD, the
-            considerations file, or the platform's own documentation.
-
-            Do NOT expand Testing Strategy into acceptance-criteria matrices, test-data
-            appendices or eval-set scaffolding: the project's own eval/test mechanism
-            owns those, and the build stage reads the code, not this section.
-
-            Two things the budget does NOT license. Do not drop a required section to
-            make room - all nine are mandatory and the validator fails a missing one.
-            Do not thin a table to hit a number: a step, a field, a business rule or a
-            call that the PDD names must appear, and it is the PROSE around the tables
-            that gives way.
-
-            ## Keep Error Handling proportionate - it is not a licence to invent
-
-            `Error Handling` is a mandatory section, but a mandatory section does NOT
-            mean mandatory complexity. It documents how the process behaves when
-            something the PDD describes goes wrong. It is not an invitation to design
-            a resilience layer nobody asked for.
-
-            Apply `architectural-considerations.md` §8 (Design simplicity) here:
-
-            - **A failure mode the PDD does not name does not belong in this section.**
-              If the PDD says nothing about the source system being flaky, the SDD does
-              not specify retries for it. Write "No retry specified - the PDD describes
-              no transient-failure behaviour for this system" and move on. That is a
-              complete, correct answer.
-            - **Prefer the platform's own mechanism over designed-in control flow.** For
-              an API Workflow, transient HTTP failure is `httpRetryConfig` at the
-              workflow level - one config block. Do NOT specify a `Do_While` + `Wait` +
-              attempt-counter retry loop; that is three activities and a variable to
-              express what the runtime already does, and the build stage will faithfully
-              construct all of it.
-            - **One failure boundary is the default.** A single catch at the edge of the
-              process that reports and stops. Per-call `Try/Catch` needs a named business
-              fallback that differs from failing the run - otherwise it is noise.
-            - **Do not multiply terminal outcomes.** Each distinct outcome the SDD names
-              becomes a branch, a variable and a Response activity in the build. Name an
-              outcome only when a human does something different because of it.
-            - Cap: this section is a compact table - failure, detection, response, who is
-              told. If it needs more than that, the process genuinely is that complex and
-              the section itself must say which PDD statement forced it.
-
-            The same restraint applies to `Execution Flow`: it describes the happy path
-            plus the deviations the PDD names, in the fewest steps that express the
-            process. Every step you write becomes an activity someone has to build,
-            validate and maintain.
-
-            ## What "ready for development" means
-
-            This is the difference between a document and a design. Every one of these:
-
-            - **Traceability.** Every `BR-xx` from the current PDD appears in the SDD's
-              business-rules table with the step or component that enforces it. Every
-              business exception and system error from the PDD maps to a handler. Every
-              field in the PDD's data definitions appears in the SDD's schema.
-            - **Steps typed to executors.** Each process step says which project, workflow
-              or node performs it, and which application it touches. A developer must never
-              have to guess where a step lives.
-            - **Concrete schemas.** Queue item schemas, input/output arguments, entity or
-              data-object shapes, config keys - written out with names and types, not
-              described in prose.
-            - **Named resources.** Assets, credentials, queues, storage buckets, connections
-              with the exact names to create in Orchestrator, and who owns each value.
-              Names follow the process name; never invent a credential value.
-            - **Project structure.** The folder/file layout, the workflow inventory with one
-              line of purpose each, and the dependency direction between them.
-            - **Packages.** The dependency list per project, and Integration Service versus
-              NuGet where both could serve.
-            - **Testing Strategy is mandatory and thorough** - happy path assertions, edge
-              cases, every business exception, every system error, non-functional checks,
-              UAT acceptance criteria, and an end-to-end test when more than one project is
-              involved. Never offer "happy path only".
-            - **Environments.** DEV / UAT / PROD differences, robot attendance and why,
-              concurrency, and the runtime prerequisites.
+            `${{ env.WORK_DIR }}/sdd-guidance.md` is the rest of this prompt: how to read the
+            inputs, what each section must contain, the length budget you write to, and what
+            "ready for development" means. Read it IN FULL with the Read tool, first, before
+            any other tool call. It is not reference material you consult if stuck - it is the
+            instruction set, and the validator that runs after you enforces what it says.
 
             ## Hard rules
 
@@ -1552,6 +1546,7 @@ jobs:
               wrap a document in a code fence.
             - Write ONLY the paths in `sdd_files`. Do NOT touch anything under
               ${{ env.WORK_DIR }}. Do NOT run git, gh, or `uip login`.
+
 
             ## Step 3 - self-check before you finish
 
