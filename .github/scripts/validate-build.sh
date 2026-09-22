@@ -152,11 +152,87 @@ for key, act in walk(doc):
                         f"the HTTP connector's own operation. The verb and URL of YOUR call go in "
                         f"bodyParameters.method and bodyParameters.url.")
 
-    url = str(bp.get("url", ""))
+    url  = str(bp.get("url", ""))
+    path = str(bp.get("path", ""))
     if not url:
-        problems.append(f"{key}: bodyParameters.url is required - it is the address being called.")
+        problems.append(f"{key}: bodyParameters.url is required - it is the resource path being called.")
     if not bp.get("method"):
         problems.append(f"{key}: bodyParameters.method is required - the verb of your call.")
+
+    # The connection already knows its base URL. An absolute URL here arrives EMPTY in
+    # Studio Web - it validates, it packs, and the request URL field is blank at run
+    # time. A shipped solution had to be opened and fixed by hand for this.
+    if url.startswith(("http://", "https://")):
+        problems.append(f"{key}: bodyParameters.url is the absolute URL {url!r}. It must be the "
+                        f"resource path RELATIVE to the connector's base URL - e.g. 'invoices', "
+                        f"not 'https://.../api/invoices'. An absolute URL lands empty in the "
+                        f"designer. See architectural-considerations.md §4.")
+    elif url.startswith("/"):
+        problems.append(f"{key}: bodyParameters.url {url!r} has a leading slash - drop it "
+                        f"('invoices', not '/invoices').")
+    if not path:
+        problems.append(f"{key}: bodyParameters.path is required and must carry the same "
+                        f"relative resource path as bodyParameters.url.")
+    elif path != url:
+        problems.append(f"{key}: bodyParameters.path {path!r} and bodyParameters.url {url!r} "
+                        f"must be the same relative resource path.")
+
+    # Slack takes a member/channel ID. An email is accepted by the document, the SDD and
+    # the build, and rejected by Slack at run time.
+    if "slack" in target.lower():
+        body = json.dumps(bp.get("body", ""))
+        m = re.search(r"channel\s*:\s*['\"]?([^'\",}\s]+)", body)
+        if m and "@" in m.group(1):
+            problems.append(f"{key}: Slack channel is {m.group(1)!r}, an email address. "
+                            f"chat.postMessage needs a member ID or channel ID (e.g. WLX9BD8FN). "
+                            f"See architectural-considerations.md §4.")
+
+# ── activity names are resolved as exact strings, case included ─────────────
+# `$context.outputs.http_request_slack` against an activity named
+# HTTP_Request_Slack reads undefined: no build error, no validate error, a
+# confusing failure at run time. A shipped solution needed this fixed by hand.
+raw = open(wf_path, encoding="utf-8").read()
+
+def named(node):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(v, dict) and isinstance(v.get("export"), dict):
+                yield k, v
+            if isinstance(v, (dict, list)):
+                yield from named(v)
+    elif isinstance(node, list):
+        for item in node:
+            yield from named(item)
+
+# Built from the DECODED export strings: in the raw file their quotes are escaped
+# (\"Name\": $output), so a regex over the file text silently finds nothing.
+exported = set()
+for _k, _a in named(doc):
+    exported.update(re.findall(r'"([A-Za-z_][A-Za-z0-9_]*)"\s*:\s*\$output',
+                               (_a.get("export") or {}).get("as", "")))
+
+for key, act in named(doc):
+    as_ = (act.get("export") or {}).get("as", "")
+    own = re.findall(r'"([A-Za-z_][A-Za-z0-9_]*)"\s*:\s*\$output', as_)
+    if not own:
+        continue                       # exports variables, not a named output
+    base = key.split("#")[0]           # If_1#Wrapper exports as "If_1"
+    if base not in own:
+        problems.append(f"{key}: its export writes outputs.{own[0]!r} but the activity is "
+                        f"named {base!r}. The export key is the activity name character for "
+                        f"character, same case.")
+
+for ref in sorted(set(re.findall(r'\$context\??\.outputs\??\.([A-Za-z_][A-Za-z0-9_]*)', raw))):
+    if ref in exported:
+        continue
+    same = [e for e in exported if e.lower() == ref.lower()]
+    if same:
+        problems.append(f"$context.outputs.{ref} does not exist - the activity exports "
+                        f"{same[0]!r}. Activity names are CASE SENSITIVE; this reads undefined "
+                        f"at run time and fails nothing until then.")
+    else:
+        problems.append(f"$context.outputs.{ref} does not exist - no activity exports that "
+                        f"name. Exported names are: {', '.join(sorted(exported)) or '(none)'}.")
 
 for p in problems: print(f"::error::{wf_path} {p}")
 sys.exit(1 if problems else 0)

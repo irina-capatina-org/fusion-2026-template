@@ -35,6 +35,10 @@ FAILURES=0
 fail() { echo "::error::$*"; FAILURES=$((FAILURES + 1)); }
 ok()   { echo "  ok  - $*"; }
 
+# THE TARGET SHAPE, fixed for this programme: a UiPath SOLUTION containing exactly
+# ONE API Workflow project. `sdd_scope: single-product` means one PROJECT INSIDE that
+# solution - it has never meant "no solution". Everything here still ships a solution.
+#
 # ── architecture.json ────────────────────────────────────────────────────────
 if [ ! -f "$ARCH_FILE" ]; then
   fail "architecture.json not found: $ARCH_FILE"

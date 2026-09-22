@@ -129,6 +129,10 @@ check_document_history() {
   fi
 }
 
+# THE TARGET SHAPE, fixed for this programme: a UiPath SOLUTION containing exactly
+# ONE API Workflow project. `sdd_scope: single-product` means one PROJECT INSIDE that
+# solution - it has never meant "no solution". Everything here still ships a solution.
+#
 # ── the section contract, per template ────────────────────────────────────────
 # Kept in sync with uipath-planner assets/templates/*. A generated SDD must be a
 # SUPERSET of its template's numbered sections - extra sections are fine, a
