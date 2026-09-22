@@ -181,7 +181,14 @@ Everything here is fixed except the five marked lines. Copy it, change those, do
 ```
 
 The Slack call is the same activity with four lines different — target connector,
-connection, verb and path — and the payload in `body`:
+connection, verb and path — and the payload in `body`.
+
+> **`body` below is deliberately shortened so the activity shape stays readable. It is
+> NOT the payload you ship.** The real value of `bodyParameters.body` is the full Block
+> Kit payload in *"The Slack message is Block Kit, and it goes in `body`"* further down
+> this section — read that before you write this activity. A build that copies the
+> one-line `text:` form below and stops produces the unformatted wall-of-prose message
+> the Block Kit subsection exists to prevent. That has now happened on a real run.
 
 ```json
 {
@@ -200,7 +207,7 @@ connection, verb and path — and the payload in `body`:
         "method": "POST",
         "path": "chat.postMessage",
         "url": "chat.postMessage",
-        "body": "${{ channel: 'WLX9BD8FN', text: $context.variables.message }}"
+        "body": "${{ /* SHORTENED - ship the Block Kit payload below */ }}"
       }
     },
     "export": {
@@ -439,19 +446,46 @@ say so plainly and stop, rather than inventing a name for one.
 
 ### Naming — derived from the repository, never from the process name
 
-The repository name IS the solution name, and its prefix IS the epic key:
+Everything is derived from the repository name, whose prefix IS the epic key:
 
 ```
-repository / solution name   jactiv-572-no-po-invoice-chaser
+repository name              jactiv-572-no-po-invoice-chaser
 epic key                     jactiv-572
+epic number                  572
+process base                 no-po-invoice-chaser     (repo name minus the epic prefix)
+solution / deployment name   no-po-invoice-chaser-572 (process base + epic number)
+API Workflow project name    no-po-invoice-chaser-api
 resource prefix              jactiv_572_
 ```
 
 | Thing | Rule | Example |
 |---|---|---|
-| Solution name | = the repository name, verbatim | `jactiv-572-no-po-invoice-chaser` |
+| Solution name | `<process-base>-<epic-number>` | `no-po-invoice-chaser-572` |
+| Deployment name, and so the Orchestrator sub-folder | the same string as the solution | `no-po-invoice-chaser-572` |
+| The API Workflow project inside it | `<process-base>-api` | `no-po-invoice-chaser-api` |
+| …and that one string appears in three places | the project directory, `project.uiproj`'s `"Name"`, and `resources/solution_folder/process/api/<name>.json` | all three read `no-po-invoice-chaser-api` |
 | Every asset, credential, queue and bucket | `<epic_key>_<thing>`, lowercase, underscores | `jactiv_572_invoice_status`, `jactiv_572_coupa_api_key` |
 | Connections | **never named here — they already exist**, see the table above | `coupa-uipath-test` |
+
+**What Orchestrator actually displays.** The solution and its folder take the deployment
+name; the process takes `project.uiproj`'s `"Name"`, NOT the directory it sits in and
+NOT the solution name. Get that field wrong and the repository and the tenant read
+different names for the same thing — one build shipped `jactiv-707-no-po-invoice-chaser`
+in git showing as `NoPoInvoiceChaser` in Orchestrator, with the solution and the process
+swapped relative to each other. `uipath-develop` now fails the build unless the
+directory, the `"Name"` field and the process resource all carry the same string.
+
+Two deployments do not collide on the project name: each deployment gets its own
+Orchestrator folder, and processes are scoped to the folder. Only the SOLUTION name has
+to be globally unique, which is what the epic number is for.
+
+**Why the epic number is on the end of the solution name.** `uip solution deploy run`
+names the Orchestrator sub-folder after the deployment, and refuses to create one that
+already exists. Two epics of the same process — a change request, a re-run, a rehearsal
+— would collide on a bare `no-po-invoice-chaser`, and the pipeline would be forced down
+the upgrade path instead of producing a clean, separately inspectable deployment. The
+epic number makes each lifecycle its own folder. Do not drop it, and do not substitute
+the story key: a lifecycle has one epic but a different story per stage.
 
 **Use the EPIC key, never a stage story key.** A lifecycle has one epic and one story
 per stage — analysis, architecture, docs, development each carry a different key. If a
