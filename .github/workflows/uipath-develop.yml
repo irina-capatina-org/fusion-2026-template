@@ -269,8 +269,13 @@ jobs:
   # job so the build has a written plan to work against rather than improvising,
   # and so a reviewer can see what the agent thought it was going to do.
   # ═══════════════════════════════════════════════════════════════
-  derive-tasks:
-    name: Derive tasks
+  # 3. Build
+  # The heaviest agent step in the chain. It writes real project code under code/,
+  # then commits - Test runs against what was committed, not against a workspace
+  # only this job could see.
+  # ═══════════════════════════════════════════════════════════════
+  build:
+    name: Build
     needs: identify
     runs-on: ubuntu-latest
     steps:
@@ -279,12 +284,31 @@ jobs:
           ref: ${{ needs.identify.outputs.branch }}
           fetch-depth: 1
 
-      - name: Install UiPath skills
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install UiPath CLI and skills
         id: skills
         continue-on-error: true
         run: |
           set -uo pipefail
           npm i -g "@uipath/cli@${CLI_VERSION}" || { echo "::warning::@uipath/cli install failed"; exit 1; }
+          # Freeze the CLI. `npm i -g @uipath/cli@1.202.0` installs 1.202.0 and then the
+          # CLI's own daily auto-updater pulls the newest patch in the line on first use -
+          # a run logged "Update succeeded: @uipath/cli 1.202.0 -> 1.202.1" in two separate
+          # jobs. That is ~10s a job, and worse, it means a UiPath patch released between
+          # the rehearsal and the stage changes the CLI mid-demo.
+          # An EXACT three-part pin sets core.version and the updater short-circuits with
+          # "Daily auto-update skipped: exact pin (frozen)". A two-part value (1.202) pins
+          # the LINE and still updates, so CLI_VERSION must stay major.minor.patch.
+          case "$CLI_VERSION" in
+            *.*.*) uip config set version "$CLI_VERSION" --output json >/dev/null 2>&1 \
+                     && echo "CLI frozen at $CLI_VERSION (auto-update disabled)" \
+                     || echo "::warning::could not pin the CLI; it may auto-update mid-run" ;;
+            *) echo "::warning::CLI_VERSION '$CLI_VERSION' is not major.minor.patch - the CLI will auto-update within its line." ;;
+          esac
+          uip --version
           # --path must already exist; the CLI refuses to create it and fails with
           # "Path does not exist or is not a directory".
           mkdir -p "$RUNNER_TEMP/uip-skills"
@@ -294,6 +318,11 @@ jobs:
           cp -R "$RUNNER_TEMP/uip-skills/.agents/skills/." "$HOME/.claude/skills/"
           ls -1 "$HOME/.claude/skills"
 
+      # Task derivation used to be its own job that uploaded WORK_DIR for this one to
+      # download. Both jobs installed the CLI and the skills, both checked the branch
+      # out, and the artifact existed only to cross the boundary - about 35 seconds of
+      # runner time to hand over one markdown file that the next step reads immediately.
+      # The upload stays, because the Test job downloads the same artifact.
       - name: Run uipath-planner agent
         uses: anthropics/claude-code-base-action@beta
         with:
@@ -389,47 +418,6 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # ═══════════════════════════════════════════════════════════════
-  # 3. Build
-  # The heaviest agent step in the chain. It writes real project code under code/,
-  # then commits - Test runs against what was committed, not against a workspace
-  # only this job could see.
-  # ═══════════════════════════════════════════════════════════════
-  build:
-    name: Build
-    needs: [identify, derive-tasks]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.identify.outputs.branch }}
-          fetch-depth: 1
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: design
-          path: ${{ env.WORK_DIR }}
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Install UiPath CLI and skills
-        id: skills
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          npm i -g "@uipath/cli@${CLI_VERSION}" || { echo "::warning::@uipath/cli install failed"; exit 1; }
-          uip --version
-          # --path must already exist; the CLI refuses to create it and fails with
-          # "Path does not exist or is not a directory".
-          mkdir -p "$RUNNER_TEMP/uip-skills"
-          uip skills install --agent codex --path "$RUNNER_TEMP/uip-skills" \
-            || { echo "::warning::uip skills install failed"; exit 1; }
-          mkdir -p "$HOME/.claude/skills"
-          cp -R "$RUNNER_TEMP/uip-skills/.agents/skills/." "$HOME/.claude/skills/"
-          ls -1 "$HOME/.claude/skills"
-
       - name: Run uipath-developer agent
         uses: anthropics/claude-code-base-action@beta
         with:
@@ -507,6 +495,14 @@ jobs:
             including its table of non-obvious rules, before you write the Slack
             activity:
 
+            - **`${{ ... }}` already opens the object - do NOT add another `{ }`.** The
+              outer brace is the `${ }` expression delimiter, the inner one is the
+              object literal. Write `${{ channel: '...', text: `...`, blocks: [...] }}`.
+              Pasting a JSON payload in whole gives `${{ { ... } }}`, which is a
+              SyntaxError at run time - after the build and the deploy have both gone
+              green. That has happened on a real run. It is an EXPRESSION, not JSON:
+              unquoted keys, single quotes or backticks, `${$context.variables.x}` for
+              interpolation. `validate-build.sh` fails the build on the doubled brace.
             - `channel` is the member id from §4's table, never an email address
             - top-level `text` must be present - with `blocks` it is the push
               notification, and omitting it renders "This content can't be displayed"
@@ -630,6 +626,35 @@ jobs:
 
             `.uipx` and `resources/solution_folder/` are generated. Never hand-edit
             either; they desync and fail silently. Use `projects add` / `remove`.
+
+            ## Step 1.8 - run the runnability gate yourself, and fix what it says
+
+            This is not optional and it is not the Test stage's job to do for you.
+
+            ```
+            bash .github/scripts/validate-build.sh ${{ env.CODE_DIR }} \
+                 ${{ env.DOCS_DIR }}/architectural-considerations.md
+            ```
+
+            It must exit clean. Fix every `::error::` it reports and run it again,
+            until it does. Warnings are advisory; errors are not.
+
+            Before you run it, walk your `Workflow.json` against
+            **§4 "Before you say the build is finished"** in
+            `${{ env.DOCS_DIR }}/architectural-considerations.md` - it is a short list
+            and every line on it is a defect that has actually shipped here. The gate
+            checks the same things, so reading the list first usually means the gate
+            passes first time.
+
+            Why this matters more than the minute it costs. `uip api-workflow validate`
+            returns Valid for a workflow that cannot run: it checks structure, not
+            whether the request URL is filled in, whether the Slack payload is Block
+            Kit, or whether `$context.outputs.X` matches its activity's case. The last
+            run shipped a Slack body with no `blocks`, this gate caught it one job
+            later, and a fresh agent spent 197 seconds - 137 of them just working out
+            where the files were - fixing one activity. You have the file open and the
+            context loaded. Fixing it here costs seconds, and a repair written without
+            your context is how the doubled-brace bug got introduced.
 
             ## Step 2 - write build notes
 
@@ -804,6 +829,20 @@ jobs:
         run: |
           set -uo pipefail
           npm i -g "@uipath/cli@${CLI_VERSION}" || { echo "::warning::@uipath/cli install failed"; exit 1; }
+          # Freeze the CLI. `npm i -g @uipath/cli@1.202.0` installs 1.202.0 and then the
+          # CLI's own daily auto-updater pulls the newest patch in the line on first use -
+          # a run logged "Update succeeded: @uipath/cli 1.202.0 -> 1.202.1" in two separate
+          # jobs. That is ~10s a job, and worse, it means a UiPath patch released between
+          # the rehearsal and the stage changes the CLI mid-demo.
+          # An EXACT three-part pin sets core.version and the updater short-circuits with
+          # "Daily auto-update skipped: exact pin (frozen)". A two-part value (1.202) pins
+          # the LINE and still updates, so CLI_VERSION must stay major.minor.patch.
+          case "$CLI_VERSION" in
+            *.*.*) uip config set version "$CLI_VERSION" --output json >/dev/null 2>&1 \
+                     && echo "CLI frozen at $CLI_VERSION (auto-update disabled)" \
+                     || echo "::warning::could not pin the CLI; it may auto-update mid-run" ;;
+            *) echo "::warning::CLI_VERSION '$CLI_VERSION' is not major.minor.patch - the CLI will auto-update within its line." ;;
+          esac
           uip --version
           # --path must already exist; the CLI refuses to create it and fails with
           # "Path does not exist or is not a directory".
@@ -1323,7 +1362,7 @@ jobs:
   # ═══════════════════════════════════════════════════════════════
   faulted:
     name: Record fault
-    needs: [identify, derive-tasks, build, test, open-pr, assign-pr]
+    needs: [identify, build, test, open-pr, assign-pr]
     if: failure()
     runs-on: ubuntu-latest
     steps:
@@ -1341,7 +1380,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO:     ${{ github.repository }}
         run: |
-          # Development is the code being written - identify, derive-tasks, build.
+          # Development is the code being written - identify and build. Task
+          # derivation used to be its own job and is now the first half of build.
           # Testing is a separate job in this same workflow. Once build is green the
           # automation exists, so a red test run must paint Testing red and leave
           # Development done, rather than dragging both bubbles down together.
@@ -1349,7 +1389,6 @@ jobs:
 
           DEV_FAILED=0
           if [ "${{ needs.identify.result }}" = "failure" ] \
-             || [ "${{ needs['derive-tasks'].result }}" = "failure" ] \
              || [ "${{ needs.build.result }}" = "failure" ]; then
             DEV_FAILED=1
           fi

@@ -305,6 +305,12 @@ jobs:
           echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.npm-global/bin:$PATH"
           command -v uip >/dev/null || npm install -g "@uipath/cli@${CLI_VERSION}"
+          # Freeze the CLI at the exact version: without an exact (three-part) pin its
+          # daily auto-updater pulls the newest patch in the line on first use, so the
+          # deploy could run on a CLI nobody rehearsed with.
+          case "$CLI_VERSION" in
+            *.*.*) uip config set version "$CLI_VERSION" --output json >/dev/null 2>&1 || true ;;
+          esac
           uip --version
 
       - name: Pack
@@ -409,6 +415,12 @@ jobs:
           echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.npm-global/bin:$PATH"
           command -v uip >/dev/null || npm install -g "@uipath/cli@${CLI_VERSION}"
+          # Freeze the CLI at the exact version: without an exact (three-part) pin its
+          # daily auto-updater pulls the newest patch in the line on first use, so the
+          # deploy could run on a CLI nobody rehearsed with.
+          case "$CLI_VERSION" in
+            *.*.*) uip config set version "$CLI_VERSION" --output json >/dev/null 2>&1 || true ;;
+          esac
           uip --version
 
       - uses: actions/download-artifact@v4
@@ -774,6 +786,12 @@ jobs:
           echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.npm-global/bin:$PATH"
           command -v uip >/dev/null || npm install -g "@uipath/cli@${CLI_VERSION}"
+          # Freeze the CLI at the exact version: without an exact (three-part) pin its
+          # daily auto-updater pulls the newest patch in the line on first use, so the
+          # deploy could run on a CLI nobody rehearsed with.
+          case "$CLI_VERSION" in
+            *.*.*) uip config set version "$CLI_VERSION" --output json >/dev/null 2>&1 || true ;;
+          esac
 
       - name: Authenticate
         env:

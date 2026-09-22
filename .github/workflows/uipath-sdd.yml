@@ -629,7 +629,7 @@ jobs:
       #     repository, never from the process name"
       #   * validator-stable markdown tables: the considerations file's §1
       #     Delivery model, §2 Licensed products and §4 connection list, and
-      #     the PDD's §3 Process Overview and §15 open questions, all of which
+      #     the PDD's Process Overview and open-questions sections, both of which
       #     validate-pdd.sh already requires to exist
       #
       # A parse miss on any of those is a ::warning:: and a safe default, never
@@ -822,7 +822,10 @@ jobs:
 
           # ── need profile: PDD §3 is a validator-guaranteed table ────────────────────
           def overview(label):
-              for c in rows(section(pdd, r'3\.\s*Process Overview')):
+              # Matched by NAME, not by number: the PDD was renumbered when sections
+              # 12-14 were dropped, and a hardcoded number silently returns an empty
+              # section instead of failing.
+              for c in rows(section(pdd, r'\d+\.\s*Process Overview')):
                   if cell(c, 0).lower().startswith(label):
                       return cell(c, 1)
               return ""
@@ -840,7 +843,7 @@ jobs:
           # for [SME REVIEW] markers instead drags in table-cell fragments, which is
           # noise the SDD stage would dutifully carry into the document.
           numbered = []
-          for line in section(pdd, r'15\.\s*Assumptions').splitlines():
+          for line in section(pdd, r'\d+\.\s*Assumptions').splitlines():
               m = re.match(r'^\s*\d+\.\s+(.*\S)', line)
               if m:
                   numbered.append(re.sub(r'\s+', ' ', m.group(1)).strip())
@@ -1248,10 +1251,12 @@ jobs:
             in the document - name the asset and its owner.
 
           Read every PDD in the manifest. The document you write must account for ALL of
-          the current PDD's content: every step in its section 7, every `BR-xx` in its
-          section 9, every business exception, every system error, every field in its
-          section 12, every concrete value in its section 15. A PDD business rule that
-          appears nowhere in the SDD is a hole in the design.
+          the current PDD's content: every step in `Detailed Process Steps`, every
+          `BR-xx` in `Business Rules`, every row of `Business Exceptions` and of
+          `System Errors`, and every field in `Data Definitions`. Sections are named
+          here rather than numbered because the PDD has been renumbered once and a
+          stale number sends you to the wrong section in silence. A PDD business rule
+          that appears nowhere in the SDD is a hole in the design.
 
           On a revision run, read every prior SDD and UPDATE it in place rather than
           replacing it: keep section structure and reviewed content, change what the new

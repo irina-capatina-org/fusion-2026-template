@@ -1,8 +1,14 @@
 name: uipath-dsd
 
-# Stage 5 of the ADLC chain, as six visible jobs:
+# Stage 5 of the ADLC chain, as four visible jobs:
 #
-#   Identify build -> Read build -> Generate DSD -> Open PR -> Merge -> Promote to main
+#   Identify build -> Generate DSD -> Open PR and merge -> Promote to main
+#
+# Four, not six. Reading the build used to be its own job that handed the corpus to
+# Generate DSD as an artifact, and opening the PR used to be its own job before
+# merging it. Both boundaries cost a runner spin-up and a second checkout to move a
+# handful of bytes between adjacent steps. Promote stays separate: opening the
+# release PR is a different decision from merging the docs.
 #
 # Maestro creates branch  docs-<dsdStoryKey>  from develop. Creating the branch IS the
 # trigger.
@@ -269,8 +275,10 @@ jobs:
   # ═══════════════════════════════════════════════════════════════
   # 2. Read build
   # ═══════════════════════════════════════════════════════════════
-  read-build:
-    name: Read build
+  # 3. Generate DSD
+  # ═══════════════════════════════════════════════════════════════
+  generate-dsd:
+    name: Generate DSD
     needs: identify
     runs-on: ubuntu-latest
     steps:
@@ -279,6 +287,9 @@ jobs:
           ref: ${{ needs.identify.outputs.branch }}
           fetch-depth: 1
 
+      # Assembling the corpus used to be its own job that uploaded WORK_DIR as an
+      # artifact for this one to download. Same branch, same files, one step later -
+      # the boundary cost a runner, a second checkout and the upload/download pair.
       - name: Assemble the build corpus
         env:
           ARCH_FILE:  ${{ needs.identify.outputs.arch_file }}
@@ -349,44 +360,11 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dsd-inputs
-          path: ${{ env.WORK_DIR }}
-          retention-days: 1
-          if-no-files-found: error
-
-  # ═══════════════════════════════════════════════════════════════
-  # 3. Generate DSD
-  # ═══════════════════════════════════════════════════════════════
-  generate-dsd:
-    name: Generate DSD
-    needs: [identify, read-build]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.identify.outputs.branch }}
-          fetch-depth: 1
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: dsd-inputs
-          path: ${{ env.WORK_DIR }}
-
-      - name: Install UiPath skills
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          npm i -g "@uipath/cli@${CLI_VERSION}" || { echo "::warning::@uipath/cli install failed"; exit 1; }
-          # --path must already exist; the CLI refuses to create it and fails with
-          # "Path does not exist or is not a directory".
-          mkdir -p "$RUNNER_TEMP/uip-skills"
-          uip skills install --agent codex --path "$RUNNER_TEMP/uip-skills" \
-            || { echo "::warning::uip skills install failed"; exit 1; }
-          mkdir -p "$HOME/.claude/skills"
-          cp -R "$RUNNER_TEMP/uip-skills/.agents/skills/." "$HOME/.claude/skills/"
-          ls -1 "$HOME/.claude/skills"
+      # The skills install used to be here. It cost nine seconds and bought a
+      # single SKILL.md read, which told the agent how to parse project files it
+      # no longer opens - see Step 1 of the prompt. Nothing in this job needs the
+      # CLI either: the DSD is prose about a build that was already validated,
+      # packed and deployed three stages ago.
 
       - name: Run uipath-documenter agent
         uses: anthropics/claude-code-base-action@beta
@@ -412,7 +390,6 @@ jobs:
                             (`single-product` = ONE API Workflow project inside a
                              UiPath Solution; the delivery is always a solution)
             Primary:        ${{ needs.identify.outputs.product }}
-            Build skills:   ${{ needs.identify.outputs.skills }}
             Today:          run `date +%F` and use that as the generation date.
 
             Write EXACTLY these files, one per line as `path <TAB> measured-against-SDD
@@ -433,25 +410,28 @@ jobs:
             exist on disk. A DSD that describes the design instead of the delivery will
             fail it.
 
-            ## Step 0 - load the specialist skill
+            ## Step 1 - read the code first, but only these files
 
-            Run `ls ~/.claude/skills`. For every skill in Build skills, READ
-            `~/.claude/skills/<skill-name>/SKILL.md` with the Read tool - it tells you how
-            to read that product's project files correctly, which you need in order to
-            describe them accurately.
+            Read exactly these, in this order, and then stop reading:
 
-            NEVER load a skill through the Task tool. Spawning a subagent fails in this
-            runner: it resolves a retired model id and comes back
-            `404 not_found_error - model: claude-sonnet-4-20250514`, so you lose the skill
-            entirely. Read SKILL.md with the Read tool, and read the reference files it
-            points at the same way.
+            1. `${{ env.WORK_DIR }}/manifest.json`
+            2. `${{ env.WORK_DIR }}/code-inventory.txt` - the file list, for the
+               Project Structure section
+            3. every `Workflow.json` the inventory lists - THIS is the delivery, and
+               the source of everything you say about what was built
+            4. `build-notes.md` - its *Deviations from the SDD* and *Left for a human*
+               sections are the two things as-built documentation most often misses
+            5. only then the SDD and the architecture json
 
+            That order matters: read the design first and you will describe the design.
 
-            ## Step 1 - read the code first
-
-            Read the manifest, then the code inventory, then EVERY project file it lists.
-            Only after that read the SDD and the architecture json. That order matters: if
-            you read the design first you will describe the design.
+            **Do NOT open `project.uiproj`, `entry-points.json`, `bindings_v2.json`,
+            the `.uipx`, or anything under `resources/solution_folder/`.** A previous
+            run read all eight of them, which cost fifteen file reads and about twenty
+            seconds, and not one sentence of the resulting document came from any of
+            them. They are packaging, and this document describes behaviour. If you
+            need the connection names, they are in `Workflow.json` and in §4 of the
+            org considerations.
 
             Read the build notes if present - its *Deviations from the SDD* and *Left for a
             human* sections are the two things as-built documentation most often misses.
@@ -507,9 +487,11 @@ jobs:
 
             ## Length budget - read this before you write anything
 
-            The whole document is about 6 KB. Not a target to reach: a ceiling to stay
-            under. The previous DSD was 28 KB and took eight minutes to write, which is
-            most of this stage's runtime.
+            The whole document is **5 KB, and that is a ceiling, not a target**. The
+            last one came out at 8,377 bytes against a 6 KB ceiling - a 40% overshoot -
+            and that single `Write` call took 51 seconds, which was most of the agent's
+            runtime. Writing streams at roughly 190 characters a second, so every
+            kilobyte you do not write is five seconds the demo gets back.
 
             Length is not a quality signal here. This document is read by a human
             skimming it on a screen, and nothing downstream parses it - no stage reads
@@ -524,8 +506,17 @@ jobs:
             said. Do not pad a section to look thorough - the validator's size floor is
             3 KB across the whole document and you will clear it easily.
 
-            Each section carries its own budget below. They are approximate; the 6 KB
-            total is the one that matters.
+            Each section carries its own budget below. They are approximate; the 5 KB
+            total is the one that matters, and the last run proves the per-section
+            numbers drift upward unless the total is checked. So check it: after you
+            write the file, run
+
+            ```
+            wc -c <the dsd path>
+            ```
+
+            If it is over 5,500 bytes, cut prose - not table rows - and write it again.
+            One re-write of a 5 KB document costs 26 seconds; shipping 8 KB costs 51.
 
             Two things a budget must never do: leave a table with a header and no data
             rows (the validator fails that), and drop a business exception or system
@@ -537,7 +528,7 @@ jobs:
             1. **Solution Overview** - what this automation does for the business, in
                plain language a support engineer who has never seen it can follow, plus a
                table of what was delivered (projects, their roles, their entry points).
-               BUDGET: one paragraph plus that table. Roughly 800 bytes.
+               BUDGET: one paragraph plus that table. Roughly 700 bytes.
             2. **As-Built Architecture** - the shape of what exists: the projects, how they
                call each other, what they talk to. A short diagram in a fenced block is
                welcome. Describe the delivered topology, not the SDD's.
@@ -547,25 +538,25 @@ jobs:
                past a grep. If a rule from the SDD was NOT implemented, say so in
                section 2 in one line; that is the only rule fact the build knows and
                the design does not.
-               BUDGET: a fenced diagram plus about ten lines. Roughly 1,200 bytes.
+               BUDGET: a fenced diagram plus about eight lines. Roughly 1,000 bytes.
             3. **Configuration Reference** - the assets, credentials, queues, buckets,
                connections and config keys the code actually reads, with exact name, type,
                where it is read and who owns the value. Names come from the code.
                BUDGET: at most 10 rows, and they are the 10 someone would realistically
                change or get wrong - connections, credentials, schedules, tunable values.
                Not every variable the workflow declares. The last one ran to 24 rows.
-               Roughly 1,200 bytes. Make it ONE table - if trimming leaves a sub-table
+               Roughly 1,000 bytes. Make it ONE table - if trimming leaves a sub-table
                with a header and no data rows the validator fails the document, so merge
                rather than split.
             4. **Exception and Error Handling** - ONE table mapping each business
                exception and system error ID to where it is handled in the code, the
                retry behaviour, and the resulting state. No prose around it.
-               BUDGET: roughly 1,200 bytes.
+               BUDGET: roughly 1,000 bytes.
             5. **Operations Runbook** - how this thing is run: trigger and schedule, how to
                start it manually, expected runtime and volume, what a normal run looks like
                in the logs, and the prerequisites that must be in place before it will run
                at all.
-               BUDGET: roughly 1,400 bytes, prerequisites included.
+               BUDGET: roughly 1,200 bytes, prerequisites included.
 
             Anything a human must still do before the first run - an unresolved value, an
             open TODO in the code, a prerequisite nobody has set up - goes in the
@@ -708,13 +699,17 @@ jobs:
   # Still opened, because the case waits on the PR-created event before it waits on
   # the merge. The next job merges it.
   # ═══════════════════════════════════════════════════════════════
-  open-pr:
-    name: Open PR
+  # 5. Merge
+  # No human gate on the DSD: the release gate is the develop -> main PR.
+  # ═══════════════════════════════════════════════════════════════
+  # Opening the PR and merging it are one job. They are two `gh` calls against the
+  # same PR, and splitting them cost a runner spin-up and a second checkout to
+  # carry one PR number across a job boundary. `promote` stays separate on purpose -
+  # it opens the release PR, which is a different decision.
+  merge:
+    name: Open PR and merge
     needs: [identify, generate-dsd]
     runs-on: ubuntu-latest
-    outputs:
-      pr_number: ${{ steps.pr.outputs.pr_number }}
-      pr_url:    ${{ steps.pr.outputs.pr_url }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -792,21 +787,12 @@ jobs:
             echo "[#$PR_NUMBER - docs: $TITLE_LINE]($PR_URL) into \`$BASE_BRANCH\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ═══════════════════════════════════════════════════════════════
-  # 5. Merge
-  # No human gate on the DSD: the release gate is the develop -> main PR.
-  # ═══════════════════════════════════════════════════════════════
-  merge:
-    name: Merge
-    needs: [identify, open-pr]
-    runs-on: ubuntu-latest
-    steps:
       - name: Merge the DSD PR into develop
         env:
           GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
-          PR_NUMBER: ${{ needs.open-pr.outputs.pr_number }}
-          PR_URL:    ${{ needs.open-pr.outputs.pr_url }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          PR_URL:    ${{ steps.pr.outputs.pr_url }}
         run: |
           set -euo pipefail
           # An immediate merge first. --auto only works when the repo has auto-merge
@@ -825,15 +811,6 @@ jobs:
             echo ""
             echo "[#$PR_NUMBER]($PR_URL) merged into \`$BASE_BRANCH\` automatically."
           } >> "$GITHUB_STEP_SUMMARY"
-
-      # This job otherwise makes only `gh` API calls and needs no working tree - but
-      # observe.sh is a FILE, and a job that never checks out has an empty workspace.
-      # Sparse: only the scripts, from develop, so it costs a second.
-      - uses: actions/checkout@v4
-        with:
-          ref: develop
-          sparse-checkout: .github/scripts
-          fetch-depth: 1
 
       - name: Observe - Documentation done
         # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
@@ -987,7 +964,7 @@ jobs:
   # ═══════════════════════════════════════════════════════════════
   faulted:
     name: Record fault
-    needs: [identify, read-build, generate-dsd, open-pr, merge, promote]
+    needs: [identify, generate-dsd, merge, promote]
     if: failure()
     runs-on: ubuntu-latest
     steps:

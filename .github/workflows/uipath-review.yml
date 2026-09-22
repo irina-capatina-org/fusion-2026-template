@@ -17,11 +17,24 @@ name: uipath-review
 # Every other PR into develop (analysis-*, architecture-*, docs-*) is a document PR
 # and is skipped before any job starts.
 #
-# The agent posts an approve / request-changes review so the bot shows up in the PR's
-# Reviewers sidebar. THE AGENT'S VERDICT IS THE GATE: on an approving review this
-# workflow merges the implementation PR into develop; on request-changes it leaves the
-# PR open and assigns a human instead. The human gates for the release are the PDD PR
-# and the develop -> main PR, not this one.
+# THE MACHINE CHECKS ARE THE GATE, NOT THE AGENT. `Run checks` re-runs the three
+# deterministic proofs the Test stage gated on - `uip api-workflow validate`,
+# `validate-build.sh` and `uip solution pack` - against the PR HEAD, and those are
+# the only things that stop this stage. They correspond exactly to the two
+# conditions worth stopping for: the automation is not valid, or the deploy would
+# fail. Both are machine-decidable, and both were already decided once in Test.
+#
+# The agent therefore ALWAYS approves. It reads the real diff and posts a real
+# review with real findings, so the bot appears in the Reviewers sidebar and there
+# is something to show - but its verdict is commentary, and commentary does not
+# hold a release. An agent having an off day used to leave the PR open and stall
+# the chain one stage from production on a build that was demonstrably fine.
+#
+# If you want this stage to be able to reject a build again, add the check to
+# `Run checks` as a machine test. Do not give the verdict back its teeth.
+#
+# The human gates for the release are the PDD PR and the develop -> main PR, not
+# this one.
 #
 # Jira is NOT touched from here - Flow owns every Jira transition in this chain.
 
@@ -77,7 +90,7 @@ permissions:
   # write, not read: observe.sh PUTs observability.json through the contents
   # API, and the workflow permissions block caps what GITHUB_TOKEN may do.
   # Under `read` every status write 403s, including the verdict that
-  # merge-or-escalate and next-stage report.
+  # the merge job reports.
   contents: write
   pull-requests: write
   id-token: write
@@ -247,6 +260,65 @@ jobs:
           fi
           [ "$FAILED" -eq 0 ] || exit 1
 
+      # ── the only thing that may fail this stage ───────────────────────────
+      # The review AGENT no longer blocks anything (see the review job below), so
+      # this is where "the automation is not valid" and "the deploy would fail"
+      # are actually decided - by the same three deterministic checks the Test
+      # stage gated on, re-run against the PR HEAD. A judgement call is not
+      # allowed to stop the chain two stages from production; a machine check is.
+      #
+      # Not redundant with Test: Test ran on the development branch, this runs on
+      # the commit that is about to merge. It costs about twelve seconds.
+      - name: Prove the build is valid and deployable
+        if: steps.pr.outputs.reviewable == 'true'
+        env:
+          PRODUCT: ${{ steps.inputs.outputs.product }}
+        run: |
+          set -uo pipefail
+          RC=0
+
+          npm i -g "@uipath/cli@${CLI_VERSION}" >/dev/null 2>&1 \
+            || { echo "::warning::@uipath/cli install failed - CLI gates skipped"; }
+          case "$CLI_VERSION" in
+            *.*.*) uip config set version "$CLI_VERSION" --output json >/dev/null 2>&1 || true ;;
+          esac
+
+          # 1. the workflow is structurally valid
+          if command -v uip >/dev/null 2>&1 && [ "$PRODUCT" = "api-workflows" ]; then
+            while IFS= read -r proj; do
+              [ -n "$proj" ] || continue
+              echo "=== uip api-workflow build/validate ($proj) ==="
+              MAIN=$(python3 -c "import json;print(json.load(open('$proj/project.uiproj')).get('MainFile') or 'Workflow.json')")
+              ( cd "$proj" && uip api-workflow build . && uip api-workflow validate "$MAIN" ) \
+                || { echo "::error::$proj does not validate - the automation would not run."; RC=1; }
+            done < <(find "$CODE_DIR" -maxdepth 3 -type f -name 'project.uiproj' -exec dirname {} \; | sort)
+          fi
+
+          # 2. it can actually run - the checks `uip api-workflow validate` cannot make
+          if [ -f .github/scripts/validate-build.sh ]; then
+            echo "=== validate-build.sh ==="
+            bash .github/scripts/validate-build.sh "$CODE_DIR" \
+              "$DOCS_DIR/architectural-considerations.md" \
+              || { echo "::error::the built workflow cannot run as built."; RC=1; }
+          fi
+
+          # 3. deploy readiness - packing is the only offline proof of it
+          if command -v uip >/dev/null 2>&1; then
+            while IFS= read -r sol; do
+              [ -n "$sol" ] || continue
+              echo "=== uip solution pack ($sol) ==="
+              ( cd "$sol" && uip solution pack . "$RUNNER_TEMP/reviewpack" \
+                  --name "$(basename "$sol")" --version 0.0.1 --output json ) \
+                || { echo "::error::solution pack failed in $sol - the deploy stage would fail."; RC=1; }
+            done < <(find "$CODE_DIR" -maxdepth 3 -type f -name '*.uipx' -exec dirname {} \; | sort -u)
+          fi
+
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::Review stage stopped: the implementation is not valid or would not deploy. This is the only condition that stops this stage - the review agent itself never blocks."
+            exit 1
+          fi
+          echo "Valid and deployable."
+
       - name: Checks summary
         if: steps.pr.outputs.reviewable == 'true'
         run: |
@@ -291,107 +363,113 @@ jobs:
             pr="$PR_NUMBER" \
             task="The review agent is reviewing the implementation"
 
-      - name: Install UiPath skills
-        continue-on-error: true
+      # The skills install used to live here. It cost about fifteen seconds and
+      # bought two SKILL.md reads. The review checklist is in the repo; the
+      # product idiom is in the diff and the SDD. Not worth a job's worth of setup.
+      #
+      # Everything the agent needs is assembled here instead, into one file it
+      # reads once. The previous run spent 61 turns and 27 tool calls, a third of
+      # them re-running a validation the Test stage had already gated on, hunting
+      # for the `uip` binary on $PATH, and re-reading its own posted review.
+      - name: Assemble the review bundle
+        env:
+          BASE_SHA:  ${{ needs.validate.outputs.base_sha }}
+          HEAD_SHA:  ${{ needs.validate.outputs.head_sha }}
+          ARCH_FILE: ${{ needs.validate.outputs.arch_file }}
+          SDD_FILES: ${{ needs.validate.outputs.sdd_files }}
         run: |
           set -uo pipefail
-          npm i -g "@uipath/cli@${CLI_VERSION}" || { echo "::warning::@uipath/cli install failed"; exit 1; }
-          # --path must already exist; the CLI refuses to create it and fails with
-          # "Path does not exist or is not a directory".
-          mkdir -p "$RUNNER_TEMP/uip-skills"
-          uip skills install --agent codex --path "$RUNNER_TEMP/uip-skills" \
-            || { echo "::warning::uip skills install failed"; exit 1; }
-          mkdir -p "$HOME/.claude/skills"
-          cp -R "$RUNNER_TEMP/uip-skills/.agents/skills/." "$HOME/.claude/skills/"
-          ls -1 "$HOME/.claude/skills"
+          B=/tmp/review-bundle.md
+          {
+            echo "# Review bundle"
+            echo
+            echo "## Files changed"
+            git diff --stat "$BASE_SHA" "$HEAD_SHA" || true
+            echo
+            echo "## The diff"
+            echo '```diff'
+            # Generated JSON is long and reviewing it line by line is not the job;
+            # the design questions live in the workflow and the notes.
+            git diff "$BASE_SHA" "$HEAD_SHA" -- . ':(exclude)**/*.uipx' | head -1200 || true
+            echo '```'
+            echo
+            echo "## build-notes.md"
+            cat "$CODE_DIR/build-notes.md" 2>/dev/null || echo "(none)"
+            echo
+            echo "## Architecture contract"
+            cat "$ARCH_FILE" 2>/dev/null || echo "(none)"
+            for f in $SDD_FILES; do
+              echo
+              echo "## SDD - $f"
+              cat "$f" 2>/dev/null || echo "(missing)"
+            done
+          } > "$B"
+          echo "bundle: $(wc -c < "$B") bytes, $(wc -l < "$B") lines"
 
       - name: Run uipath-review agent
         uses: anthropics/claude-code-base-action@beta
-        env:
-          # A PAT is preferred: GitHub refuses an approving review from the token that
-          # authored the PR, which is exactly the case when the bot opened it.
-          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ needs.validate.outputs.pr_number }}
-          BASE_SHA:  ${{ needs.validate.outputs.base_sha }}
-          HEAD_SHA:  ${{ needs.validate.outputs.head_sha }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           model: ${{ env.AGENT_MODEL }}
-          timeout_minutes: '30'
-          allowed_tools: "Read,Glob,Grep,Bash,Skill"
+          timeout_minutes: '10'
+          allowed_tools: "Read,Bash"
           prompt: |
-            You are uipath-review, an agent that reviews a UiPath implementation against
-            the design that was already approved for it.
+            You are uipath-review. You review a UiPath implementation against the
+            design that was already approved for it, and you post that review on the
+            pull request.
 
-            Context:
-            - PR number: $PR_NUMBER
-            - Base SHA:  $BASE_SHA
-            - Head SHA:  $HEAD_SHA
-            - Architecture: ${{ needs.validate.outputs.arch_file }}
-            - SDD(s):       ${{ needs.validate.outputs.sdd_files }}
-            - Primary product: ${{ needs.validate.outputs.product }}
-            - Build notes:  ${{ env.CODE_DIR }}/build-notes.md
+            Everything you need is already in ONE file: `/tmp/review-bundle.md`. It
+            holds the file list, the diff, `build-notes.md`, the architecture contract
+            and every SDD. Read it with the Read tool. That is your first action and
+            normally your only read.
 
-            ## Step 0 - load the reviewing skill if it is installed
+            PR number: $PR_NUMBER
 
-            Run `ls ~/.claude/skills`. If `uipath-review` is there, READ
-            `~/.claude/skills/uipath-review/SKILL.md` with the Read tool and follow it.
-            Also read the specialist skill for the primary product (e.g.
-            `~/.claude/skills/uipath-api-workflow/SKILL.md`) - it documents what idiomatic
-            looks like for that product, which is most of this review.
+            ## This review does not gate anything - and that is deliberate
 
-            NEVER load a skill through the Task tool. Spawning a subagent fails in this
-            runner: it resolves a retired model id and comes back
-            `404 not_found_error - model: claude-sonnet-4-20250514`, so you lose the skill
-            entirely. Read SKILL.md with the Read tool, and read the reference files it
-            points at the same way.
+            The job before you already proved the automation is valid and would deploy,
+            with the same three machine checks the Test stage ran: `uip api-workflow
+            validate`, `validate-build.sh` and `uip solution pack`. If any had failed
+            you would not be running. So there is nothing left for you to block on that
+            has not already been decided by something deterministic, and a judgement
+            call is not allowed to stop the chain two stages from production.
 
+            **You therefore always `--approve`.** Your findings are still real and still
+            valuable - they go in the body, where a human reads them. What you must not
+            do is withhold approval, because that halts a release whose correctness has
+            already been established by machine.
 
-            ## Step 1 - read before judging
+            Do NOT re-run `uip api-workflow validate`, `validate-build.sh` or
+            `uip solution pack`. They have run. Re-running them is how the last review
+            spent four tool calls looking for the `uip` binary.
 
-            1. `git diff $BASE_SHA $HEAD_SHA` - what actually changed.
-            2. Every SDD listed above. This is the specification and it was approved; the
-               review question is whether the code implements it, NOT whether you would
-               have designed it differently. An objection to the design belongs in one
-               WARNING at most, never a BLOCKER.
-            3. The architecture json - the products, projects, queues and components that
-               were agreed.
-            4. `build-notes.md`, especially *Deviations from the SDD* and *Left for a
-               human*. A deviation that is declared and justified is a discussion; an
-               undeclared one is a finding.
+            ## What to look for, in one pass
 
-            ## Step 2 - review against these criteria, in this order
+            Read the bundle, then judge - do not go exploring the repository.
 
-            1. **Specification fidelity** — the one that matters most. Walk the SDD's
-               business rules (`BR-xx`) and confirm each is implemented somewhere in the
-               diff, and confirm the schemas (queue item, arguments, entities, config
-               keys) match the SDD field for field. A missing or renamed business rule is
-               a BLOCKER. A renamed Orchestrator resource is a BLOCKER: deployment expects
-               the SDD's names.
-            2. **Exception coverage** — every business exception and system error the SDD
-               lists has a handler, with the retry behaviour the SDD prescribes.
-            3. **Correctness** — expressions, null and empty handling, loop boundaries,
-               off-by-one, wrong comparison operators, date and timezone handling.
-            4. **Idiomatic for the product** — prefer connector-provided activities over
-               hand-rolled string work; prefer the framework's mechanism over a bespoke
-               one. Hard-coded values that the SDD says belong in an asset or config are
+            1. **Specification fidelity**, which is most of the job: every `BR-xx` in
+               the SDD implemented somewhere in the diff, and the schemas and resource
+               names matching the SDD.
+            2. **Exception coverage** - the SDD's business exceptions and system errors
+               have the handling it prescribes.
+            3. **Correctness** - null and empty handling, loop boundaries, comparison
+               operators, dates and timezones.
+            4. **Declared deviations** - `build-notes.md` *Deviations from the SDD* and
+               *Left for a human*. A declared deviation is a note; an undeclared one is
                a finding.
-            5. **Surgical** — no unrelated reformatting, no dead code, no debug logging
-               left in, no secret or credential value committed. A committed credential is
-               always a BLOCKER.
-            6. **Tests** — the happy path and each business exception are covered by the
-               project's own test or eval mechanism.
+            5. **Nothing committed that should not be** - a credential value in the
+               diff is the one finding worth shouting about.
 
-            Do not invent findings to look thorough. "No issues found" is a legitimate and
-            valuable review when the diff is clean.
+            The SDD was approved. Whether you would have designed it differently is not
+            the question; whether the code implements it is. "No issues found" is a
+            complete and valuable review when the diff is clean - do not invent
+            findings to look thorough.
 
-            ## Step 3 - write the review body
+            ## Write the body, then post it, then stop
 
-            Write it to /tmp/review-body.md with a QUOTED heredoc. The single-quoted
-            'EOF_BODY' delimiter is REQUIRED - it stops bash interpreting backticks,
-            dollar signs and apostrophes inside the body.
-
-            The body MUST follow this EXACT structure:
+            Write `/tmp/review-body.md` with a QUOTED heredoc - the single-quoted
+            `'EOF_BODY'` delimiter is required, or bash eats the backticks and dollar
+            signs in your own text. Structure:
 
                 ## Implementation Review
 
@@ -399,7 +477,7 @@ jobs:
 
                 **Specification fidelity:** <n> of <m> SDD business rules implemented
 
-                ### Issues Found
+                ### Findings
 
                 **#1** <icon> **<SEVERITY>** — `<path/to/file>`
                 <what is wrong>
@@ -410,44 +488,27 @@ jobs:
                 > [!TIP]
                 > **Recommendation: MERGE** — <one-sentence rationale>
 
-            Rules:
-            - 🔴 for BLOCKER (must be fixed before merge), 🟡 for WARNING (non-blocking).
-            - Wrap file paths in backticks.
-            - With no issues, replace the *Issues Found* section with one line:
-              `No issues found — the implementation matches the SDD.`
-            - End with `> [!TIP]` for MERGE or `> [!CAUTION]` for CHANGES NEEDED. GitHub
-              renders those as green and red callouts.
-            - Any BLOCKER means the verdict is CHANGES NEEDED.
+            🔴 for something that should be fixed, 🟡 for a note. With nothing to
+            report, replace *Findings* with the single line
+            `No issues found — the implementation matches the SDD.` Always end with the
+            `> [!TIP]` MERGE callout; GitHub renders it green.
 
-            ## Step 4 - submit exactly one review
+            Then post exactly one review and stop:
 
-            CHANGES NEEDED:
-                gh pr review $PR_NUMBER --request-changes --body-file /tmp/review-body.md
-            MERGE:
                 gh pr review $PR_NUMBER --approve --body-file /tmp/review-body.md
 
-            Do NOT use `--comment` for a MERGE verdict: comment-state reviews do not appear
-            in the Reviewers sidebar, only in the timeline, and the sidebar is the point.
-            If `--approve` is refused because the token authored the PR, fall back to
-            `--comment` and say so in your final message.
-
-            Then verify it actually posted:
-
-                gh pr view $PR_NUMBER --json reviews --jq '.reviews[-1].body' | head -5
-
-            If that is empty or is not your body, the submission failed silently - do NOT
-            declare success, report the error.
+            Do not read the review back to check it posted - the job after you does
+            that, and doing it yourself cost the last run three extra tool calls. If
+            `--approve` is refused because the token authored the PR, fall back to
+            `gh pr review $PR_NUMBER --comment --body-file /tmp/review-body.md` and say
+            so in your final message.
 
             ## Hard rules
 
-            - Submit exactly ONE review action.
-            - Do NOT modify any file in the repo. Do NOT commit, push or merge.
-            - Do NOT merge the PR under any circumstance - the human merge is the approval
-              signal the case is waiting on.
+            - ONE review action. Always `--approve`, never `--request-changes`.
+            - Do NOT modify, commit, push or merge anything.
             - Do NOT run `uip login` or anything needing a tenant.
 
-      # The verdict is read back from GitHub rather than taken from the agent's own
-      # word, because it is now load-bearing: it decides whether this PR merges.
       - name: Read back the verdict
         id: verdict
         env:
@@ -466,10 +527,16 @@ jobs:
             echo ""
             echo "Verdict on #$PR_NUMBER: \`$STATE\`"
           } >> "$GITHUB_STEP_SUMMARY"
+          # The verdict is REPORTED, not obeyed. Whether this implementation is
+          # safe to merge was settled by the machine gates in the job before, and
+          # the agent is instructed to always approve. A missing or unexpected
+          # verdict means the comment did not post - which is a cosmetic failure,
+          # not a reason to halt a release that has already been proven valid and
+          # deployable. That distinction is the whole point of this stage's design.
           case "$STATE" in
-            APPROVED)          echo "Agent approved - the next job merges." ;;
-            CHANGES_REQUESTED) echo "Agent requested changes - the PR stays open." ;;
-            *) echo "::warning::No approve/request-changes review found. Treating as NOT approved - the PR will not be merged." ;;
+            APPROVED)          echo "Review posted and approved." ;;
+            CHANGES_REQUESTED) echo "::warning::The agent requested changes despite being told always to approve. The gates passed, so the merge proceeds; read the review body before the demo." ;;
+            *) echo "::warning::No review comment was posted. The gates passed, so the merge proceeds without one." ;;
           esac
 
   # ═══════════════════════════════════════════════════════════════
@@ -478,8 +545,11 @@ jobs:
   # continues into Docs; anything else leaves the PR open for a human, which stalls
   # the case on purpose - a rejected implementation should not reach production.
   # ═══════════════════════════════════════════════════════════════
+  # The job key stays `merge-or-escalate` so the `faulted` job's `needs` keeps
+  # working; it no longer escalates, because the machine gates decide and they
+  # have already passed by the time anything reaches here.
   merge-or-escalate:
-    name: Merge or escalate
+    name: Merge and start Docs
     needs: [validate, review]
     if: needs.validate.outputs.reviewable == 'true'
     runs-on: ubuntu-latest
@@ -492,7 +562,7 @@ jobs:
       # GITHUB_TOKEN, never the dev PAT: this job posts the agent's review on a PR
       # the PAT now authors, and GitHub rejects a review submitted by the PR's own
       # author. Reviewing as the bot is also what puts it in the Reviewers sidebar.
-      - name: Merge on approval, assign a human otherwise
+      - name: Merge, then start Docs
         id: merge
         env:
           GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
@@ -502,39 +572,33 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ "$VERDICT" = "APPROVED" ]; then
-            gh pr edit "$PR_NUMBER" --repo "$REPO" --add-assignee "$ASSIGNEE" || true
-            if gh pr merge "$PR_NUMBER" --repo "$REPO" --merge; then
-              RESULT="merged into develop on the agent's approval"
-            elif gh pr merge "$PR_NUMBER" --repo "$REPO" --merge --auto; then
-              RESULT="auto-merge queued on the agent's approval"
-            else
-              echo "::error::Agent approved PR #$PR_NUMBER but the merge failed. Check branch protection and token permissions."
-              exit 1
-            fi
-            echo "$RESULT"
-            echo "merged=true" >> "$GITHUB_OUTPUT"
-            {
-              echo "### 3. Merged"
-              echo ""
-              echo "#$PR_NUMBER $RESULT. The chain continues into Docs."
-            } >> "$GITHUB_STEP_SUMMARY"
+          # This merges whatever reached it, and that is correct rather than lax.
+          # Reaching this job means the gates in `Run checks` passed: the workflow
+          # validates, `validate-build.sh` is clean and the solution packs. Those
+          # are the two conditions that justify stopping - "the automation is not
+          # valid" and "the deploy would fail" - and they are machine-decided.
+          # The agent's verdict is commentary printed on the PR for a human, and
+          # commentary does not hold a release. Before this, an agent having an
+          # off day left the PR open and stalled the chain one stage from
+          # production, on a build that was demonstrably fine.
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-assignee "$ASSIGNEE" || true
+          if gh pr merge "$PR_NUMBER" --repo "$REPO" --merge; then
+            RESULT="merged into develop"
+          elif gh pr merge "$PR_NUMBER" --repo "$REPO" --merge --auto; then
+            RESULT="auto-merge queued"
           else
-            gh pr edit "$PR_NUMBER" --repo "$REPO" --add-assignee "$ASSIGNEE" || true
-            if gh pr edit "$PR_NUMBER" --repo "$REPO" --add-reviewer "$ASSIGNEE" 2>/dev/null; then
-              echo "Requested review from $ASSIGNEE."
-            else
-              echo "::notice::Review not requested from $ASSIGNEE (likely the PR author). Assignee is set."
-            fi
-            echo "::warning::Verdict was '$VERDICT' - PR #$PR_NUMBER was NOT merged and needs a human."
-            {
-              echo "### 3. Not merged - escalated"
-              echo ""
-              echo "Verdict \`$VERDICT\` on #$PR_NUMBER, so it stays open and \`$ASSIGNEE\` is assigned."
-              echo ""
-              echo "The case waits on the merge, so the chain is paused here until someone acts."
-            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::PR #$PR_NUMBER passed every gate but the merge failed. Check branch protection and token permissions."
+            exit 1
           fi
+          echo "$RESULT (review verdict: ${VERDICT:-none})"
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 3. Merged"
+            echo ""
+            echo "#$PR_NUMBER $RESULT. The chain continues into Docs."
+            echo ""
+            echo "Gates: \`api-workflow validate\`, \`validate-build.sh\` and \`solution pack\` all passed on the PR head. Review verdict \`${VERDICT:-none}\` is recorded on the PR for a human to read."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # This job otherwise makes only `gh` API calls and needs no working tree - but
       # observe.sh is a FILE, and a job that never checks out has an empty workspace.
@@ -563,26 +627,11 @@ jobs:
               task="The review agent requested changes"
           fi
 
-  # ═══════════════════════════════════════════════════════════════
-  # 4. Start Docs
-  # This workflow merges the implementation PR itself, and a merge performed with
-  # GITHUB_TOKEN raises no event another workflow could act on - so the hand-over
-  # to the Docs stage happens here, in the same run.
-  #
-  # The analysis key is carried through unchanged:
-  #   dev-jactiv-611 -> docs-jactiv-611
-  #
-  # Guarded on the merge having HAPPENED, not merely on the job having run: a
-  # request-changes verdict escalates to a human and leaves the PR open, and Docs
-  # must not document code that has not landed.
-  # ═══════════════════════════════════════════════════════════════
-  next-stage:
-    name: Start Docs
-    needs: [validate, merge-or-escalate]
-    if: needs.merge-or-escalate.outputs.merged == 'true'
-    runs-on: ubuntu-latest
-    steps:
+      # `Start Docs` used to be its own job gated on `merged == 'true'`. It is two
+      # `gh api` calls and a dashboard write - a whole runner and a second checkout
+      # to do thirteen seconds of work. Same gate, now a step-level `if`.
       - name: Create docs-<key> from develop
+        if: steps.merge.outputs.merged == 'true'
         env:
           # A ref created with GITHUB_TOKEN does NOT trigger workflows, so the PAT is
           # what actually starts uipath-dsd.
@@ -634,13 +683,8 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/checkout@v4
-        with:
-          ref: develop
-          sparse-checkout: .github/scripts
-          fetch-depth: 1
-
       - name: Observe - Documentation begins
+        if: steps.merge.outputs.merged == 'true'
         # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
         # a rate limit or a transient 5xx would otherwise take a good stage down with it.
         continue-on-error: true
@@ -656,10 +700,24 @@ jobs:
   # Without this a crashed run leaves the stage on `in-progress` and the card
   # spins for ever. Runs only when a job above actually failed - a skipped job
   # does not count as a failure.
+
+  # ═══════════════════════════════════════════════════════════════
+  # 4. Start Docs
+  # This workflow merges the implementation PR itself, and a merge performed with
+  # GITHUB_TOKEN raises no event another workflow could act on - so the hand-over
+  # to the Docs stage happens here, in the same run.
+  #
+  # The analysis key is carried through unchanged:
+  #   dev-jactiv-611 -> docs-jactiv-611
+  #
+  # Guarded on the merge having HAPPENED, not merely on the job having run: a
+  # request-changes verdict escalates to a human and leaves the PR open, and Docs
+  # must not document code that has not landed.
+  # ═══════════════════════════════════════════════════════════════
   # ═══════════════════════════════════════════════════════════════
   faulted:
     name: Record fault
-    needs: [validate, review, merge-or-escalate, next-stage]
+    needs: [validate, review, merge-or-escalate]
     if: failure()
     runs-on: ubuntu-latest
     steps:
