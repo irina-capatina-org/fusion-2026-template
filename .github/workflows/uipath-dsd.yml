@@ -409,6 +409,8 @@ jobs:
             Story key:      ${{ needs.identify.outputs.story_key }}
             Revision:       ${{ needs.identify.outputs.revision }}
             Scope:          ${{ needs.identify.outputs.scope }}
+                            (`single-product` = ONE API Workflow project inside a
+                             UiPath Solution; the delivery is always a solution)
             Primary:        ${{ needs.identify.outputs.product }}
             Build skills:   ${{ needs.identify.outputs.skills }}
             Today:          run `date +%F` and use that as the generation date.

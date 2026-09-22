@@ -43,11 +43,16 @@ run-name: SDD for ${{ github.ref_name }}
 # develop -> main PR at the end. The case still resumes normally: it waits on the
 # PR-created event and then on the PR-merged event, and both still fire.
 #
-# FORCED_PRODUCT below pins the PRODUCT for a live demo. The pin is a hard gate: the
-# Determine-architecture job fails if the agent picks anything else. FORCED_SCOPE is
-# deliberately empty - single-product vs solution is a real consequence of the PDD,
-# not a demo risk, so the agent decides it. Clear FORCED_PRODUCT too to hand the
-# whole decision back.
+# FORCED_PRODUCT and FORCED_SCOPE below pin the shape for a live demo. Both are hard
+# gates: the Determine-architecture job FAILS if the agent returns anything else.
+#
+# THE TARGET SHAPE, fixed for this programme:
+#   a UiPath SOLUTION containing exactly ONE API Workflow project.
+# `sdd_scope: single-product` means one PROJECT INSIDE that solution. It has never
+# meant "no solution" - every build is packed and shipped as a solution - and reading
+# it that way is what made the deploy step hunt for .nupkg files and skip the deploy.
+#
+# Clear both to hand the whole decision back to the agent.
 
 on:
   push:
@@ -86,13 +91,13 @@ env:
   # prompt - the job FAILS if the agent returns anything else, so the run can never
   # quietly surprise us on stage.
   #
-  # SCOPE is NOT pinned. single-product vs solution follows from how many
-  # independently deployed projects the PDD actually needs, and forcing it to
-  # single-product would silently collapse a genuine multi-project design into one
-  # document. An API Workflow that turns out to need, say, an RPA peer should be
-  # allowed to say so. Set FORCED_SCOPE to pin it again for a demo.
+  # SCOPE is pinned too. The use case is simple and deliberately so: one API
+  # Workflow. Left free, the architect can decide it needs a second or third project
+  # and the run produces a shape nobody rehearsed. Pinning it removes that surprise.
+  # It does NOT remove the solution - `single-product` is one project INSIDE the
+  # solution, and the build still packs and ships a solution.
   FORCED_PRODUCT: 'api-workflows'
-  FORCED_SCOPE: ''
+  FORCED_SCOPE: 'single-product'
   # Org-level platform facts and house design preferences. Hardcoded path, read on
   # every run and handed to both agents as authoritative - a confirmed value here is
   # a fact the SDD states outright instead of an [ARCHITECT REVIEW] it carries.
@@ -635,6 +640,14 @@ jobs:
             Delivery model:  ${{ inputs.delivery_model }}
             PINNED product:  ${{ env.FORCED_PRODUCT }}   (empty = you decide)
             PINNED scope:    ${{ env.FORCED_SCOPE }}     (empty = you decide)
+
+            When scope is pinned to `single-product` it means: ONE project, and that
+            project is an API Workflow, inside a UiPath Solution. It does NOT mean
+            "no solution" - the build always produces a solution and deployment always
+            ships one. Do not split the work across two or three projects to be
+            thorough; if you believe it genuinely needs a peer project, write the
+            design for the one project and record the objection as an inline
+            `[ARCHITECT REVIEW]`.
 
             ## Step 0.1 - the org's architectural considerations
 

@@ -9,11 +9,16 @@ name: uipath-deploy
 # develop is merged into main. Maestro or Flow can also fire it directly with
 # workflow_dispatch, which is why every input has a sane default.
 #
-# It reads docs/architecture-<key>.json to decide HOW to ship, because that differs by
-# scope. A multi-project Solution packs and deploys as one .uipx; a single-product
-# build publishes its own package and has no Solution wrapper. Getting that wrong is
-# the most common deployment failure in this chain, so it is resolved from the design
-# rather than hardcoded.
+# THE TARGET SHAPE, fixed for this programme:
+#   a UiPath SOLUTION containing exactly ONE API Workflow project.
+# `sdd_scope: single-product` means one PROJECT INSIDE that solution. It has never
+# meant "no solution" - every build is packed and shipped as a solution - and reading
+# it that way is what made the deploy step hunt for .nupkg files and skip the deploy.
+#
+# So this workflow ships a SOLUTION, and decides how by looking at what `Build
+# package` actually produced - never at `sdd_scope`. The per-project .nupkg path
+# below is a fallback for a build that produced no solution at all; it is not the
+# single-product path, because there is no such thing.
 #
 # Jira is NOT touched from here - Flow owns every Jira transition in this chain.
 #
@@ -416,18 +421,29 @@ jobs:
           echo "Authenticated."
 
       - name: Publish
+        id: publish
         env:
           SCOPE:   ${{ needs.resolve.outputs.scope }}
           NAME:    ${{ needs.resolve.outputs.solution_name }}
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           set -euo pipefail
-          if [ "$SCOPE" = "solution" ]; then
-            PKG=$(find "$OUTPUT_DIR" -type f \( -name '*.uipx' -o -name "${NAME}_${VERSION}.zip" -o -name '*.zip' \) 2>/dev/null | head -1 || true)
-            [ -n "$PKG" ] || { echo "::error::No solution package in $OUTPUT_DIR."; exit 1; }
+          # Branch on WHAT WAS BUILT, not on the declared scope. `Build package`
+          # already decides by looking for a .uipx manifest under code/, and every
+          # build now ships as a solution whatever its scope says - so a
+          # `single-product` design still produces `uip solution pack` output
+          # (NAME_VERSION.zip). Keying this step on scope instead sent a perfectly
+          # good solution zip down the per-project path, which hunts for .nupkg
+          # files that a solution build never produces, and failed the deploy with
+          # "No .nupkg found to publish".
+          PKG=$(find "$OUTPUT_DIR" -type f \( -name '*.uipx' -o -name "${NAME}_${VERSION}.zip" -o -name '*.zip' \) 2>/dev/null | head -1 || true)
+          if [ -n "$PKG" ]; then
             echo "Publishing solution $PKG"
             uip solution publish "$PKG"
+            # Downstream steps gate on what was ACTUALLY published, not on sdd_scope.
+            echo "solution=true" >> "$GITHUB_OUTPUT"
           else
+            echo "solution=false" >> "$GITHUB_OUTPUT"
             PUBLISHED=0
             while IFS= read -r pkg; do
               [ -n "$pkg" ] || continue
@@ -436,14 +452,21 @@ jobs:
                 echo "::error::Upload failed for $pkg. Supported surface:"; uip or packages --help || true; exit 1; }
               PUBLISHED=$((PUBLISHED + 1))
             done < <(find "$OUTPUT_DIR" -type f -name '*.nupkg' | sort)
-            [ "$PUBLISHED" -gt 0 ] || { echo "::error::No .nupkg found to publish."; exit 1; }
+            [ "$PUBLISHED" -gt 0 ] || {
+              echo "::error::Nothing to publish in $OUTPUT_DIR - no solution package (.uipx / ${NAME}_${VERSION}.zip) and no .nupkg."
+              ls -la "$OUTPUT_DIR" 2>/dev/null || echo "  ($OUTPUT_DIR does not exist)"
+              exit 1; }
             echo "Published $PUBLISHED package(s)."
           fi
 
       # Orchestrator indexes a freshly published package asynchronously, so the first
       # deploy attempt routinely reports it as not ready. Retry rather than fail.
+      # Gated on what Publish actually shipped, NOT on sdd_scope. Every build now
+      # produces a solution whatever its scope says, so a `single-product` run was
+      # publishing a solution zip and then SKIPPING this step - the package appeared
+      # in Orchestrator and was never deployed, with a green tick on the run.
       - name: Deploy to Orchestrator
-        if: needs.resolve.outputs.scope == 'solution'
+        if: steps.publish.outputs.solution == 'true'
         env:
           NAME:        ${{ needs.resolve.outputs.solution_name }}
           VERSION:     ${{ needs.resolve.outputs.version }}
@@ -452,14 +475,170 @@ jobs:
           set -uo pipefail
           MAX_ATTEMPTS=10
           DELAY=10
+          CONFIG="${RUNNER_TEMP:-/tmp}/deploy-config.json"
+
+          # ── Bind to the EXISTING connections instead of provisioning new ones ──
+          # `deploy run` creates a new folder and, by default, provisions a FRESH copy
+          # of every resource the package declares - including Integration Service
+          # connections. A fresh connection has never been authenticated, so the
+          # deployment stops at
+          #   [CNS1072] connection <name>: You will need to authenticate this
+          #   connection before proceeding further
+          # even though a working, authenticated connection of the same name is
+          # sitting in the parent folder. The connections are shared programme
+          # infrastructure (architectural-considerations.md §4: never create, rename
+          # or duplicate them), so every one of them must be LINKED, not installed.
+          #
+          # Link state lives in the deploy config: a resource with `linkToResource`
+          # binds to an existing entity, one without it is provisioned fresh.
+          link_connections() {
+          # 1. Resolve the folder we are told the connections live in, and prove the
+          #    DEPLOYING IDENTITY can see it. This is the check that matters: the CI
+          #    authenticates as an external application, not as a person, and
+          #    Integration Service connections are account-scoped. A run once listed
+          #    three connections from entirely different folders and none of ours,
+          #    because the app had no access to this one - and the only symptom was
+          #    "Resource '<name>' was not found in folder 'Fusion2026' in the target
+          #    environment", three fallbacks deep.
+          cat > "${RUNNER_TEMP:-/tmp}/folder_key.py" <<'EOF_FKEY'
+          import json, re, sys
+
+          try:
+              doc = json.load(sys.stdin)
+          except Exception:
+              raise SystemExit(0)
+
+          stack = [doc]
+          while stack:
+              node = stack.pop()
+              if isinstance(node, dict):
+                  low = {k.lower(): v for k, v in node.items()}
+                  for k in ("key", "folderkey", "id"):
+                      v = low.get(k)
+                      if isinstance(v, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", v):
+                          print(v)
+                          raise SystemExit(0)
+                  stack.extend(node.values())
+              elif isinstance(node, list):
+                  stack.extend(node)
+          EOF_FKEY
+          FOLDER_KEY=$(uip or folders get "$FOLDER_PATH" --output json 2>/dev/null \
+            | python3 "${RUNNER_TEMP:-/tmp}/folder_key.py")
+          if [ -z "$FOLDER_KEY" ]; then
+            echo "::error::The deploying account cannot resolve folder '$FOLDER_PATH'."
+            echo "::error::It authenticates as an external application, not as you. Grant that application access to '$FOLDER_PATH' in Orchestrator (Manage access), then re-run."
+            uip or folders list --output table 2>&1 | head -15
+            return 1
+          fi
+          echo "  folder '$FOLDER_PATH' -> $FOLDER_KEY"
+
+          # 2. The deploy config lists the resources this package will provision.
+          uip solution deploy config get "$NAME" -d "$CONFIG" --package-version "$VERSION" --output json >/dev/null 2>&1 \
+            || { echo "::warning::Could not fetch the deploy config for $NAME v$VERSION - deploying without link overrides."; return 1; }
+
+          cat > "${RUNNER_TEMP:-/tmp}/list_connections.py" <<'EOF_CONN'
+          import json, sys
+
+          try:
+              doc = json.load(open(sys.argv[1], encoding="utf-8"))
+          except Exception:
+              raise SystemExit(0)
+
+          for r in (doc.get("resources") or []):
+              if "connection" in str(r.get("kind", "")).lower():
+                  name = r.get("name")
+                  if name:
+                      print(name)
+          EOF_CONN
+
+          # 3. Advisory only. If a connection the package declares is not visible to
+          #    this account, linking it will fail - say so before the 400 rather than
+          #    after, but do not let it choose the folder.
+          VISIBLE=$(uip is connections list --all-folders --output json 2>/dev/null || true)
+
+          local n=0 total=0
+          while IFS= read -r res; do
+            [ -n "$res" ] || continue
+            total=$((total + 1))
+
+            case "$VISIBLE" in
+              *"\"$res\""*) : ;;
+              *) echo "::warning::Connection '$res' is not visible to the deploying account. If the link fails, that is why - it needs access to the connection, not just to the folder." ;;
+            esac
+
+            # linkToResource.folderPath takes the folder KEY, not its name. The
+            # solution's own debug_overwrites.json records the working binding that
+            # way: folderFullyQualifiedName "Fusion2026", folderPath "<key>".
+            if OUT=$(uip solution deploy config link "$CONFIG" "$res" \
+                       --name "$res" --folder-path "$FOLDER_KEY" 2>&1); then
+              echo "  linked '$res' -> $FOLDER_PATH ($FOLDER_KEY)"
+              n=$((n + 1))
+            else
+              echo "::warning::Could not link connection '$res'."
+              echo "$OUT" | head -5 | sed 's/^/      /'
+            fi
+          done < <(python3 "${RUNNER_TEMP:-/tmp}/list_connections.py" "$CONFIG")
+
+          echo "Linked $n of $total connection(s) to $FOLDER_PATH."
+          echo "$FOLDER_PATH" > "${RUNNER_TEMP:-/tmp}/link_retry.txt"
+          [ "$n" -gt 0 ]
+          }
+
+          CONFIG_ARG=""
+          if link_connections; then
+            CONFIG_ARG="--config-file $CONFIG"
+          else
+            echo "::warning::Deploying without connection links. If it fails with CNS1072, the connections in $FOLDER_PATH need to exist with the same names as in the solution."
+          fi
+
+          # Everything in here is deliberately at column 0: a heredoc terminator has
+          # to start the line, and indentation inside a shell function is irrelevant.
+          # (Putting the python at column 0 in the YAML instead would end the block
+          # scalar and silently truncate this whole script.)
+          find_deployment_key() {
+          # The program goes to a file first: `python3 - <<EOF` reads the PROGRAM from
+          # stdin, which would clobber the piped JSON and leave nothing to parse.
+          cat > "${RUNNER_TEMP:-/tmp}/find_deployment_key.py" <<'EOF_KEY'
+          import json, sys
+
+          want = sys.argv[1].lower()
+          try:
+              doc = json.load(sys.stdin)
+          except Exception:
+              print("")
+              raise SystemExit(0)
+
+          # The list response has been reshaped more than once, so walk it rather
+          # than assuming where the rows live.
+          stack, found = [doc], ""
+          while stack:
+              node = stack.pop()
+              if isinstance(node, dict):
+                  low = {k.lower(): v for k, v in node.items()}
+                  if "key" in low and str(low.get("name", "")).lower() == want:
+                      found = str(low["key"])
+                      break
+                  stack.extend(node.values())
+              elif isinstance(node, list):
+                  stack.extend(node)
+          print(found)
+          EOF_KEY
+          uip solution deploy list --limit 200 --output json 2>/dev/null \
+            | python3 "${RUNNER_TEMP:-/tmp}/find_deployment_key.py" "$1"
+          }
           for i in $(seq 1 $MAX_ATTEMPTS); do
             EXIT_CODE=0
+            # --parent-folder-path, NOT --folder-path. CLI 1.202 rejects the latter
+            # with "unknown option '--folder-path' (Did you mean --folder-name?)" and
+            # the step dies in 0s. --folder-name is the NEW folder this deployment
+            # creates; --parent-folder-path is where that folder is created.
             OUTPUT=$(uip solution deploy run \
               --name "$NAME" \
               --package-name "$NAME" \
               --package-version "$VERSION" \
               --folder-name "$NAME" \
-              --folder-path "$FOLDER_PATH" 2>&1) || EXIT_CODE=$?
+              --parent-folder-path "$FOLDER_PATH" \
+              $CONFIG_ARG 2>&1) || EXIT_CODE=$?
             echo "$OUTPUT"
 
             if echo "$OUTPUT" | grep -q "Deployment polling failed"; then
@@ -471,12 +650,70 @@ jobs:
               sleep $DELAY
               continue
             fi
+            # A FOLDER collision is not a deployment collision. `deploy run` always
+            # creates a new folder, so a leftover folder from a failed attempt gives
+            # "Folder already exists" - routing that to the upgrade path would try to
+            # upgrade a deployment that may not exist, or one that never installed
+            # cleanly (which the server rejects).
+            if [ "$EXIT_CODE" -ne 0 ] && echo "$OUTPUT" | grep -qi "folder already exists"; then
+              echo "::error::The Orchestrator folder '$FOLDER_PATH/$NAME' already exists, left over from an earlier deployment attempt."
+              echo "::error::Remove it first - 'uip solution deploy uninstall <deployment-key>' clears the deployment and its folder - then re-run. 'uip solution deploy list' shows the key."
+              exit "$EXIT_CODE"
+            fi
+
             if [ "$EXIT_CODE" -ne 0 ] && echo "$OUTPUT" | grep -q "already exists"; then
               echo "::notice::A deployment already exists - upgrading instead."
-              uip solution deploy upgrade \
-                --name "$NAME" --package-name "$NAME" --package-version "$VERSION" \
-                --folder-path "$FOLDER_PATH"
-              exit $?
+              # `deploy upgrade` takes the deployment KEY as a positional argument -
+              # not --name/--package-name/--package-version, which it rejects.
+              KEY=$(find_deployment_key "$NAME")
+              if [ -z "$KEY" ]; then
+                echo "::error::A deployment named '$NAME' already exists but its key was not found in 'uip solution deploy list'. Upgrade it from the Orchestrator UI, or re-run once the list shows it."
+                uip solution deploy list --limit 200 --output table 2>&1 | head -20
+                exit 1
+              fi
+              # No --version: only the LATEST published version is a valid target
+              # today, and passing an explicit one that is not the newest is rejected.
+              # The pipeline publishes immediately before this, so newest IS ours.
+              echo "Upgrading deployment $KEY (to the newest published version)"
+              UPOUT=$(uip solution deploy upgrade "$KEY" 2>&1); UPRC=$?
+              echo "$UPOUT"
+              if [ "$UPRC" -ne 0 ]; then
+                echo "::error::Upgrade was rejected. A deployment can only be upgraded when it installed cleanly - one left in a failed or partially-provisioned state has to be uninstalled and deployed again:"
+                echo "::error::  uip solution deploy uninstall $KEY"
+              fi
+              exit "$UPRC"
+            fi
+            if [ "$EXIT_CODE" -ne 0 ] && echo "$OUTPUT" | grep -q "LinkedResourceNotFound" \
+               && [ -s "${RUNNER_TEMP:-/tmp}/link_retry.txt" ] && [ -z "${RELINKED:-}" ]; then
+              echo "::notice::Link by folder key was rejected - relinking by folder name and retrying once."
+              RELINKED=1
+              while IFS= read -r r; do
+                [ -n "$r" ] || continue
+                uip solution deploy config link "$CONFIG" "$r" --name "$r" --folder-path "$FOLDER_PATH" >/dev/null 2>&1 \
+                  && echo "  relinked '$r' -> folder-path=$FOLDER_PATH"
+              done < <(python3 "${RUNNER_TEMP:-/tmp}/list_connections.py" "$CONFIG")
+              continue
+            fi
+
+            # Last resort: deploy with no link overrides at all. That is the old
+            # behaviour - the connections get provisioned and need a one-time
+            # authentication in Orchestrator - but a deployed solution awaiting one
+            # click beats a red pipeline and nothing in the folder.
+            if [ "$EXIT_CODE" -ne 0 ] && echo "$OUTPUT" | grep -q "LinkedResourceNotFound" \
+               && [ -n "$CONFIG_ARG" ] && [ -z "${BARE:-}" ]; then
+              echo "::warning::Linking failed by both folder key and folder name. Deploying WITHOUT link overrides - the connections will need authenticating once in Orchestrator."
+              BARE=1
+              CONFIG_ARG=""
+              continue
+            fi
+
+            if echo "$OUTPUT" | grep -q "LinkedResourceNotFound"; then
+              echo "::error::The deploy config linked connections to a folder that Orchestrator does not agree with. What it reported is logged above as 'connections in Orchestrator:'."
+              echo "::error::Compare them with the 'linked ... ->' lines above. If the index lists nothing, the connections exist in Integration Service but are not indexed as solution resources - add them with 'uip solution resources add --source remote --kind Connection --name <name> --folder-path <folder>' and re-run."
+            fi
+            if echo "$OUTPUT" | grep -q "CNS1072"; then
+              echo "::error::The deployment provisioned NEW, unauthenticated connections instead of binding to the existing ones in $FOLDER_PATH."
+              echo "::error::Each connection in the solution must be linked in the deploy config. Check that a connection with the SAME NAME exists in $FOLDER_PATH and that 'uip solution deploy config link' succeeded above."
             fi
             exit ${EXIT_CODE}
           done
@@ -491,7 +728,7 @@ jobs:
             echo ""
             echo "\`${{ needs.resolve.outputs.solution_name }}\` v\`${{ needs.resolve.outputs.version }}\` -> folder \`${{ needs.resolve.outputs.folder_path }}\`"
             echo ""
-            echo "Path: $([ "${{ needs.resolve.outputs.scope }}" = "solution" ] && echo 'solution publish + deploy run' || echo 'package upload (no Solution wrapper)')"
+            echo "Path: $([ "${{ steps.publish.outputs.solution }}" = "true" ] && echo 'solution publish + deploy run' || echo 'package upload (no Solution wrapper)')"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ═══════════════════════════════════════════════════════════════
@@ -544,7 +781,9 @@ jobs:
           uip or processes list --all-folders --output table 2>&1 | head -40 || \
             echo "::warning::Could not list processes - check the granted scopes."
 
-          if [ "$SCOPE" = "solution" ]; then
+          # Same reasoning as Publish: a solution was shipped whenever one was packed,
+          # regardless of what sdd_scope says.
+          if find "$OUTPUT_DIR" -type f \( -name '*.uipx' -o -name '*.zip' \) 2>/dev/null | grep -q .; then
             echo "=== solution deployments ==="
             uip solution deploy list --output table 2>&1 | head -20 || \
               echo "::warning::Could not list solution deployments."

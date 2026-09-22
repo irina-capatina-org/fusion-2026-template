@@ -420,6 +420,8 @@ jobs:
             Build skills:  ${{ needs.identify.outputs.skills }}
             Primary:       ${{ needs.identify.outputs.product }}
             Scope:         ${{ needs.identify.outputs.scope }}
+                           (`single-product` = ONE API Workflow project inside a
+                            UiPath Solution; you still build the solution - Step 1.5)
             Projects:      ${{ needs.identify.outputs.project_count }}
             Write code to: ${{ env.CODE_DIR }}/<project-kebab>/
 
@@ -530,9 +532,10 @@ jobs:
 
             ## Step 1.5 - wrap the projects in a solution, ALWAYS
 
-            Every build ships as a solution, whatever the scope says. "Single-product,
-            single-project" describes how many projects the solution CONTAINS, not
-            whether there is one. Without a `.uipx` the Test stage's `uip solution pack`
+            The target shape for this programme is fixed: a UiPath SOLUTION containing
+            exactly ONE API Workflow project. Every build ships as a solution, whatever
+            the scope says. "Single-product, single-project" describes how many projects
+            the solution CONTAINS - one - not whether there is a solution. Without a `.uipx` the Test stage's `uip solution pack`
             gate finds nothing to pack and passes silently, so the build reaches review
             with its deploy readiness never once proven, and deployment falls back to
             per-project packages - a different and far less exercised path.
