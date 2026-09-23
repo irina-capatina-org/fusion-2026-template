@@ -10,6 +10,14 @@ MIN_BYTES="${MIN_PDD_BYTES:-4000}"
 FAILURES=0
 
 fail() { echo "::error::$*"; FAILURES=$((FAILURES + 1)); }
+# Non-fatal. A finding earns `fail` only when it would stop the SDD being written
+# or the automation being built from it. Anything that would merely make a human
+# tidy the prose is an `advise`: it prints, it annotates the run, and it does NOT
+# trigger the repair pass. A repair costs about forty-five seconds - a fresh agent
+# with its own setup and its own re-read - and spending that on a missing table
+# heading is how this pipeline used to lose a minute per stage.
+ADVISORIES=0
+advise() { echo "::warning::$*"; ADVISORIES=$((ADVISORIES + 1)); }
 ok()   { echo "  ok  - $*"; }
 # Advisory: printed and annotated, never counted toward the exit code.
 soft_note() { echo "::warning::[advisory] $*"; }
@@ -28,7 +36,7 @@ check_document_history() {
   local f="$1" label="${2:-$1}"
 
   if ! grep -qxF '## Document History' "$f"; then
-    fail "$label is missing '## Document History' - without it a revision leaves no record of what changed."
+    advise "$label is missing '## Document History' - a revision will leave no record of what changed. Cosmetic: nothing downstream reads it."
     return
   fi
 
@@ -43,7 +51,7 @@ check_document_history() {
   n=$(printf '%s' "$rows" | grep -c . || true)
 
   if [ "${n:-0}" -lt 1 ]; then
-    fail "$label has an empty Document History table - it needs at least one row."
+    advise "$label has an empty Document History table - it needs at least one row. Cosmetic."
     return
   fi
 
@@ -59,7 +67,7 @@ check_document_history() {
     if (c == "") print NR
   }')
   if [ -n "$blank" ]; then
-    fail "$label Document History has row(s) with an empty Comments cell: row(s) $(echo "$blank" | tr '\n' ' ')"
+    advise "$label Document History has row(s) with an empty Comments cell: row(s) $(echo "$blank" | tr '\n' ' '). Cosmetic."
   else
     ok "Document History has ${n} row(s), all with comments"
   fi
@@ -149,7 +157,7 @@ done
 # --- sections in order -----------------------------------------------------
 ORDER=$(grep -oE '^## [0-9]+\.' "$PDD_FILE" | grep -oE '[0-9]+')
 if [ "$(echo "$ORDER" | tr '\n' ' ')" != "$(echo "$ORDER" | sort -n | tr '\n' ' ')" ]; then
-  fail "Numbered sections are out of order: $(echo "$ORDER" | tr '\n' ' ')"
+  advise "Numbered sections are out of order: $(echo "$ORDER" | tr '\n' ' '). Every section is present, so the SDD can still read them."
 else
   ok "sections in order"
 fi
@@ -254,7 +262,11 @@ fi
 
 echo
 if [ "$FAILURES" -gt 0 ]; then
-  echo "PDD validation FAILED with ${FAILURES} problem(s)."
+  echo "PDD validation FAILED with ${FAILURES} problem(s)$([ "$ADVISORIES" -gt 0 ] && echo " and ${ADVISORIES} advisory finding(s)")."
   exit 1
+fi
+if [ "$ADVISORIES" -gt 0 ]; then
+  echo "PDD validation passed with ${ADVISORIES} advisory finding(s) - printed above, not repaired."
+  exit 0
 fi
 echo "PDD validation passed."

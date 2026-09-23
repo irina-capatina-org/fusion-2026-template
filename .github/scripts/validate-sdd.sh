@@ -47,23 +47,17 @@ ADVISORIES=0
 #
 #   advise() the document is worse than it should be, but usable. Counts toward the
 #            exit code on the FIRST pass, so the repair agent runs and is handed the
-#            exact message - then the workflow's Verify step re-runs with
-#            SDD_ADVISORY_ONLY=1, where advisories print as warnings and can never
-#            fail the run.
+#            exact message.
 #
-# A warning alone would guide nothing: the repair step keys off this script's exit
-# code, so a warn-only finding is printed and ignored.
+# `advise` is a WARNING and nothing more. It never fails the run and never drives
+# the repair pass - only `fail` does. SDD_ADVISORY_ONLY is kept so existing callers
+# still work, but it no longer changes the outcome, because advisories are already
+# non-fatal.
 ADVISORY_ONLY="${SDD_ADVISORY_ONLY:-0}"
 
 fail()   { echo "::error::$*"; FAILURES=$((FAILURES + 1)); }
 warn()   { echo "::warning::$*"; WARNINGS=$((WARNINGS + 1)); }
-advise() {
-  if [ "$ADVISORY_ONLY" = "1" ]; then
-    echo "::warning::[quality] $*"; WARNINGS=$((WARNINGS + 1))
-  else
-    echo "::error::[quality] $*"; ADVISORIES=$((ADVISORIES + 1))
-  fi
-}
+advise() { echo "::warning::[quality] $*"; ADVISORIES=$((ADVISORIES + 1)); }
 ok()     { echo "  ok  - $*"; }
 # Document History naming rides the same advisory channel as every other
 # quality finding, so it drives the repair pass and is then downgraded to a
@@ -289,6 +283,9 @@ fi
 
 SCOPE=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('sdd_scope',''))" "$ARCH_FILE")
 # Fall back for a contract written before `solution_name` existed.
+# The actual process name, so the naming check below can match THAT rather than a
+# shape that any activity type also has.
+PROCESS_NAME=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('process_name',''))" "$ARCH_FILE" 2>/dev/null || true)
 SOLUTION_NAME=$(python3 - "$ARCH_FILE" <<'EOF_SOLNAME'
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -575,9 +572,19 @@ while IFS=$'\t' read -r SDD TEMPLATE ROLE PRODUCT; do
   # downstream reads the prefix; the convention is stated in the architect prompt,
   # where it belongs.
   if [ -n "$RESOURCE_PREFIX" ] && [ "$ROLE" != "solution-root" ]; then
-    # The old convention: a process-name prefix. Not unique across the estate, and it
-    # changes whenever the process is renamed.
-    BADNAMES=$(grep -oE '\b[A-Z][a-z][A-Za-z0-9]*_[A-Za-z0-9_]+\b' "$SDD" | sort -u || true)
+    # The old convention: a resource named <ProcessName>_<thing>. Not unique across
+    # the estate, and it changes whenever the process is renamed.
+    #
+    # Matched against the ACTUAL process name from the contract, never against a
+    # shape. The previous pattern was \b[A-Z][a-z][A-Za-z0-9]*_[A-Za-z0-9_]+\b,
+    # which matches every PascalCase token containing an underscore - so it flagged
+    # `Do_While`, `Try_Catch`, `HTTP_Request` and `If_1`, all of which are UiPath
+    # activity types and none of which is a resource. One of those cost a repair
+    # pass that tried to rename the activity type `jactiv_737_Do_While`.
+    BADNAMES=""
+    if [ -n "${PROCESS_NAME:-}" ]; then
+      BADNAMES=$(grep -oE "\b${PROCESS_NAME}_[A-Za-z0-9_]+\b" "$SDD" | sort -u || true)
+    fi
     if [ -n "$BADNAMES" ]; then
       advise "$SDD has process-name-prefixed resource name(s) - use '${RESOURCE_PREFIX}<thing>' instead:"
       printf '%s\n' "$BADNAMES" | head -6 | sed 's/^/    /'
@@ -726,9 +733,20 @@ if [ "$FAILURES" -gt 0 ]; then
   [ "${SDD_NEVER_FAIL:-0}" = "1" ] && { echo "SDD_NEVER_FAIL=1 - reporting only."; exit 0; }
   exit 1
 fi
+# Advisories do NOT trigger the repair, and calling them advisory while exiting 1
+# was the bug behind a whole class of wasted runs. A repair pass costs about
+# forty-five seconds - a fresh agent, its own action setup, its own re-read of the
+# document - and it must be spent only on something that stops the automation
+# being built. Style, naming conventions, section counts and marker spelling do
+# not. The worst case was a check that matched any PascalCase_token and flagged
+# `Do_While`, a UiPath activity type, as a badly named resource: validation failed,
+# a repair agent started, and its first edit renamed it `jactiv_737_Do_While`.
+#
+# So: `fail` blocks and repairs, `advise` prints a warning and the run continues.
+# If a new check would stop the demo when it fires, it is a `fail`. If it would
+# only make someone tidy prose, it is an `advise` - and now that is free.
 if [ "$ADVISORIES" -gt 0 ]; then
-  echo "SDD is structurally valid but has ${ADVISORIES} quality problem(s) - repairing."
-  [ "${SDD_NEVER_FAIL:-0}" = "1" ] && { echo "SDD_NEVER_FAIL=1 - reporting only."; exit 0; }
-  exit 1
+  echo "SDD validation passed with ${ADVISORIES} advisory finding(s) - printed above, not repaired."
+  exit 0
 fi
 echo "SDD validation passed."
