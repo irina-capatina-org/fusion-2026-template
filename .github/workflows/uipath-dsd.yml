@@ -670,7 +670,13 @@ jobs:
                 echo "::warning::$f was not produced. Documentation is advisory, so the run continues."
                 continue
               fi
-              REFS=$(grep -oE '`'"$CODE_DIR"'/[^`]+`' "$f" | sort -u | wc -l | tr -d ' ')
+              # GitHub runs every step as `bash -e -o pipefail`, whatever the script's own
+            # `set` line says. grep exits 1 when it finds nothing, pipefail carries that
+            # through the pipeline, and -e then kills the step - silently, after the
+            # validator has already printed "passed". A show DSD with no backticked
+            # code/ paths is exactly the input that finds nothing. `|| true` inside the
+            # substitution keeps the count at 0 instead of ending the job.
+            REFS=$( { grep -oE '`'"$CODE_DIR"'/[^`]+`' "$f" || true; } | sort -u | wc -l | tr -d ' ')
               echo "| \`$f\` | $(wc -c < "$f" | tr -d ' ') | $(grep -c '^## [0-9]' "$f" || true) | $REFS |"
             done
           } >> "$GITHUB_STEP_SUMMARY"
