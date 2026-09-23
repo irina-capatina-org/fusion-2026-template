@@ -84,27 +84,36 @@ check_document_history() {
   fi
 }
 
-REQUIRED_SECTIONS=(
-  "1. Document Control"
-  "2. Introduction"
-  "3. Process Overview"
-  "4. Scope"
-  "5. To-Be Process (High Level)"
-  "6. Detailed Process Steps"
-  "7. Applications and Systems"
-  "8. Business Rules"
-  "9. Business Exceptions"
-  "10. System Errors"
-  "11. Data Definitions"
-  # Sections 12-14 of the old contract - Environment and Constraint Signals,
-  # Canonical Test Data, Decomposition Signals - were dropped. They existed to feed
-  # the architecture decision's Constraint Gate and Level 2.5 decomposition call,
-  # and that decision is now derived deterministically in uipath-sdd.yml from the
-  # pins and architectural-considerations.md. Nothing downstream read them, and
-  # generating them cost ~29 seconds of write time per run.
-  "12. Assumptions, Dependencies and Open Questions"
-  "13. Success Criteria"
-)
+# THE section contract comes from the workflow: uipath-pdd.yml defines PDD_SECTIONS
+# once, renders it into the analyst and repair prompts, and exports it here. Reading
+# it from the environment is what stops this script and the prompt disagreeing -
+# which they did, when the workflow was uploaded without this file and a document
+# with the right eleven sections failed on ten "missing" ones from an older list.
+# The built-in list below is only a fallback for running the script by hand.
+if [ -n "${PDD_SECTIONS:-}" ]; then
+  REQUIRED_SECTIONS=()
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"; line="${line#\#\# }"; line="${line%"${line##*[![:space:]]}"}"
+    [ -n "$line" ] && REQUIRED_SECTIONS+=("$line")
+  done <<< "$PDD_SECTIONS"
+  echo "section contract: ${#REQUIRED_SECTIONS[@]} headings from PDD_SECTIONS"
+else
+  echo "::warning::PDD_SECTIONS not set - using this script's built-in list (running outside the workflow?)"
+  REQUIRED_SECTIONS=(
+    "1. Document Control"
+    "2. Introduction"
+    "3. Process Overview"
+    "4. To-Be Process (High Level)"
+    "5. Detailed Process Steps"
+    "6. Applications and Systems"
+    "7. Business Rules"
+    "8. Business Exceptions"
+    "9. System Errors"
+    "10. Assumptions, Dependencies and Open Questions"
+    "11. Success Criteria"
+  )
+fi
+# Every check below that inspects a specific section finds it by NAME, never by number.
 
 echo "Validating $PDD_FILE"
 
@@ -165,13 +174,13 @@ fi
 # --- business rule IDs use ONE format --------------------------------------
 # Every downstream stage (SDD, DSD, review) matches rule IDs as exact strings, so
 # BR-01 and BR-001 are two different rules to all of them. The ID column of
-# section 8 is the authority, and it is the only place this check can fail:
+# the Business Rules section is the authority, and it is the only place this check can fail:
 # a PDD traces every rule back to the SME document, and that document numbers its
 # own rules (BR-001 ...). Those citations belong in `Source` cells and are correct
 # there. Failing the build over them buys nothing and costs a repair round-trip
 # that rewrites real citations into references the source document does not have.
 BR_CANON=$(awk '
-  $0 == "## 8. Business Rules" { inside = 1; next }
+  /^## [0-9]+\. Business Rules$/ { inside = 1; next }
   inside && /^## / { exit }
   inside && /^\|/ && $0 !~ /^\|[ :|-]+\|[ :|-]*$/ {
     n = split($0, cell, "|")
@@ -181,15 +190,15 @@ BR_CANON=$(awk '
 ' "$PDD_FILE" | sort -u)
 
 if [ -z "$BR_CANON" ]; then
-  fail "Section 8 has no row whose first column is a BR-nn rule ID - the SDD reads that column as the rule list."
+  fail "Business Rules has no row whose first column is a BR-nn rule ID - the SDD reads that column as the rule list."
 else
   BR_WIDTHS=$(printf '%s\n' "$BR_CANON" | sed 's/^BR-//' | awk '{ print length($0) }' | sort -u)
   BR_NWIDTH=$(printf '%s\n' "$BR_WIDTHS" | grep -c . || true)
   if [ "${BR_NWIDTH:-0}" -gt 1 ]; then
-    fail "Section 8 rule IDs mix digit widths ($(printf '%s' "$BR_WIDTHS" | tr '\n' '/' | sed 's:/$::')) - use one zero-padded width, BR-01 .. BR-nn."
+    fail "Business Rules IDs mix digit widths ($(printf '%s' "$BR_WIDTHS" | tr '\n' '/' | sed 's:/$::')) - use one zero-padded width, BR-01 .. BR-nn."
     echo "    ids found: $(printf '%s' "$BR_CANON" | tr '\n' ' ')"
   else
-    ok "section 8 rule IDs use one format ($(printf '%s\n' "$BR_CANON" | grep -c . || true) rules)"
+    ok "Business Rules IDs use one format ($(printf '%s\n' "$BR_CANON" | grep -c . || true) rules)"
   fi
 
   # Rule IDs mentioned anywhere else should resolve to that column, otherwise the
@@ -220,9 +229,9 @@ else
     printf '%s\n' "$BR_CANON" | grep -qxF "$ref" || BR_DANGLING="$BR_DANGLING $ref"
   done
   if [ -n "$BR_DANGLING" ]; then
-    soft_note "Rule references outside section 8 that are not in its ID column:${BR_DANGLING} - downstream stages resolve rule IDs against that column only. If these are the SME document's own numbers, they belong in a 'Source' cell."
+    soft_note "Rule references outside Business Rules that are not in its ID column:${BR_DANGLING} - downstream stages resolve rule IDs against that column only. If these are the SME document's own numbers, they belong in a 'Source' cell."
   else
-    ok "all rule references resolve to section 8"
+    ok "all rule references resolve to Business Rules"
   fi
 fi
 
@@ -249,15 +258,15 @@ fi
 
 # --- detailed process steps must actually be detailed ----------------------
 STEP_ROWS=$(awk '
-  $0 == "## 6. Detailed Process Steps" { inside = 1; next }
+  /^## [0-9]+\. Detailed Process Steps$/ { inside = 1; next }
   inside && /^## / { exit }
   inside && /^\|/ && $0 !~ /^\|[ :|-]+\|[ :|-]*$/ { n++ }
   END { print n + 0 }
 ' "$PDD_FILE")
 if [ "$STEP_ROWS" -lt 5 ]; then
-  fail "Section 6 has only ${STEP_ROWS} table rows - needs a real step-by-step breakdown (header + at least 4 steps)."
+  fail "Detailed Process Steps has only ${STEP_ROWS} table rows - needs a real step-by-step breakdown (header + at least 4 steps)."
 else
-  ok "section 6 has ${STEP_ROWS} table rows"
+  ok "Detailed Process Steps has ${STEP_ROWS} table rows"
 fi
 
 echo
