@@ -54,7 +54,6 @@ env:
   ASSIGNEE: irina-capatina-uipath
   AGENT_MODEL: claude-sonnet-4-6
   CLI_VERSION: '1.202.0'
-  NODE_VERSION: '20'
   # Design inputs and the derived task list live here. Must NOT start with a dot:
   # actions/upload-artifact@v4 silently skips hidden files.
   WORK_DIR: design-work
@@ -108,7 +107,7 @@ jobs:
           REPO:     ${{ github.repository }}
         run: |
           bash .github/scripts/observe.sh stage Development status=in-progress \
-            task="Deriving tasks" run=${{ github.run_id }}
+            task="Reading the design" run=${{ github.run_id }}
 
       - name: Resolve the design for this branch
         id: resolve
@@ -284,10 +283,6 @@ jobs:
           ref: ${{ needs.identify.outputs.branch }}
           fetch-depth: 1
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
       - name: Install UiPath CLI and skills
         id: skills
         continue-on-error: true
@@ -318,118 +313,6 @@ jobs:
           cp -R "$RUNNER_TEMP/uip-skills/.agents/skills/." "$HOME/.claude/skills/"
           ls -1 "$HOME/.claude/skills"
 
-      # Task derivation used to be its own job that uploaded WORK_DIR for this one to
-      # download. Both jobs installed the CLI and the skills, both checked the branch
-      # out, and the artifact existed only to cross the boundary - about 35 seconds of
-      # runner time to hand over one markdown file that the next step reads immediately.
-      # The upload stays, because the Test job downloads the same artifact.
-      - name: Run uipath-planner agent
-        uses: anthropics/claude-code-base-action@beta
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: ${{ env.AGENT_MODEL }}
-          timeout_minutes: '20'
-          allowed_tools: "Read,Write,Edit,Glob,Grep,Bash,Skill"
-          prompt: |
-            You derive the implementation task list from an approved SDD. You do NOT
-            write any automation code in this step.
-
-            Architecture: ${{ needs.identify.outputs.arch_file }}
-            SDD(s):       ${{ needs.identify.outputs.sdd_files }}
-            Root SDD:     ${{ needs.identify.outputs.root_sdd }}  (empty for single-product)
-            OUTPUT:       ${{ env.WORK_DIR }}/${{ needs.identify.outputs.tasks_file }}
-
-            ## The shape of this plan is known - keep it short
-
-            The build stage starts from a proven reference implementation
-            (`${{ env.DOCS_DIR }}/architectural-considerations.md` §4.5), so this is
-            not a plan to compose a workflow; it is a plan to extract the reference,
-            align it with the SDD, wrap it in the solution and run the gates. That is
-            at most EIGHT tasks and the file is at most 6 KB. The last task list was
-            17.8 KB and its single Write took 98 seconds, almost all of it prose the
-            developer never reads. One table, one line per task, no rationale
-            paragraphs. Read `SKILL.md` only - not the reference guides it points at.
-            Do not use the TodoWrite tool.
-
-            ## Step 0 - load the planner skill if it is installed
-
-            Run `ls ~/.claude/skills`. If `uipath-planner` is there, READ
-            `~/.claude/skills/uipath-planner/SKILL.md` with the Read tool and follow
-            **Lane A** in AUTONOMOUS mode - the SDD already carries `Status: ready` and
-            `Execution autonomy: autonomous`, so never ask a question and never re-ask
-            anything the handoff header already answers. Emit NO live TaskCreate calls:
-            write the task list to the OUTPUT file instead.
-
-            NEVER load a skill through the Task tool. Spawning a subagent fails in this
-            runner: it resolves a retired model id and comes back
-            `404 not_found_error - model: claude-sonnet-4-20250514`, so you lose the skill
-            entirely. Read SKILL.md with the Read tool, and read the reference files it
-            points at the same way.
-
-            If the skill is not installed, follow Step 2 below.
-
-            ## Step 1 - read the design
-
-            Read the architecture json and every SDD it declares. For solution scope, read
-            the root's Project Inventory first, then each child. The architecture json's
-            `projects[]` is the authoritative build list with `build_order` and `skill`
-            already decided - do not re-derive it or re-order it.
-
-            ## Step 2 - write the task list
-
-            Write a markdown file to the OUTPUT path with:
-
-            - A header table: process name, architecture file, SDD file(s), scope, primary
-              product, generation date (`date +%F`), and `Derived by: uipath-develop`.
-            - One `## Task <n> - <title>` section per task, in build order. Each carries a
-              table with: Skill (from `projects[].skill` / `integrated_components[].skill`),
-              Project, Depends on (task numbers), SDD section reference, and Deliverable.
-              Then 2-5 bullets of intent.
-            - Integrated components come BEFORE the project that consumes them.
-            - A mandatory Testing task per build skill, as the last tasks, routed to that
-              specialist's own testing references.
-            - A final `## Definition of Done` section listing what must be true for the PR
-              to be reviewable.
-
-            ## Hard rules
-
-            - Reference SDD sections by number; do NOT copy architecture content into the
-              task list. The build job reads the SDD itself.
-            - Do NOT describe specialist-internal procedure (target configuration, OR
-              registration, pack/publish, HITL field schemas, auth). Say WHICH skill and
-              IN WHAT ORDER; the specialist owns its own how.
-            - Do NOT invent selectors, URLs, credentials or resource values.
-            - Write exactly one file. Do NOT touch anything under ${{ env.CODE_DIR }}.
-            - Do NOT run git, gh, or `uip login`.
-
-      - name: Verify task list
-        run: |
-          set -euo pipefail
-          T="$WORK_DIR/${{ needs.identify.outputs.tasks_file }}"
-          [ -f "$T" ] || { echo "::error::$T was not written."; exit 1; }
-          N=$(grep -c '^## Task ' "$T" || true)
-          if [ "${N:-0}" -lt 2 ]; then
-            echo "::error::Only ${N:-0} task section(s) in $T - that is not a usable plan."
-            exit 1
-          fi
-          grep -q '^## Definition of Done' "$T" \
-            || { echo "::error::$T has no 'Definition of Done' section."; exit 1; }
-          {
-            echo "### 2. Tasks derived"
-            echo ""
-            echo "\`$T\` - ${N} tasks."
-            echo ""
-            grep -E '^## (Task |Definition)' "$T" | sed 's/^## /- /'
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "--- task list ---"; cat "$T"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: design
-          path: ${{ env.WORK_DIR }}
-          retention-days: 1
-          if-no-files-found: error
-
       - name: Run uipath-developer agent
         uses: anthropics/claude-code-base-action@beta
         with:
@@ -438,12 +321,11 @@ jobs:
           timeout_minutes: '55'
           allowed_tools: "Read,Write,Edit,Glob,Grep,Bash,Skill"
           prompt: |
-            You are uipath-developer. The design is approved and the task list is written.
-            Build it.
+            You are uipath-developer. The design is approved. You plan it and you build
+            it - there is no separate planning agent and no task file.
 
             Architecture:  ${{ needs.identify.outputs.arch_file }}
             SDD(s):        ${{ needs.identify.outputs.sdd_files }}
-            Task list:     ${{ env.WORK_DIR }}/${{ needs.identify.outputs.tasks_file }}
             Org rules:     ${{ env.DOCS_DIR }}/architectural-considerations.md
             Build skills:  ${{ needs.identify.outputs.skills }}
             Primary:       ${{ needs.identify.outputs.product }}
@@ -493,13 +375,20 @@ jobs:
             **Do not use the TodoWrite tool.** Each call is a model round trip; the last
             build made twelve of them. Plan in your head, then act.
 
-            ## Step 1 - read the design, then work the task list in order
+            ## Step 1 - read the design, plan in EIGHT lines or fewer, then build
 
-            Read the architecture json, every SDD, and the task list. Work the tasks in
-            build order. The SDD is the specification: its schemas, named resources,
-            business rules and process steps are what the reference must satisfy. Where
-            the SDD and the reference disagree, the SDD wins - it was reviewed and
-            approved - but where the SDD is silent, the reference stands as it is.
+            Read the architecture json and every SDD. Then decide your plan: at most
+            eight steps, and it goes in ONE place - as a short numbered list at the top
+            of `build-notes.md` when you write it in Step 2. There is no separate task
+            file and no planning agent any more: a previous run spent 98 seconds
+            writing a 17.8 KB task list that nothing but the developer read, and the
+            developer already knew what to do. Plan in your head, record it in eight
+            lines, execute.
+
+            The SDD is the specification: its schemas, named resources, business rules
+            and process steps are what the reference must satisfy. Where the SDD and the
+            reference disagree, the SDD wins - it was reviewed and approved - but where
+            the SDD is silent, the reference stands as it is.
 
             Read `Org rules` above in full as well - it is the org's own platform facts,
             and it is AUTHORITATIVE. The SDD deliberately does NOT repeat what is in it.
@@ -694,8 +583,11 @@ jobs:
 
             ## Step 2 - write build notes
 
-            Write `${{ env.CODE_DIR }}/build-notes.md`:
+            Write `${{ env.CODE_DIR }}/build-notes.md`. **At most 2 KB.** It is read by
+            the review and documentation agents for facts, not prose - the last one was
+            6.4 KB and took 43 seconds to write.
 
+            - The plan you executed: the numbered list from Step 1, eight lines or fewer.
             - One-line summary of what was built.
             - A table: Task | Project | Status (done / partial / blocked) | Notes.
             - `## Deviations from the SDD` - anything you did differently, and why. Empty
@@ -850,15 +742,6 @@ jobs:
         with:
           ref: ${{ needs.identify.outputs.branch }}
           fetch-depth: 1
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: design
-          path: ${{ env.WORK_DIR }}
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
 
       - name: Install UiPath CLI and skills
         continue-on-error: true
@@ -1227,7 +1110,7 @@ jobs:
   # ═══════════════════════════════════════════════════════════════
 
   open-pr:
-    name: Open PR
+    name: Open PR and assign
     needs: [identify, test]
     runs-on: ubuntu-latest
     outputs:
@@ -1337,18 +1220,15 @@ jobs:
 
   # ═══════════════════════════════════════════════════════════════
   # 6. Assign PR
-  # ═══════════════════════════════════════════════════════════════
-  assign-pr:
-    name: Assign PR
-    needs: [identify, open-pr]
-    runs-on: ubuntu-latest
-    steps:
+      # Assigning the PR used to be its own job after this one - one more runner
+      # and one more checkout to make two `gh` calls against a PR number this job
+      # already has.
       - name: Assign and request review
         env:
           GH_TOKEN:  ${{ secrets.DEV_PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
-          PR_NUMBER: ${{ needs.open-pr.outputs.pr_number }}
-          PR_URL:    ${{ needs.open-pr.outputs.pr_url }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          PR_URL:    ${{ steps.pr.outputs.pr_url }}
         run: |
           set -euo pipefail
           gh pr edit "$PR_NUMBER" --repo "$REPO" --add-assignee "$ASSIGNEE"
@@ -1365,12 +1245,6 @@ jobs:
             echo "[#$PR_NUMBER]($PR_URL) assigned to \`$ASSIGNEE\`. \`uipath-review\` reviews it and merges on approval."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/checkout@v4
-        with:
-          ref: develop
-          sparse-checkout: .github/scripts
-          fetch-depth: 1
-
       - name: Observe - Testing in review
         # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
         # a rate limit or a transient 5xx would otherwise take a good stage down with it.
@@ -1378,8 +1252,8 @@ jobs:
         env:
           GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
-          PR_NUMBER: ${{ needs.open-pr.outputs.pr_number }}
-          PR_URL:    ${{ needs.open-pr.outputs.pr_url }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          PR_URL:    ${{ steps.pr.outputs.pr_url }}
         run: |
           # The gate moves to Testing the moment the PR exists, so the bubble is
           # already amber when uipath-review picks it up. Development stays done.
@@ -1395,10 +1269,11 @@ jobs:
   # Without this a crashed run leaves the stage on `in-progress` and the card
   # spins for ever. Runs only when a job above actually failed - a skipped job
   # does not count as a failure.
+
   # ═══════════════════════════════════════════════════════════════
   faulted:
     name: Record fault
-    needs: [identify, build, test, open-pr, assign-pr]
+    needs: [identify, build, test, open-pr]
     if: failure()
     runs-on: ubuntu-latest
     steps:

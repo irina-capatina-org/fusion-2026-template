@@ -38,6 +38,26 @@ env:
   ASSIGNEE: irina-capatina-uipath
   AGENT_MODEL: claude-sonnet-4-6
   MIN_PDD_BYTES: '4000'
+  # THE section contract, defined once. The analyst prompt renders this list, the
+  # repair prompt renders it, the agent's self-check counts it, and
+  # validate-pdd.sh reads it from the environment - so the prompt and the validator
+  # can no longer disagree. They used to be four separate copies, and a run where
+  # the workflow was uploaded but the validator was not produced a document with
+  # the eleven sections the prompt asked for, ten "missing section" errors from a
+  # validator still expecting thirteen, and a 143-second repair that put the two
+  # deleted sections back. Change a section HERE and nowhere else.
+  PDD_SECTIONS: |
+    ## 1. Document Control
+    ## 2. Introduction
+    ## 3. Process Overview
+    ## 4. To-Be Process (High Level)
+    ## 5. Detailed Process Steps
+    ## 6. Applications and Systems
+    ## 7. Business Rules
+    ## 8. Business Exceptions
+    ## 9. System Errors
+    ## 10. Assumptions, Dependencies and Open Questions
+    ## 11. Success Criteria
   # Where the extracted request markdown lives inside the workspace. Never
   # committed - only the PDD is staged. Must NOT start with a dot:
   # actions/upload-artifact@v4 silently skips hidden files.
@@ -317,17 +337,7 @@ jobs:
                 # PDD - <process title>
 
                 ## Document History
-                ## 1. Document Control
-                ## 2. Introduction
-                ## 3. Process Overview
-                ## 4. To-Be Process (High Level)
-                ## 5. Detailed Process Steps
-                ## 6. Applications and Systems
-                ## 7. Business Rules
-                ## 8. Business Exceptions
-                ## 9. System Errors
-                ## 10. Assumptions, Dependencies and Open Questions
-                ## 11. Success Criteria
+                ${{ env.PDD_SECTIONS }}
 
             What each section must contain:
 
@@ -469,11 +479,13 @@ jobs:
 
             ## Step 3 - self-check before you finish - ONE command, nothing else
 
-            Confirm all 11 numbered headings are present:
+            Confirm every heading in the list above is present, and no others:
 
                 grep -c '^## [0-9]' ${{ needs.identify.outputs.pdd_file }}
+                printf '%s\n' "$PDD_SECTIONS" | grep -c '^## '
 
-            That must print 11. If it does not, add the missing heading and stop.
+            The two numbers must be equal (`PDD_SECTIONS` is in your environment; it
+            is the same list). If they are not, add the missing heading and stop.
             Do NOT run `wc -c`. Do NOT trim, tidy or rewrite the file for any other
             reason - the validator has a size FLOOR (4 KB) and no ceiling, so a document
             a few hundred bytes over the target is finished, not a defect. The run before
@@ -534,6 +546,18 @@ jobs:
 
       # Soft validation, then one repair pass, then a hard gate. A single weak
       # agent run must not put a half-empty PDD in front of a reviewer.
+      # Fail fast, with the actual reason, if the validator on this branch predates
+      # the contract in this workflow. Without this the symptom is ten "missing
+      # section" errors and a repair that rebuilds the old shape - 2.5 minutes to
+      # learn that one file was not uploaded.
+      - name: Refuse a stale validator
+        run: |
+          if ! grep -q 'PDD_SECTIONS' .github/scripts/validate-pdd.sh; then
+            echo "::error::.github/scripts/validate-pdd.sh predates this workflow: it carries its own section list instead of reading PDD_SECTIONS. Upload the current validate-pdd.sh alongside uipath-pdd.yml."
+            exit 1
+          fi
+          echo "validator reads PDD_SECTIONS - contract is single-sourced."
+
       - name: Validate PDD
         id: check
         continue-on-error: true
@@ -557,9 +581,16 @@ jobs:
                 bash .github/scripts/validate-pdd.sh ${{ needs.identify.outputs.pdd_file }}
 
             Then read ${{ env.WORK_DIR }}/request-details.md and fix the PDD so the validator
-            passes: all 18 `## <n>.` headings present in order, real content in every section,
-            no placeholder text, no empty tables. If the file is missing entirely, write it
-            from scratch. Re-run the validator until it exits 0.
+            passes. The required headings are EXACTLY these, in this order - the same list
+            the validator checks against, from `$PDD_SECTIONS` in your environment:
+
+            ${{ env.PDD_SECTIONS }}
+
+            Real content in every section, no placeholder text, no empty tables. Never
+            add a heading that is not in that list and never renumber to make room for
+            one - a repair once re-added two sections the design had deliberately removed.
+            If the file is missing entirely, write it from scratch. Re-run the validator
+            until it exits 0.
 
             Do not modify anything under ${{ env.WORK_DIR }}. Do not run git or gh.
 

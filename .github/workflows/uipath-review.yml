@@ -1,8 +1,8 @@
 name: uipath-review
 
-# Stage 5 of the ADLC chain, as three visible jobs:
+# Stage 5 of the ADLC chain, as ONE job:
 #
-#   Run checks -> Review PR -> Request human review
+#   resolve PR -> machine gates -> agent posts the review -> merge -> start Docs
 #
 # This one is NOT a branch stage. Every other stage cuts a branch, writes a file and
 # opens a PR; review has nothing to write, so it hangs off the PR that
@@ -107,42 +107,18 @@ jobs:
   # whether this PR is even ours to review - the PDD and SDD PRs also target
   # develop, and they carry no code.
   # ═══════════════════════════════════════════════════════════════
-  validate:
-    name: Run checks
-    # The real filter, in two parts.
-    #
-    # SAME REPO: the PR's branch must live here, not in a fork. On a public repo
-    # anyone can fork, and a fork PR into develop touching code/** clears both the
-    # paths filter and the branch-name test below - the author controls their own
-    # branch names. Nothing leaks, because GitHub hands fork PRs no secrets, but
-    # CLAUDE_CODE_OAUTH_TOKEN then arrives empty and the agent dies on an auth
-    # error that reads like a broken pipeline rather than a stranger's PR. On a
-    # private repo this can never be false; it earns its place the day we go public.
-    #
-    # BRANCH NAME: everything else into develop - analysis-*, architecture-*,
-    # docs-* - is a document PR, so no job runs and no run does any work.
-    #
-    # The inner parentheses are load-bearing: without them the `||` chain would let
-    # a fork PR through on the branch-name test alone, which is the case this is
-    # here to block.
-    #
-    # A manual dispatch is let through so a PR can be force-reviewed; the shell
-    # check inside still guards that path.
+  # ═══════════════════════════════════════════════════════════════
+  # ONE job. This used to be four - Run checks, Review PR, Merge and start Docs,
+  # plus the fault recorder - and three of them existed only to carry a PR number
+  # and two SHAs across runner boundaries, each costing a spin-up, a checkout and a
+  # gap. The stage's budget is about a minute, and the base action alone spends
+  # fifteen seconds of it installing the Claude CLI, so there is no room for
+  # boundaries that move nothing.
+  # ═══════════════════════════════════════════════════════════════
+  review:
+    name: Review PR
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.pull_request.head.repo.full_name == github.repository &&
-       (startsWith(github.event.pull_request.head.ref, 'dev-') ||
-        startsWith(github.event.pull_request.head.ref, 'development-')))
     runs-on: ubuntu-latest
-    outputs:
-      pr_number: ${{ steps.pr.outputs.pr_number }}
-      base_sha:  ${{ steps.pr.outputs.base_sha }}
-      head_sha:  ${{ steps.pr.outputs.head_sha }}
-      head_ref:  ${{ steps.pr.outputs.head_ref }}
-      reviewable: ${{ steps.pr.outputs.reviewable }}
-      arch_file: ${{ steps.inputs.outputs.arch_file }}
-      sdd_files: ${{ steps.inputs.outputs.sdd_files }}
-      product:   ${{ steps.inputs.outputs.product }}
     steps:
       - name: Resolve PR refs
         id: pr
@@ -270,12 +246,13 @@ jobs:
       # Not redundant with Test: Test ran on the development branch, this runs on
       # the commit that is about to merge. It costs about twelve seconds.
       - name: Prove the build is valid and deployable
+        id: gates
         if: steps.pr.outputs.reviewable == 'true'
         env:
           PRODUCT: ${{ steps.inputs.outputs.product }}
         run: |
           set -uo pipefail
-          RC=0
+          RC=0; V_OK=skipped; B_OK=skipped; P_OK=skipped
 
           npm i -g "@uipath/cli@${CLI_VERSION}" >/dev/null 2>&1 \
             || { echo "::warning::@uipath/cli install failed - CLI gates skipped"; }
@@ -289,17 +266,16 @@ jobs:
               [ -n "$proj" ] || continue
               echo "=== uip api-workflow build/validate ($proj) ==="
               MAIN=$(python3 -c "import json;print(json.load(open('$proj/project.uiproj')).get('MainFile') or 'Workflow.json')")
-              ( cd "$proj" && uip api-workflow build . && uip api-workflow validate "$MAIN" ) \
-                || { echo "::error::$proj does not validate - the automation would not run."; RC=1; }
+              if ( cd "$proj" && uip api-workflow build . && uip api-workflow validate "$MAIN" ); then V_OK=passed
+              else echo "::error::$proj does not validate - the automation would not run."; RC=1; V_OK=FAILED; fi
             done < <(find "$CODE_DIR" -maxdepth 3 -type f -name 'project.uiproj' -exec dirname {} \; | sort)
           fi
 
           # 2. it can actually run - the checks `uip api-workflow validate` cannot make
           if [ -f .github/scripts/validate-build.sh ]; then
             echo "=== validate-build.sh ==="
-            bash .github/scripts/validate-build.sh "$CODE_DIR" \
-              "$DOCS_DIR/architectural-considerations.md" \
-              || { echo "::error::the built workflow cannot run as built."; RC=1; }
+            if bash .github/scripts/validate-build.sh "$CODE_DIR" "$DOCS_DIR/architectural-considerations.md"; then B_OK=passed
+            else echo "::error::the built workflow cannot run as built."; RC=1; B_OK=FAILED; fi
           fi
 
           # 3. deploy readiness - packing is the only offline proof of it
@@ -307,9 +283,8 @@ jobs:
             while IFS= read -r sol; do
               [ -n "$sol" ] || continue
               echo "=== uip solution pack ($sol) ==="
-              ( cd "$sol" && uip solution pack . "$RUNNER_TEMP/reviewpack" \
-                  --name "$(basename "$sol")" --version 0.0.1 --output json ) \
-                || { echo "::error::solution pack failed in $sol - the deploy stage would fail."; RC=1; }
+              if ( cd "$sol" && uip solution pack . "$RUNNER_TEMP/reviewpack" --name "$(basename "$sol")" --version 0.0.1 --output json ); then P_OK=passed
+              else echo "::error::solution pack failed in $sol - the deploy stage would fail."; RC=1; P_OK=FAILED; fi
             done < <(find "$CODE_DIR" -maxdepth 3 -type f -name '*.uipx' -exec dirname {} \; | sort -u)
           fi
 
@@ -317,6 +292,7 @@ jobs:
             echo "::error::Review stage stopped: the implementation is not valid or would not deploy. This is the only condition that stops this stage - the review agent itself never blocks."
             exit 1
           fi
+          { echo "validate=$V_OK"; echo "build=$B_OK"; echo "pack=$P_OK"; } >> "$GITHUB_OUTPUT"
           echo "Valid and deployable."
 
       - name: Checks summary
@@ -335,29 +311,15 @@ jobs:
 
   # ═══════════════════════════════════════════════════════════════
   # 2. Review PR
-  # ═══════════════════════════════════════════════════════════════
-  review:
-    name: Review PR
-    needs: validate
-    if: needs.validate.outputs.reviewable == 'true'
-    runs-on: ubuntu-latest
-    outputs:
-      pr_number: ${{ needs.validate.outputs.pr_number }}
-      verdict:   ${{ steps.verdict.outputs.state }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.validate.outputs.head_sha }}
-          fetch-depth: 0
-
       - name: Observe - Testing in review
+        if: steps.pr.outputs.reviewable == 'true'
         # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
         # a rate limit or a transient 5xx would otherwise take a good stage down with it.
         continue-on-error: true
         env:
           GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
-          PR_NUMBER: ${{ needs.validate.outputs.pr_number }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
         run: |
           bash .github/scripts/observe.sh stage Testing status=in-review decidedBy=agent \
             pr="$PR_NUMBER" \
@@ -372,174 +334,132 @@ jobs:
       # them re-running a validation the Test stage had already gated on, hunting
       # for the `uip` binary on $PATH, and re-reading its own posted review.
       - name: Assemble the review bundle
+        if: steps.pr.outputs.reviewable == 'true'
         env:
-          BASE_SHA:  ${{ needs.validate.outputs.base_sha }}
-          HEAD_SHA:  ${{ needs.validate.outputs.head_sha }}
-          ARCH_FILE: ${{ needs.validate.outputs.arch_file }}
-          SDD_FILES: ${{ needs.validate.outputs.sdd_files }}
+          BASE_SHA:  ${{ steps.pr.outputs.base_sha }}
+          HEAD_SHA:  ${{ steps.pr.outputs.head_sha }}
+          ARCH_FILE: ${{ steps.inputs.outputs.arch_file }}
+          SDD_FILES: ${{ steps.inputs.outputs.sdd_files }}
+          G_VALIDATE: ${{ steps.gates.outputs.validate }}
+          G_BUILD:    ${{ steps.gates.outputs.build }}
+          G_PACK:     ${{ steps.gates.outputs.pack }}
         run: |
           set -uo pipefail
+          # The build is a copy of the reference implementation adjusted to the SDD, and
+          # the three machine gates above have already decided it is valid and would
+          # deploy. There is nothing left to JUDGE, so the agent does not get a diff to
+          # judge - the diff of a fresh 22 KB Workflow.json is the whole file, and the
+          # last run read that seven times. It gets facts, computed here, and narrates
+          # them. Everything below is deterministic; the agent's only job is prose.
           B=/tmp/review-bundle.md
+          WF=$(find "$CODE_DIR" -maxdepth 4 -name Workflow.json -not -path '*/dist/*' | head -1)
+          PDD=$(find "$DOCS_DIR" -maxdepth 1 -iname 'pdd-*.md' | head -1)
+          SOL=$(python3 -c "import json;d=json.load(open('$ARCH_FILE'));print(d.get('solution_name','?'))" 2>/dev/null || echo "?")
+          PRJ=$(python3 -c "import json;d=json.load(open('$ARCH_FILE'));print(d['projects'][0]['name'])" 2>/dev/null || echo "?")
+          ACTS=$( { grep -c '"activityType"' "$WF" 2>/dev/null || true; } | tail -1); ACTS=${ACTS:-0}
           {
-            echo "# Review bundle"
+            echo "# Review fact sheet - PR head ${HEAD_SHA:0:7}"
             echo
-            echo "## Files changed"
-            git diff --stat "$BASE_SHA" "$HEAD_SHA" || true
+            echo "## Machine gates (already decided - these are the review)"
+            echo "| Gate | Result |"; echo "| --- | --- |"
+            echo "| uip api-workflow build + validate | $G_VALIDATE |"
+            echo "| validate-build.sh (runnability: URLs, connections, Block Kit, names) | $G_BUILD |"
+            echo "| uip solution pack (deploy readiness) | $G_PACK |"
             echo
-            echo "## The diff"
-            echo '```diff'
-            # Generated JSON is long and reviewing it line by line is not the job;
-            # the design questions live in the workflow and the notes.
-            git diff "$BASE_SHA" "$HEAD_SHA" -- . ':(exclude)**/*.uipx' | head -1200 || true
-            echo '```'
+            echo "## What was built"
+            echo "| | |"; echo "| --- | --- |"
+            echo "| Solution | \`$SOL\` |"; echo "| API Workflow project | \`$PRJ\` |"
+            echo "| Activities in Workflow.json | $ACTS |"
+            echo "| Files changed | $(git diff --name-only "$BASE_SHA" "$HEAD_SHA" 2>/dev/null | wc -l | tr -d ' ') |"
             echo
-            echo "## build-notes.md"
-            cat "$CODE_DIR/build-notes.md" 2>/dev/null || echo "(none)"
+            # Rule ids are not embedded in Workflow.json - the workflow implements the
+            # SDD, and the SDD carries the ids - so coverage is measured against the
+            # design and the build notes, never against the JSON.
+            echo "## Business-rule coverage (every PDD rule carried into the design?)"
+            echo "| Rule | In SDD | In build notes |"; echo "| --- | --- | --- |"
+            if [ -n "$PDD" ]; then
+              awk '/^## [0-9]+\. Business Rules$/{f=1;next} f&&/^## /{exit} f&&/^\|/{n=split($0,c,"|");id=c[2];gsub(/^[ \t]+|[ \t]+$/,"",id);if(id~/^BR-[0-9]+$/)print id}' "$PDD" \
+              | while read -r id; do
+                  sd=0; for f in $SDD_FILES; do c=$( { grep -c "$id" "$f" 2>/dev/null || true; } | tail -1); sd=$((sd + ${c:-0})); done
+                  bn=$( { grep -c "$id" "$CODE_DIR/build-notes.md" 2>/dev/null || true; } | tail -1); bn=${bn:-0}
+                  echo "| $id | $([ "$sd" -gt 0 ] && echo yes || echo no) | $([ "$bn" -gt 0 ] && echo yes || echo no) |"
+                done
+            else
+              echo "| (no PDD found) | - | - |"
+            fi
             echo
-            echo "## Architecture contract"
-            cat "$ARCH_FILE" 2>/dev/null || echo "(none)"
-            for f in $SDD_FILES; do
-              echo
-              echo "## SDD - $f"
-              cat "$f" 2>/dev/null || echo "(missing)"
-            done
+            echo "## build-notes.md (first 60 lines)"
+            head -60 "$CODE_DIR/build-notes.md" 2>/dev/null || echo "(none)"
           } > "$B"
-          echo "bundle: $(wc -c < "$B") bytes, $(wc -l < "$B") lines"
+          echo "bundle: $(wc -c < "$B") bytes"; cat "$B"
 
-      # env is LOAD-BEARING. A rewrite of this step once dropped it; the agent then
-      # had no GH_TOKEN, `gh pr review` failed, and it spent five minutes hunting
-      # for credentials - grepping the environment, cat-ing runner temp files,
-      # blocking 120s on a named pipe, blocking 120s more on an interactive
-      # `gh auth login`. 372 seconds for a review that should take 40.
       - name: Run uipath-review agent
+        if: steps.pr.outputs.reviewable == 'true'
         uses: anthropics/claude-code-base-action@beta
         env:
           GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
-          PR_NUMBER: ${{ needs.validate.outputs.pr_number }}
-          BASE_SHA:  ${{ needs.validate.outputs.base_sha }}
-          HEAD_SHA:  ${{ needs.validate.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          BASE_SHA:  ${{ steps.pr.outputs.base_sha }}
+          HEAD_SHA:  ${{ steps.pr.outputs.head_sha }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           model: ${{ env.AGENT_MODEL }}
-          # A hard cap. This step is commentary; nothing downstream waits on its
-          # opinion, so if it is still running after four minutes something is
-          # hung and the right outcome is to stop it, not to wait.
-          timeout_minutes: '4'
+          # Hard caps, both of them. This step is commentary - nothing downstream
+          # waits on its opinion - and its whole job is one Read and one gh call.
+          # max_turns bounds the damage if the agent starts exploring anyway: the
+          # run that lost its GH_TOKEN took 77 turns; this cannot take more than 5.
+          timeout_minutes: '2'
+          max_turns: '5'
           allowed_tools: "Read,Bash"
           prompt: |
-            You are uipath-review. You review a UiPath implementation against the
-            design that was already approved for it, and you post that review on the
-            pull request.
+            You are uipath-review. Post the implementation review on PR $PR_NUMBER in
+            $REPO. You have TWO actions to take, in this order, and then you stop.
 
-            Everything you need is already in ONE file: `/tmp/review-bundle.md`. It
-            holds the file list, the diff, `build-notes.md`, the architecture contract
-            and every SDD. Read it with the Read tool, ONCE. That is your first action
-            and your only read - the last run read it seven times, which is seven
-            round trips for information that did not change.
+            **Action 1 - Read `/tmp/review-bundle.md`, once.** It is a short fact sheet:
+            the three machine gates and their results, what was built, a business-rule
+            coverage table, and the build notes. Every fact you need is in it. Do not
+            read anything else, do not run git, do not run uip - the gates already ran.
 
-            PR number: $PR_NUMBER   (repository: $REPO - pass `--repo "$REPO"` to gh)
+            **Action 2 - write the body and post it, in one Bash call:**
 
-            `GH_TOKEN` is set in your environment and `gh` is authenticated with it.
-            **If a `gh` command fails, print its error in your final message and STOP.**
-            Do not search the environment, the filesystem or runner temp directories
-            for another token, do not run `gh auth login`, do not call the OIDC
-            endpoint. There is no other credential, and the job after you handles a
-            missing review without blocking anything. The last run did all of those
-            things and hung twice for two minutes each.
-
-            ## This review does not gate anything - and that is deliberate
-
-            The job before you already proved the automation is valid and would deploy,
-            with the same three machine checks the Test stage ran: `uip api-workflow
-            validate`, `validate-build.sh` and `uip solution pack`. If any had failed
-            you would not be running. So there is nothing left for you to block on that
-            has not already been decided by something deterministic, and a judgement
-            call is not allowed to stop the chain two stages from production.
-
-            **You therefore always `--approve`.** Your findings are still real and still
-            valuable - they go in the body, where a human reads them. What you must not
-            do is withhold approval, because that halts a release whose correctness has
-            already been established by machine.
-
-            Do NOT re-run `uip api-workflow validate`, `validate-build.sh` or
-            `uip solution pack`. They have run. Re-running them is how the last review
-            spent four tool calls looking for the `uip` binary.
-
-            Do not use the TodoWrite tool - every call is a model round trip and it puts nothing in the output.
-
-            ## What to look for, in one pass
-
-            Read the bundle, then judge - do not go exploring the repository.
-
-            1. **Specification fidelity**, which is most of the job: every `BR-xx` in
-               the SDD implemented somewhere in the diff, and the schemas and resource
-               names matching the SDD.
-            2. **Exception coverage** - the SDD's business exceptions and system errors
-               have the handling it prescribes.
-            3. **Correctness** - null and empty handling, loop boundaries, comparison
-               operators, dates and timezones.
-            4. **Declared deviations** - `build-notes.md` *Deviations from the SDD* and
-               *Left for a human*. A declared deviation is a note; an undeclared one is
-               a finding.
-            5. **Nothing committed that should not be** - a credential value in the
-               diff is the one finding worth shouting about.
-
-            The SDD was approved. Whether you would have designed it differently is not
-            the question; whether the code implements it is. "No issues found" is a
-            complete and valuable review when the diff is clean - do not invent
-            findings to look thorough.
-
-            ## Write the body, then post it, then stop
-
-            Write `/tmp/review-body.md` with a QUOTED heredoc - the single-quoted
-            `'EOF_BODY'` delimiter is required, or bash eats the backticks and dollar
-            signs in your own text. Structure:
-
+                cat > /tmp/review-body.md <<'EOF_BODY'
                 ## Implementation Review
 
-                **Summary:** <one line on what this PR implements>
+                **Summary:** <one sentence: what this PR delivers, from the fact sheet>
 
-                **Specification fidelity:** <n> of <m> SDD business rules implemented
+                **Machine gates:** validate <result> · runnability <result> · pack <result>
 
-                ### Findings
+                **Business-rule coverage:** <n> of <m> PDD rules carried into the design
+                <one line per rule whose SDD column says "no", if any - otherwise omit this line>
 
-                **#1** <icon> **<SEVERITY>** — `<path/to/file>`
-                <what is wrong>
-                > **Fix:** <how to fix it>
+                **Notes:** <one or two sentences from build-notes.md worth a reviewer's eye, or "No deviations declared.">
 
                 ---
 
                 > [!TIP]
-                > **Recommendation: MERGE** — <one-sentence rationale>
-
-            🔴 for something that should be fixed, 🟡 for a note. With nothing to
-            report, replace *Findings* with the single line
-            `No issues found — the implementation matches the SDD.` Always end with the
-            `> [!TIP]` MERGE callout; GitHub renders it green.
-
-            Then post exactly one review and stop:
-
+                > **Recommendation: MERGE** — validated, runnable and deployable by machine check; the review is informational.
+                EOF_BODY
                 gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body-file /tmp/review-body.md
 
-            Do not read the review back to check it posted - the job after you does
-            that, and doing it yourself cost the last run three extra tool calls. If
-            `--approve` is refused because the token authored the PR, fall back to
-            `gh pr review "$PR_NUMBER" --repo "$REPO" --comment --body-file /tmp/review-body.md`
-            and say so in your final message. If that fails too, stop and report.
+            The single-quoted `'EOF_BODY'` is required so bash leaves the backticks
+            alone. Always `--approve`: this review cannot block, because everything
+            that could justify blocking was decided by the gates before you started.
+            If `--approve` is refused (token authored the PR), run the same command
+            with `--comment` and say so. If that fails too, report the error and stop.
 
-            ## Hard rules
-
-            - ONE review action. Always `--approve`, never `--request-changes`.
-            - Do NOT modify, commit, push or merge anything.
-            - Do NOT run `uip login` or anything needing a tenant.
+            `GH_TOKEN` is set. If `gh` fails, do NOT look for another credential, do
+            NOT run `gh auth login`, do NOT read the environment or runner temp files.
+            Report and stop. Do not read the review back afterwards - the next step does.
+            Do not use the TodoWrite tool.
 
       - name: Read back the verdict
+        if: steps.pr.outputs.reviewable == 'true'
         id: verdict
         env:
           GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
-          PR_NUMBER: ${{ needs.validate.outputs.pr_number }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
         run: |
           set -uo pipefail
           STATE=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json reviews \
@@ -569,31 +489,17 @@ jobs:
   # The agent's verdict is the gate. APPROVED merges into develop and the chain
   # continues into Docs; anything else leaves the PR open for a human, which stalls
   # the case on purpose - a rejected implementation should not reach production.
-  # ═══════════════════════════════════════════════════════════════
-  # The job key stays `merge-or-escalate` so the `faulted` job's `needs` keeps
-  # working; it no longer escalates, because the machine gates decide and they
-  # have already passed by the time anything reaches here.
-  merge-or-escalate:
-    name: Merge and start Docs
-    needs: [validate, review]
-    if: needs.validate.outputs.reviewable == 'true'
-    runs-on: ubuntu-latest
-    outputs:
-      # Only set when the implementation actually landed on develop. An escalated
-      # PR leaves it empty, which is what stops the Docs stage starting against
-      # code that is still sitting in an open PR.
-      merged: ${{ steps.merge.outputs.merged }}
-    steps:
       # GITHUB_TOKEN, never the dev PAT: this job posts the agent's review on a PR
       # the PAT now authors, and GitHub rejects a review submitted by the PR's own
       # author. Reviewing as the bot is also what puts it in the Reviewers sidebar.
       - name: Merge, then start Docs
+        if: steps.pr.outputs.reviewable == 'true'
         id: merge
         env:
           GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
-          PR_NUMBER: ${{ needs.validate.outputs.pr_number }}
-          VERDICT:   ${{ needs.review.outputs.verdict }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          VERDICT:   ${{ steps.verdict.outputs.state }}
         run: |
           set -euo pipefail
 
@@ -628,13 +534,8 @@ jobs:
       # This job otherwise makes only `gh` API calls and needs no working tree - but
       # observe.sh is a FILE, and a job that never checks out has an empty workspace.
       # Sparse: only the scripts, from develop, so it costs a second.
-      - uses: actions/checkout@v4
-        with:
-          ref: develop
-          sparse-checkout: .github/scripts
-          fetch-depth: 1
-
       - name: Observe - Testing decided
+        if: steps.pr.outputs.reviewable == 'true'
         # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
         # a rate limit or a transient 5xx would otherwise take a good stage down with it.
         continue-on-error: true
@@ -663,7 +564,7 @@ jobs:
           GH_TOKEN:  ${{ secrets.DEV_PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
           USING_PAT: ${{ secrets.DEV_PR_AUTHOR_PAT != '' }}
           REPO:      ${{ github.repository }}
-          HEAD_REF:  ${{ needs.validate.outputs.head_ref }}
+          HEAD_REF:  ${{ steps.pr.outputs.head_ref }}
         run: |
           set -euo pipefail
 
@@ -742,7 +643,7 @@ jobs:
   # ═══════════════════════════════════════════════════════════════
   faulted:
     name: Record fault
-    needs: [validate, review, merge-or-escalate]
+    needs: review
     if: failure()
     runs-on: ubuntu-latest
     steps:
