@@ -559,6 +559,519 @@ seconds. Letting it fail in the Test stage costs a fresh agent three minutes, mo
 spent working out where the files are — and a repair written without this context is how
 the doubled brace got introduced in the first place.
 
+
+---
+
+## 4.5 Reference implementation — the build starts from THIS, not from a blank file
+
+Below is the complete `Workflow.json` of a build of this exact process that passed
+`uip api-workflow validate`, passed `validate-build.sh`, packed, published, deployed
+to Orchestrator, ran, and posted the Block Kit message to Slack. It is the approved
+implementation of the No-PO Invoice Chaser, and **the build stage is required to
+start from it** rather than compose a workflow from the SDD and the product docs.
+
+Why this exists. Two builds of the same SDD came out at 21 KB and 35 KB, one right
+and one bloated, and every build re-learned the same lessons about relative URLs,
+member IDs, Block Kit bodies and brace counts by failing a gate first. A demo cannot
+carry that variance. Composing from scratch is the right way to build something new;
+this process is not new, and a reference that is already proven is both faster and
+far more predictable than a fresh derivation. Only the parts the SDD genuinely
+changes get touched.
+
+**How the build stage uses it** — extract it with one command, never by re-typing:
+
+```
+awk '/^```json reference-workflow$/{f=1;next} /^```$/{if(f)exit} f' \
+    docs/architectural-considerations.md > <project-dir>/Workflow.json
+```
+
+Then read the SDD and check three things against the extracted file: every `BR-xx`
+has a step that implements it, the Coupa filter matches the SDD's window and status
+values, and the variable names used in the Slack `body` (`qualifyingCount`,
+`coupaUrl`, `windowStart`, `windowEnd`, `runDate`) are the ones the scripts set.
+Change only a line the SDD contradicts. If nothing is contradicted, change nothing.
+
+What is deliberately in here and must stay: the two HTTP Request activities in §4's
+exact shape; the inline Block Kit body with `channel`, `text` and `blocks` and the
+correct outer braces; the `Assign` aliases after each script (see §8 for why they
+are not padding); the single edge `Try/Catch`. What is NOT in here: any credential,
+any absolute URL, any email address.
+
+```json reference-workflow
+{
+  "document": {
+    "dsl": "1.0.0",
+    "name": "no-po-invoice-chaser-api",
+    "tags": {
+      "projectId": "ea846bf4-5333-4ad0-a3b8-8cebf41317d4"
+    },
+    "version": "0.0.1",
+    "namespace": "default",
+    "metadata": {
+      "variables": {
+        "schema": {
+          "format": "json",
+          "document": {
+            "type": "object",
+            "properties": {
+              "windowStart": {
+                "type": "string",
+                "default": ""
+              },
+              "windowEnd": {
+                "type": "string",
+                "default": ""
+              },
+              "runDate": {
+                "type": "string",
+                "default": ""
+              },
+              "qualifyingCount": {
+                "type": "number",
+                "default": 0
+              },
+              "exclusionLog": {
+                "type": "string",
+                "default": ""
+              },
+              "slackPayload": {
+                "type": "string",
+                "default": ""
+              },
+              "coupaUrl": {
+                "type": "string",
+                "default": ""
+              },
+              "slackSent": {
+                "type": "boolean",
+                "default": false
+              }
+            },
+            "title": "Variables"
+          }
+        }
+      }
+    }
+  },
+  "input": {
+    "schema": {
+      "format": "json",
+      "document": {
+        "type": "object",
+        "properties": {},
+        "title": "Inputs"
+      }
+    }
+  },
+  "output": {
+    "schema": {
+      "format": "json",
+      "document": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string"
+          },
+          "qualifying_count": {
+            "type": "number"
+          },
+          "slack_sent": {
+            "type": "boolean"
+          }
+        },
+        "title": "Outputs"
+      }
+    }
+  },
+  "do": [
+    {
+      "Sequence_1": {
+        "do": [
+          {
+            "WorkflowStart": {
+              "set": "${ { ...Object.entries($workflow.definition?.document?.metadata?.variables?.schema?.document?.properties || {}).reduce((acc, [name, def]) => ({ ...acc, [name]: def?.default }), {}), ...($workflow.input || {}) } }",
+              "output": {
+                "as": "${$input}"
+              },
+              "export": {
+                "as": "{ ...$context, variables: { ...$context.variables, ...$output } }"
+              },
+              "metadata": {
+                "activityType": "Assign",
+                "displayName": "Workflow start",
+                "fullName": "Assign",
+                "isTransparent": true
+              }
+            }
+          },
+          {
+            "Javascript_ComputeDateWindow": {
+              "run": {
+                "script": {
+                  "code": "const now = new Date(); const pad = (n) => String(n).padStart(2,'0'); const fmt = (d) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; const windowEndDate = new Date(now.getFullYear(), now.getMonth(), now.getDate()); const windowStartDate = new Date(windowEndDate); windowStartDate.setDate(windowStartDate.getDate() - 7); return { windowStart: fmt(windowStartDate), windowEnd: fmt(windowEndDate), runDate: fmt(windowEndDate) };",
+                  "language": "javascript",
+                  "arguments": "${{ \"$context\": $context, \"$workflow\": $workflow, \"$input\": $input }}"
+                }
+              },
+              "export": {
+                "as": "{ ...$context, outputs: { ...$context?.outputs, \"Javascript_ComputeDateWindow\": $output } }"
+              },
+              "metadata": {
+                "activityType": "JsInvoke",
+                "displayName": "Compute date window",
+                "fullName": "JsInvoke"
+              }
+            }
+          },
+          {
+            "Assign_WindowStart": {
+              "set": {
+                "windowStart": "${$context.outputs.Javascript_ComputeDateWindow.windowStart}"
+              },
+              "export": {
+                "as": "{ ...$context, variables: { ...$context.variables, ...$output } }"
+              },
+              "metadata": {
+                "activityType": "Assign",
+                "displayName": "Set windowStart",
+                "fullName": "Assign",
+                "isTransparent": false
+              }
+            }
+          },
+          {
+            "Assign_WindowEnd": {
+              "set": {
+                "windowEnd": "${$context.outputs.Javascript_ComputeDateWindow.windowEnd}"
+              },
+              "export": {
+                "as": "{ ...$context, variables: { ...$context.variables, ...$output } }"
+              },
+              "metadata": {
+                "activityType": "Assign",
+                "displayName": "Set windowEnd",
+                "fullName": "Assign",
+                "isTransparent": false
+              }
+            }
+          },
+          {
+            "Assign_RunDate": {
+              "set": {
+                "runDate": "${$context.outputs.Javascript_ComputeDateWindow.runDate}"
+              },
+              "export": {
+                "as": "{ ...$context, variables: { ...$context.variables, ...$output } }"
+              },
+              "metadata": {
+                "activityType": "Assign",
+                "displayName": "Set runDate",
+                "fullName": "Assign",
+                "isTransparent": false
+              }
+            }
+          },
+          {
+            "HTTP_Request_Coupa": {
+              "call": "UiPath.Http",
+              "with": {
+                "connector": "uipath-uipath-http",
+                "connectionId": "5fadfc73-a372-46ae-a27c-2481741eed07",
+                "connectionResourceId": "5fadfc73-a372-46ae-a27c-2481741eed07",
+                "method": "POST",
+                "endpoint": "/http-request",
+                "bodyParameters": {
+                  "authentication": "connector",
+                  "targetConnector": "uipath-coupa-coupa",
+                  "connection": "5fadfc73-a372-46ae-a27c-2481741eed07",
+                  "method": "GET",
+                  "path": "invoices",
+                  "url": "invoices",
+                  "query": {
+                    "status[in]": "draft,new",
+                    "invoice-date[gt_or_eq]": "${$context.variables.windowStart}",
+                    "invoice-date[lt_or_eq]": "${$context.variables.windowEnd}",
+                    "order_by": "invoice-date",
+                    "dir": "desc",
+                    "limit": "50"
+                  }
+                }
+              },
+              "export": {
+                "as": "{ ...$context, outputs: { ...$context?.outputs, \"HTTP_Request_Coupa\": $output } }"
+              },
+              "metadata": {
+                "activityType": "Connector",
+                "displayName": "HTTP Request: Coupa",
+                "uiPathActivityTypeId": "5c4cc855-b42a-37e6-b910-de8588998fce",
+                "configuration": "{\"essentialConfiguration\":{\"connectorVersion\":\"1.4.44\",\"scriptRef\":null,\"customFieldsRequestDetails\":null,\"instanceParameters\":{\"connectorKey\":\"uipath-uipath-http\",\"objectName\":\"http-request\",\"httpMethod\":\"POST\",\"activityType\":\"Curated\",\"version\":\"1.0.0\",\"supportsStreaming\":false,\"subType\":\"method\"},\"objectName\":\"http-request\",\"operation\":\"create\",\"packageVersion\":\"1.0.0\",\"httpMethod\":\"POST\",\"path\":\"/http-request\",\"unifiedTypesCompatible\":true,\"savedJitInputFieldId\":\"in_http-request\"}}"
+              }
+            }
+          },
+          {
+            "Javascript_FilterAndCount": {
+              "run": {
+                "script": {
+                  "code": "const invoices = $context.outputs.HTTP_Request_Coupa.content || []; const excluded = []; const qualifying = []; for (const inv of invoices) { if (inv['invoice-type'] === 'Credit Note') { excluded.push(`${inv['invoice-number'] || inv['id']} excluded: credit note`); continue; } const lines = inv['invoice-lines'] || []; const hasLinkedPo = lines.some(l => (l['po-number'] && l['po-number'].trim() !== '') || (l['order-header-num'] && l['order-header-num'].trim() !== '')); if (hasLinkedPo) { excluded.push(`${inv['invoice-number'] || inv['id']} excluded: linked PO`); continue; } qualifying.push(inv); } return { qualifyingCount: qualifying.length, exclusionLog: excluded.join('; ') };",
+                  "language": "javascript",
+                  "arguments": "${{ \"$context\": $context, \"$workflow\": $workflow, \"$input\": $input }}"
+                }
+              },
+              "export": {
+                "as": "{ ...$context, outputs: { ...$context?.outputs, \"Javascript_FilterAndCount\": $output } }"
+              },
+              "metadata": {
+                "activityType": "JsInvoke",
+                "displayName": "Filter and count",
+                "fullName": "JsInvoke"
+              }
+            }
+          },
+          {
+            "Assign_QualifyingCount": {
+              "set": {
+                "qualifyingCount": "${$context.outputs.Javascript_FilterAndCount.qualifyingCount}"
+              },
+              "export": {
+                "as": "{ ...$context, variables: { ...$context.variables, ...$output } }"
+              },
+              "metadata": {
+                "activityType": "Assign",
+                "displayName": "Set qualifyingCount",
+                "fullName": "Assign",
+                "isTransparent": false
+              }
+            }
+          },
+          {
+            "Assign_ExclusionLog": {
+              "set": {
+                "exclusionLog": "${$context.outputs.Javascript_FilterAndCount.exclusionLog}"
+              },
+              "export": {
+                "as": "{ ...$context, variables: { ...$context.variables, ...$output } }"
+              },
+              "metadata": {
+                "activityType": "Assign",
+                "displayName": "Set exclusionLog",
+                "fullName": "Assign",
+                "isTransparent": false
+              }
+            }
+          },
+          {
+            "If_1#Wrapper": {
+              "do": [
+                {
+                  "If_1": {
+                    "switch": [
+                      {
+                        "case": {
+                          "when": "${$context.variables.qualifyingCount > 0}",
+                          "then": "If_1#Then"
+                        }
+                      },
+                      {
+                        "default": {
+                          "then": "If_1#Else"
+                        }
+                      }
+                    ],
+                    "metadata": {
+                      "displayName": "Branch on qualifying count"
+                    }
+                  }
+                },
+                {
+                  "If_1#Then": {
+                    "do": [
+                      {
+                        "Javascript_ComposeSlackPayload": {
+                          "run": {
+                            "script": {
+                              "code": "const count = $context.variables.qualifyingCount; const start = $context.variables.windowStart; const end = $context.variables.windowEnd; const run = $context.variables.runDate; const url = `https://uipath-test.coupahost.com/invoices?q%5Binvoice_date_gteq%5D=${start}&q%5Binvoice_date_lteq%5D=${end}&q%5Bstatus_eq%5D=draft`; const payload = { channel: 'WLX9BD8FN', text: `:receipt: ${count} invoices from the last seven days have no purchase order linked`, blocks: [ { type: 'header', text: { type: 'plain_text', text: `:receipt: ${count} invoices need a purchase order`, emoji: true } }, { type: 'section', text: { type: 'mrkdwn', text: `:warning:  *${count} invoices* from the last seven days have no purchase order linked.\\n:no_entry:  An invoice without a linked PO cannot be matched or paid under our *no-PO-no-pay policy*, and payment to the supplier stalls until it is fixed.\\n:point_right:  Please make sure a purchase order exists for these invoices and is correctly linked to each one.` } }, { type: 'actions', elements: [ { type: 'button', text: { type: 'plain_text', text: 'Open the list in Coupa', emoji: true }, url: url, style: 'primary' } ] }, { type: 'divider' }, { type: 'context', elements: [ { type: 'mrkdwn', text: `:calendar: Invoices dated *${start}* to *${end}*  ·  :robot_face: No-PO Invoice Chaser  ·  checked *${run}*` } ] } ] }; return { slackPayload: JSON.stringify(payload), coupaUrl: url };",
+                              "language": "javascript",
+                              "arguments": "${{ \"$context\": $context, \"$workflow\": $workflow, \"$input\": $input }}"
+                            }
+                          },
+                          "export": {
+                            "as": "{ ...$context, outputs: { ...$context?.outputs, \"Javascript_ComposeSlackPayload\": $output } }"
+                          },
+                          "metadata": {
+                            "activityType": "JsInvoke",
+                            "displayName": "Compose Slack payload",
+                            "fullName": "JsInvoke"
+                          }
+                        }
+                      },
+                      {
+                        "Assign_SlackPayload": {
+                          "set": {
+                            "slackPayload": "${$context.outputs.Javascript_ComposeSlackPayload.slackPayload}"
+                          },
+                          "export": {
+                            "as": "{ ...$context, variables: { ...$context.variables, ...$output } }"
+                          },
+                          "metadata": {
+                            "activityType": "Assign",
+                            "displayName": "Set slackPayload",
+                            "fullName": "Assign",
+                            "isTransparent": false
+                          }
+                        }
+                      },
+                      {
+                        "Assign_CoupaUrl": {
+                          "set": {
+                            "coupaUrl": "${$context.outputs.Javascript_ComposeSlackPayload.coupaUrl}"
+                          },
+                          "export": {
+                            "as": "{ ...$context, variables: { ...$context.variables, ...$output } }"
+                          },
+                          "metadata": {
+                            "activityType": "Assign",
+                            "displayName": "Set coupaUrl",
+                            "fullName": "Assign",
+                            "isTransparent": false
+                          }
+                        }
+                      },
+                      {
+                        "HTTP_Request_Slack": {
+                          "call": "UiPath.Http",
+                          "with": {
+                            "connector": "uipath-uipath-http",
+                            "connectionId": "43d506f7-7de2-4798-aac1-9522e2e45dbb",
+                            "connectionResourceId": "43d506f7-7de2-4798-aac1-9522e2e45dbb",
+                            "method": "POST",
+                            "endpoint": "/http-request",
+                            "bodyParameters": {
+                              "authentication": "connector",
+                              "targetConnector": "uipath-salesforce-slack",
+                              "connection": "43d506f7-7de2-4798-aac1-9522e2e45dbb",
+                              "method": "POST",
+                              "path": "chat.postMessage",
+                              "url": "chat.postMessage",
+                              "body": "${{ channel: 'WLX9BD8FN', text: `:receipt: ${$context.variables.qualifyingCount} invoices from the last seven days have no purchase order linked`, blocks: [ { type: 'header', text: { type: 'plain_text', text: `:receipt: ${$context.variables.qualifyingCount} invoices need a purchase order`, emoji: true } }, { type: 'section', text: { type: 'mrkdwn', text: `:warning:  *${$context.variables.qualifyingCount} invoices* from the last seven days have no purchase order linked.\\n:no_entry:  An invoice without a linked PO cannot be matched or paid under our *no-PO-no-pay policy*, and payment to the supplier stalls until it is fixed.\\n:point_right:  Please make sure a purchase order exists for these invoices and is correctly linked to each one.` } }, { type: 'actions', elements: [ { type: 'button', text: { type: 'plain_text', text: 'Open the list in Coupa', emoji: true }, url: $context.variables.coupaUrl, style: 'primary' } ] }, { type: 'divider' }, { type: 'context', elements: [ { type: 'mrkdwn', text: `:calendar: Invoices dated *${$context.variables.windowStart}* to *${$context.variables.windowEnd}*  ·  :robot_face: No-PO Invoice Chaser  ·  checked *${$context.variables.runDate}*` } ] } ] }}"
+                            }
+                          },
+                          "export": {
+                            "as": "{ ...$context, outputs: { ...$context?.outputs, \"HTTP_Request_Slack\": $output } }"
+                          },
+                          "metadata": {
+                            "activityType": "Connector",
+                            "displayName": "HTTP Request: Slack",
+                            "uiPathActivityTypeId": "5c4cc855-b42a-37e6-b910-de8588998fce",
+                            "configuration": "{\"essentialConfiguration\":{\"connectorVersion\":\"1.4.44\",\"scriptRef\":null,\"customFieldsRequestDetails\":null,\"instanceParameters\":{\"connectorKey\":\"uipath-uipath-http\",\"objectName\":\"http-request\",\"httpMethod\":\"POST\",\"activityType\":\"Curated\",\"version\":\"1.0.0\",\"supportsStreaming\":false,\"subType\":\"method\"},\"objectName\":\"http-request\",\"operation\":\"create\",\"packageVersion\":\"1.0.0\",\"httpMethod\":\"POST\",\"path\":\"/http-request\",\"unifiedTypesCompatible\":true,\"savedJitInputFieldId\":\"in_http-request\"}}"
+                          }
+                        }
+                      },
+                      {
+                        "Javascript_ValidateSlack": {
+                          "run": {
+                            "script": {
+                              "code": "const resp = $context.outputs.HTTP_Request_Slack.content; if (!resp || resp.ok !== true) { throw new Error(`Slack chat.postMessage failed: ${JSON.stringify(resp)}`); } return { ok: true };",
+                              "language": "javascript",
+                              "arguments": "${{ \"$context\": $context, \"$workflow\": $workflow, \"$input\": $input }}"
+                            }
+                          },
+                          "export": {
+                            "as": "{ ...$context, outputs: { ...$context?.outputs, \"Javascript_ValidateSlack\": $output } }"
+                          },
+                          "metadata": {
+                            "activityType": "JsInvoke",
+                            "displayName": "Validate Slack response",
+                            "fullName": "JsInvoke"
+                          }
+                        }
+                      },
+                      {
+                        "Assign_SlackSent": {
+                          "set": {
+                            "slackSent": true
+                          },
+                          "export": {
+                            "as": "{ ...$context, variables: { ...$context.variables, ...$output } }"
+                          },
+                          "metadata": {
+                            "activityType": "Assign",
+                            "displayName": "Set slackSent true",
+                            "fullName": "Assign",
+                            "isTransparent": false
+                          }
+                        }
+                      }
+                    ],
+                    "then": "exit"
+                  }
+                },
+                {
+                  "If_1#Else": {
+                    "do": [],
+                    "then": "exit"
+                  }
+                }
+              ],
+              "export": {
+                "as": "{ ...$context, outputs: { ...$context?.outputs, \"If_1\": $output } }"
+              },
+              "metadata": {
+                "activityType": "If",
+                "displayName": "Branch: qualifying count > 0",
+                "fullName": "If"
+              }
+            }
+          },
+          {
+            "Javascript_LogResult": {
+              "run": {
+                "script": {
+                  "code": "const count = $context.variables.qualifyingCount; const sent = $context.variables.slackSent; console.log(`qualifying_count=${count}`); console.log(`slack_sent=${sent}`); return { qualifying_count: count, slack_sent: sent };",
+                  "language": "javascript",
+                  "arguments": "${{ \"$context\": $context, \"$workflow\": $workflow, \"$input\": $input }}"
+                }
+              },
+              "export": {
+                "as": "{ ...$context, outputs: { ...$context?.outputs, \"Javascript_LogResult\": $output } }"
+              },
+              "metadata": {
+                "activityType": "JsInvoke",
+                "displayName": "Log result",
+                "fullName": "JsInvoke"
+              }
+            }
+          },
+          {
+            "Response_1": {
+              "response": "${{ status: 'Successful', qualifying_count: $context.variables.qualifyingCount, slack_sent: $context.variables.slackSent }}",
+              "markJobAsFailed": false,
+              "then": "end",
+              "export": {
+                "as": "{ ...$context, outputs: { ...$context?.outputs, \"Response_1\": $output } }"
+              },
+              "metadata": {
+                "activityType": "Response",
+                "displayName": "Response",
+                "fullName": "Response"
+              }
+            }
+          }
+        ],
+        "metadata": {
+          "activityType": "Sequence",
+          "displayName": "Sequence",
+          "fullName": "Sequence"
+        }
+      }
+    }
+  ],
+  "evaluate": {
+    "mode": "strict",
+    "language": "javascript"
+  }
+}
+```
+
 ---
 
 ## 5. Runtime and environment
