@@ -84,7 +84,18 @@ env:
   REVIEW_HEAD_PREFIXES: 'dev- development-'
   ASSIGNEE: irina-capatina-uipath
   AGENT_MODEL: claude-sonnet-4-6
-  CLI_VERSION: '1.202.0'
+  # 1.202.1, not 1.202.0 - and the difference is not cosmetic. The agent runs inside
+  # claude-code-base-action, which puts ITS OWN Node 18 first on PATH, whatever the
+  # runner or setup-node provides. 1.202.0 fails to start on Node 18
+  # (`SyntaxError: 'node:util' does not provide an export named 'styleText'`); 1.202.1
+  # runs. Pinned at 1.202.0 the developer agent could not run `uip`, found a Node 22
+  # by path, hand-wrote the solution's resource files, and the solution feed rejected
+  # the package as corrupted (HTTP 400, errorCode 1201). Every run before the pin was
+  # silently auto-updating to 1.202.1 on first use, which is why it "never failed
+  # before". The pin stays - a demo must not change CLI mid-week - but at a version
+  # that runs on the agent's Node. Before changing this number, run `uip --version`
+  # under Node 18.
+  CLI_VERSION: '1.202.1'
 
 permissions:
   # write, not read: observe.sh PUTs observability.json through the contents

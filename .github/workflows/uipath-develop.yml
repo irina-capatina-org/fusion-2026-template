@@ -53,7 +53,18 @@ env:
   BASE_BRANCH: develop
   ASSIGNEE: irina-capatina-uipath
   AGENT_MODEL: claude-sonnet-4-6
-  CLI_VERSION: '1.202.0'
+  # 1.202.1, not 1.202.0 - and the difference is not cosmetic. The agent runs inside
+  # claude-code-base-action, which puts ITS OWN Node 18 first on PATH, whatever the
+  # runner or setup-node provides. 1.202.0 fails to start on Node 18
+  # (`SyntaxError: 'node:util' does not provide an export named 'styleText'`); 1.202.1
+  # runs. Pinned at 1.202.0 the developer agent could not run `uip`, found a Node 22
+  # by path, hand-wrote the solution's resource files, and the solution feed rejected
+  # the package as corrupted (HTTP 400, errorCode 1201). Every run before the pin was
+  # silently auto-updating to 1.202.1 on first use, which is why it "never failed
+  # before". The pin stays - a demo must not change CLI mid-week - but at a version
+  # that runs on the agent's Node. Before changing this number, run `uip --version`
+  # under Node 18.
+  CLI_VERSION: '1.202.1'
   # Design inputs and the derived task list live here. Must NOT start with a dot:
   # actions/upload-artifact@v4 silently skips hidden files.
   WORK_DIR: design-work
@@ -283,6 +294,15 @@ jobs:
           ref: ${{ needs.identify.outputs.branch }}
           fetch-depth: 1
 
+      # The agent does NOT run on the runner's Node. claude-code-base-action installs
+      # its own Node 18 and puts it first on PATH, so whatever `uip` the agent calls
+      # runs under 18. Give the run steps the same Node, so the CLI is installed and
+      # proven in the environment the agent will actually have - not in the image's
+      # Node 22, where a CLI that cannot start on 18 looks perfectly healthy.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
       - name: Install UiPath CLI and skills
         id: skills
         continue-on-error: true
@@ -312,6 +332,23 @@ jobs:
           mkdir -p "$HOME/.claude/skills"
           cp -R "$RUNNER_TEMP/uip-skills/.agents/skills/." "$HOME/.claude/skills/"
           ls -1 "$HOME/.claude/skills"
+
+      # Fail here, in five seconds, rather than at Publish two stages later. A CLI
+      # pin that cannot start on Node 18 (1.202.0: `SyntaxError ... 'node:util' does
+      # not provide an export named 'styleText'`) once left the developer agent to
+      # improvise a toolchain and hand-write solution resources, and the solution
+      # feed rejected the package as corrupted. This is the check that turns that
+      # into a one-line fix of CLI_VERSION.
+      - name: Prove the CLI starts on the agent's Node
+        run: |
+          set -uo pipefail
+          echo "node: $(node --version)   (the agent's shell has the same major)"
+          if ! OUT=$(uip --version 2>&1); then
+            echo "$OUT" | head -5
+            echo "::error::@uipath/cli ${CLI_VERSION} does not start under $(node --version), which is the Node the developer agent runs on. Change CLI_VERSION to a release that does (1.202.1 is proven) - do NOT let the agent work around it."
+            exit 1
+          fi
+          echo "uip: $OUT - starts on $(node --version)."
 
       - name: Run uipath-developer agent
         uses: anthropics/claude-code-base-action@beta
@@ -374,6 +411,31 @@ jobs:
 
             **Do not use the TodoWrite tool.** Each call is a model round trip; the last
             build made twelve of them. Plan in your head, then act.
+
+            **If `uip` fails to START - a SyntaxError mentioning `node:util`, `styleText`,
+            an unsupported engine, a missing module - STOP and report it.** Do not look
+            for another Node, do not run `uip` through an explicit interpreter path, do
+            not alias it. A previous build did exactly that, then hand-wrote
+            `resources/solution_folder/*.json` and `project.uiproj` when the half-working
+            toolchain left gaps, and the solution feed rejected the package as corrupted.
+            A build that stops with a clear toolchain error is fixable in one line; a
+            build that improvises is not.
+
+            **Never hand-write the solution or the project scaffolding, and never touch
+            the toolchain.** Concretely:
+            - The `.uipx`, `project.uiproj` and `entry-points.json` come from
+              `uip solution init` and `uip api-workflow init` / `uip solution projects
+              add` - only. Never create or edit them in an editor.
+            - Never modify anything under `/usr/local/lib/node_modules/` or any other
+              CLI install path. A previous build "fixed" a CLI that would not start by
+              patching its JavaScript bundle, built the solution with the patched CLI,
+              and the solution feed rejected the package as corrupted. A toolchain you
+              patched is not a toolchain; a step after you checks the install is
+              untouched and fails the build if it is not.
+            - The connection resource files under `resources/solution_folder/connection/`
+              and the workflow's `bindings_v2.json` ARE yours to write - copy their shapes
+              from §4 exactly, as every working build has. That is the one place hand-
+              written JSON belongs.
 
             ## Step 1 - read the design, plan in EIGHT lines or fewer, then build
 
@@ -597,6 +659,28 @@ jobs:
             - `## How to test this` - the exact commands a reviewer should run.
 
             Write the file even if the build went perfectly. The review stage reads it.
+
+      # The developer once could not start `uip`, patched the CLI's own bundle until it
+      # did, and shipped a solution built by the patched tool. Nothing downstream can
+      # see that - Test and deploy reinstall a clean CLI and pack the same files - so
+      # the only place to catch it is here: the installed dist/ must be byte-identical
+      # to the published tarball for the pinned version.
+      - name: Prove the CLI was not modified by the agent
+        run: |
+          set -uo pipefail
+          ROOT=$(npm root -g)/@uipath/cli
+          TMP=$(mktemp -d); cd "$TMP"
+          if ! npm pack "@uipath/cli@${CLI_VERSION}" --silent >/dev/null 2>&1; then
+            echo "::warning::could not fetch the reference tarball for @uipath/cli@${CLI_VERSION} - tamper check skipped"; exit 0
+          fi
+          tar -xzf uipath-cli-*.tgz
+          DIFF=$(diff -rq "package/dist" "$ROOT/dist" 2>&1 | grep -v "^Only in package/dist" || true)
+          if [ -n "$DIFF" ]; then
+            echo "$DIFF" | head -10
+            echo "::error::The installed @uipath/cli differs from the published ${CLI_VERSION} tarball - the developer agent modified the toolchain. Nothing it built can be trusted; fix the cause (a CLI that does not start on the agent's Node) rather than the symptom."
+            exit 1
+          fi
+          echo "CLI install is byte-identical to @uipath/cli@${CLI_VERSION} - untampered."
 
       - name: Verify build output
         id: verify
