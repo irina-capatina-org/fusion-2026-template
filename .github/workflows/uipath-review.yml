@@ -406,12 +406,26 @@ jobs:
           } > "$B"
           echo "bundle: $(wc -c < "$B") bytes, $(wc -l < "$B") lines"
 
+      # env is LOAD-BEARING. A rewrite of this step once dropped it; the agent then
+      # had no GH_TOKEN, `gh pr review` failed, and it spent five minutes hunting
+      # for credentials - grepping the environment, cat-ing runner temp files,
+      # blocking 120s on a named pipe, blocking 120s more on an interactive
+      # `gh auth login`. 372 seconds for a review that should take 40.
       - name: Run uipath-review agent
         uses: anthropics/claude-code-base-action@beta
+        env:
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          REPO:      ${{ github.repository }}
+          PR_NUMBER: ${{ needs.validate.outputs.pr_number }}
+          BASE_SHA:  ${{ needs.validate.outputs.base_sha }}
+          HEAD_SHA:  ${{ needs.validate.outputs.head_sha }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           model: ${{ env.AGENT_MODEL }}
-          timeout_minutes: '10'
+          # A hard cap. This step is commentary; nothing downstream waits on its
+          # opinion, so if it is still running after four minutes something is
+          # hung and the right outcome is to stop it, not to wait.
+          timeout_minutes: '4'
           allowed_tools: "Read,Bash"
           prompt: |
             You are uipath-review. You review a UiPath implementation against the
@@ -420,10 +434,19 @@ jobs:
 
             Everything you need is already in ONE file: `/tmp/review-bundle.md`. It
             holds the file list, the diff, `build-notes.md`, the architecture contract
-            and every SDD. Read it with the Read tool. That is your first action and
-            normally your only read.
+            and every SDD. Read it with the Read tool, ONCE. That is your first action
+            and your only read - the last run read it seven times, which is seven
+            round trips for information that did not change.
 
-            PR number: $PR_NUMBER
+            PR number: $PR_NUMBER   (repository: $REPO - pass `--repo "$REPO"` to gh)
+
+            `GH_TOKEN` is set in your environment and `gh` is authenticated with it.
+            **If a `gh` command fails, print its error in your final message and STOP.**
+            Do not search the environment, the filesystem or runner temp directories
+            for another token, do not run `gh auth login`, do not call the OIDC
+            endpoint. There is no other credential, and the job after you handles a
+            missing review without blocking anything. The last run did all of those
+            things and hung twice for two minutes each.
 
             ## This review does not gate anything - and that is deliberate
 
@@ -442,6 +465,8 @@ jobs:
             Do NOT re-run `uip api-workflow validate`, `validate-build.sh` or
             `uip solution pack`. They have run. Re-running them is how the last review
             spent four tool calls looking for the `uip` binary.
+
+            Do not use the TodoWrite tool - every call is a model round trip and it puts nothing in the output.
 
             ## What to look for, in one pass
 
@@ -495,13 +520,13 @@ jobs:
 
             Then post exactly one review and stop:
 
-                gh pr review $PR_NUMBER --approve --body-file /tmp/review-body.md
+                gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body-file /tmp/review-body.md
 
             Do not read the review back to check it posted - the job after you does
             that, and doing it yourself cost the last run three extra tool calls. If
             `--approve` is refused because the token authored the PR, fall back to
-            `gh pr review $PR_NUMBER --comment --body-file /tmp/review-body.md` and say
-            so in your final message.
+            `gh pr review "$PR_NUMBER" --repo "$REPO" --comment --body-file /tmp/review-body.md`
+            and say so in your final message. If that fails too, stop and report.
 
             ## Hard rules
 

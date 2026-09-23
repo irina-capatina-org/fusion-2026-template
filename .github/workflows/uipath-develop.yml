@@ -339,6 +339,18 @@ jobs:
             Root SDD:     ${{ needs.identify.outputs.root_sdd }}  (empty for single-product)
             OUTPUT:       ${{ env.WORK_DIR }}/${{ needs.identify.outputs.tasks_file }}
 
+            ## The shape of this plan is known - keep it short
+
+            The build stage starts from a proven reference implementation
+            (`${{ env.DOCS_DIR }}/architectural-considerations.md` §4.5), so this is
+            not a plan to compose a workflow; it is a plan to extract the reference,
+            align it with the SDD, wrap it in the solution and run the gates. That is
+            at most EIGHT tasks and the file is at most 6 KB. The last task list was
+            17.8 KB and its single Write took 98 seconds, almost all of it prose the
+            developer never reads. One table, one line per task, no rationale
+            paragraphs. Read `SKILL.md` only - not the reference guides it points at.
+            Do not use the TodoWrite tool.
+
             ## Step 0 - load the planner skill if it is installed
 
             Run `ls ~/.claude/skills`. If `uipath-planner` is there, READ
@@ -462,12 +474,32 @@ jobs:
             invent one) and keep the structure the SDD's Project Structure section
             prescribes.
 
+            ## Step 0.5 - start from the reference implementation. This is not optional.
+
+            `${{ env.DOCS_DIR }}/architectural-considerations.md` §4.5 carries the
+            complete, proven `Workflow.json` for this process - it validated, packed,
+            deployed, ran, and posted the Slack message. Extract it into your project
+            directory with the one-line `awk` command printed in that section. Do not
+            re-type it, do not paraphrase it, do not "improve" it. Then read the SDD
+            and change ONLY a line the SDD contradicts; if nothing is contradicted,
+            change nothing.
+
+            Because of this you do NOT need `api-workflow-template.json`,
+            `conditional-workflow-example.json`, or more than one `SKILL.md`. The last
+            build read all of those, composed a 35 KB workflow from scratch where the
+            proven one is 22 KB, and took 334 seconds. Starting from the reference the
+            same result is a copy, a read, a diff and the gates.
+
+            **Do not use the TodoWrite tool.** Each call is a model round trip; the last
+            build made twelve of them. Plan in your head, then act.
+
             ## Step 1 - read the design, then work the task list in order
 
             Read the architecture json, every SDD, and the task list. Work the tasks in
             build order. The SDD is the specification: its schemas, named resources,
-            business rules and process steps are what you implement. Where the SDD and
-            your instinct disagree, the SDD wins - it was reviewed and approved.
+            business rules and process steps are what the reference must satisfy. Where
+            the SDD and the reference disagree, the SDD wins - it was reviewed and
+            approved - but where the SDD is silent, the reference stands as it is.
 
             Read `Org rules` above in full as well - it is the org's own platform facts,
             and it is AUTHORITATIVE. The SDD deliberately does NOT repeat what is in it.

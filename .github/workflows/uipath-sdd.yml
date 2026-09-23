@@ -424,16 +424,31 @@ jobs:
   # so the corpus is normalised to markdown here and passed on as an artifact.
   # Nothing in here is ever committed.
   # ═══════════════════════════════════════════════════════════════
-  read-pdd:
-    name: Read PDDs
+  # 3. Determine architecture, then write the SDD
+  # One job, deliberately. The decision produces architecture-<key>.json - the
+  # machine-readable design contract - and the SDD is written from it in the same
+  # runner. Splitting these cost a second runner spin-up, a second skills install,
+  # a second agent cold start and a full re-read of the PDD: ~50s for nothing,
+  # since the second agent needs exactly the context the first one already had.
+  # ═══════════════════════════════════════════════════════════════
+  generate-sdd:
+    name: Architecture + SDD
     needs: identify
     runs-on: ubuntu-latest
+    outputs:
+      # Advisory only - the PR opens either way. It exists so the reviewer is told
+      # up front whether the validator was happy, instead of discovering it later.
+      verdict: ${{ steps.verify.outputs.verdict }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.identify.outputs.branch }}
           fetch-depth: 1
 
+      # Normalising the PDD corpus used to be its own job that uploaded WORK_DIR for
+      # this one to download. Same branch, same files, one step later - the boundary
+      # cost a runner, a checkout and the upload/download pair to move bytes between
+      # adjacent steps.
       - name: Normalise the PDD corpus to markdown
         env:
           PDD_FILES:      ${{ needs.identify.outputs.pdd_files }}
@@ -550,40 +565,6 @@ jobs:
 
           echo "--- first 80 lines of the current PDD ---"
           head -80 "$WORK_DIR/pdd/$(basename "${PRIMARY_PDD%.*}").md"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pdd-corpus
-          path: ${{ env.WORK_DIR }}
-          retention-days: 1
-          if-no-files-found: error
-
-  # ═══════════════════════════════════════════════════════════════
-  # 3. Determine architecture, then write the SDD
-  # One job, deliberately. The decision produces architecture-<key>.json - the
-  # machine-readable design contract - and the SDD is written from it in the same
-  # runner. Splitting these cost a second runner spin-up, a second skills install,
-  # a second agent cold start and a full re-read of the PDD: ~50s for nothing,
-  # since the second agent needs exactly the context the first one already had.
-  # ═══════════════════════════════════════════════════════════════
-  generate-sdd:
-    name: Architecture + SDD
-    needs: [identify, read-pdd]
-    runs-on: ubuntu-latest
-    outputs:
-      # Advisory only - the PR opens either way. It exists so the reviewer is told
-      # up front whether the validator was happy, instead of discovering it later.
-      verdict: ${{ steps.verify.outputs.verdict }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.identify.outputs.branch }}
-          fetch-depth: 1
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: pdd-corpus
-          path: ${{ env.WORK_DIR }}
 
       # Best effort, and only the SDD agent needs it now: what it wants from
       # uipath-planner is the seven SDD templates. The product-selection levels
@@ -1170,7 +1151,14 @@ jobs:
           only the inputs and the hard rules; everything about HOW to write the
           document is here.
 
-          ## Step 0 - load the planner skill if it is installed
+          ## Step 0 - the planner skill is installed; do NOT read it
+
+          The UiPath skills are installed on this runner. You do not need to open any
+          `SKILL.md`: the section contract for your template is inlined below, and
+          the last run's two SKILL.md reads bought nothing the guidance did not
+          already say. Skip straight to Step 1.
+
+          ## Step 0 (old) - load the planner skill if it is installed
 
           Run `ls ~/.claude/skills`. If `uipath-planner` is there, READ
           `~/.claude/skills/uipath-planner/SKILL.md` with the Read tool - NEVER via the
@@ -1329,7 +1317,13 @@ jobs:
             own row in section 5 instead.
 
 
-          ## Never re-type the org's fixed JSON
+          ## Never re-type the org's fixed JSON - and never the reference implementation
+
+          `architectural-considerations.md` §4.5 carries a complete 22 KB `Workflow.json`.
+          It is code, and the build stage extracts it directly. Do NOT paste any of it,
+          or any activity from it, into the SDD - point at "§4.5" and move on. An SDD is
+          the design; the reference is the delivery.
+
 
           `architectural-considerations.md` §4 carries the canonical HTTP Request
           activity shape, its `bindings_v2.json` entry and the solution
@@ -1382,24 +1376,39 @@ jobs:
           ## Length budget - this is a contract, not a suggestion
 
           You write this document in ONE `Write` call, and that call streams at about
-          46 characters per second. The last SDD was 19,090 characters, so the write
-          alone took 114 seconds - more than half the whole stage. Every character you
-          do not write is time the demo gets back, and none of the cuts below lose
-          anything the build stage reads.
+          165 characters per second. The run before last wrote 15,446 characters against
+          a 12 KB budget - a 29% overshoot - and that single call took 93 seconds, half
+          the whole stage. Every character you do not write is time the demo gets back,
+          and none of the cuts below lose anything the build stage reads.
 
-          Whole document: aim for **12 KB, hard ceiling 14 KB**. Per section, measured
+          **Measure it. Do not estimate it.** After you write the file, run
+
+          ```
+          wc -c <the sdd path>
+          ```
+
+          That prints the byte count. Rewrite ONLY if it is over 11,000 bytes, and
+          AT MOST ONCE - a check that fires close to the target produces a loop, not a
+          shorter document (the DSD stage once wrote the same file four times chasing
+          sixty bytes). Anything under 11 KB ships as written.
+
+          Whole document: aim for **8 KB**. The build stage now starts from a proven
+          reference implementation (architectural-considerations.md, "Reference
+          implementation"), so this document's job is to state WHAT this process does
+          and which rules, fields and calls it has - not to teach the developer how to
+          write an API Workflow. Per section, measured
           against the last run so you can see where the weight actually is:
 
           | Section | Last run | Budget | What changes |
           | --- | --- | --- | --- |
-          | 1. API Workflow Overview | 3.1 KB | **1.2 KB** | It restates the PDD. A short paragraph plus the trigger, the schedule and the one-line outcome. No re-narration of the business problem. |
+          | 1. API Workflow Overview | 3.1 KB | **0.8 KB** | It restates the PDD. A short paragraph plus the trigger, the schedule and the one-line outcome. No re-narration of the business problem. |
           | 2. Input Schema | 1.1 KB | 1.1 KB | Already right. One table. |
-          | 3. Output Schema | 1.9 KB | 1.4 KB | One table. Drop the prose around it. |
-          | 4. Execution Flow | 3.1 KB | **2.8 KB** | The core of the document - do NOT squeeze this one. Every step, its activity type, its inputs and its outputs. |
+          | 3. Output Schema | 1.9 KB | 1.0 KB | One table. Drop the prose around it. |
+          | 4. Execution Flow | 3.1 KB | **2.0 KB** | The core of the document - do NOT squeeze this one. Every step, its activity type, its inputs and its outputs. |
           | 5. Connectors & External Calls | 1.6 KB | 1.2 KB | One row per call. The patterns live in considerations §4; point at it, do not restate it. |
-          | 6. Error Handling | 1.9 KB | 0.9 KB | The PDD says no retry and no error notification. Saying that plainly is the complete answer. |
-          | 7. Project Structure | 3.4 KB | **1.0 KB** | A file tree and one short table, at least 10 lines. `uip` scaffolds the project; this section orients a human, it does not specify a generator. |
-          | 8. Testing Strategy | 1.8 KB | 0.8 KB | Exactly three `###` subsections - happy path, business exceptions, system errors - each a compact table. |
+          | 6. Error Handling | 1.9 KB | 0.6 KB | The PDD says no retry and no error notification. Saying that plainly is the complete answer. |
+          | 7. Project Structure | 3.4 KB | **0.6 KB** | A file tree and one short table, at least 10 lines. `uip` scaffolds the project; this section orients a human, it does not specify a generator. |
+          | 8. Testing Strategy | 1.8 KB | 0.6 KB | Exactly three `###` subsections - happy path, business exceptions, system errors - each a compact table. |
           | 9. Next Steps | 0.5 KB | 0.4 KB | Already right. |
 
           The budget is spent on the sections the Development stage reads to build the
@@ -1515,6 +1524,8 @@ jobs:
 
             ## Hard rules
 
+            - Do not use the TodoWrite tool - every call is a model round trip and it puts nothing in the output.
+
             - **Architecture only - NO task list.** No `## Implementation Plan` heading and
               no `### Task 1` heading. Task derivation is the Development stage's job.
             - **Never write the literal word `TaskCreate` anywhere in the document.** Not in
@@ -1553,7 +1564,14 @@ jobs:
               ${{ env.WORK_DIR }}. Do NOT run git, gh, or `uip login`.
 
 
-            ## Step 3 - self-check before you finish
+            ## Step 3 - self-check before you finish - ONCE, errors only
+
+            Run the validator ONE time. Fix only lines it prints as `::error::`; leave
+            `::warning::` alone - warnings never block and never trigger a repair. Do
+            not re-read the whole document looking for things to polish: the run before
+            last re-read its own SDD six times and made four cosmetic edits after the
+            validator had already passed it. Write, validate once, fix errors if any,
+            stop.
 
             Run it with `SDD_ADVISORY_ONLY=1`. That leaves structural problems - a missing
             section, a task list, an empty table - as the only things that can fail it:
@@ -1727,7 +1745,7 @@ jobs:
   # This is the Maestro resume signal. No auto-merge.
   # ═══════════════════════════════════════════════════════════════
   open-pr:
-    name: Open PR
+    name: Open PR, merge, start Development
     needs: [identify, generate-sdd]
     runs-on: ubuntu-latest
     outputs:
@@ -1896,22 +1914,16 @@ jobs:
           bash .github/scripts/observe.sh stage Architecture status=in-review decidedBy=auto \
             pr="${{ steps.pr.outputs.pr_number }}" prUrl="${{ steps.pr.outputs.pr_url }}"
 
-  # ═══════════════════════════════════════════════════════════════
-  # 6. Merge
-  # No human gate on the SDD - see the note in the header.
-  # ═══════════════════════════════════════════════════════════════
-
-  merge:
-    name: Merge
-    needs: [identify, open-pr]
-    runs-on: ubuntu-latest
-    steps:
+      # Merging the PR and cutting the development branch used to be two more jobs
+      # after this one. Between them they are three `gh` calls and two dashboard
+      # writes, and each boundary cost a runner spin-up plus a checkout that existed
+      # only so observe.sh was on disk - which this job's checkout already provides.
       - name: Merge the SDD PR into develop
         env:
           GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           REPO:      ${{ github.repository }}
-          PR_NUMBER: ${{ needs.open-pr.outputs.pr_number }}
-          PR_URL:    ${{ needs.open-pr.outputs.pr_url }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          PR_URL:    ${{ steps.pr.outputs.pr_url }}
         run: |
           set -euo pipefail
           # Assign first, so the merged PR still shows who owns the design.
@@ -1939,12 +1951,6 @@ jobs:
       # This job otherwise makes only `gh` API calls and needs no working tree - but
       # observe.sh is a FILE, and a job that never checks out has an empty workspace.
       # Sparse: only the scripts, from develop, so it costs a second.
-      - uses: actions/checkout@v4
-        with:
-          ref: develop
-          sparse-checkout: .github/scripts
-          fetch-depth: 1
-
       - name: Observe - Architecture done
         # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
         # a rate limit or a transient 5xx would otherwise take a good stage down with it.
@@ -1958,23 +1964,6 @@ jobs:
             path="${{ needs.identify.outputs.sdd_file }}" \
             url="https://github.com/${{ github.repository }}/blob/develop/${{ needs.identify.outputs.sdd_file }}"
 
-  # ═══════════════════════════════════════════════════════════════
-  # 7. Start Development
-  # This stage merges its own PR, so nothing external will notice and cut the next
-  # branch for it - a merge performed with GITHUB_TOKEN raises no event that can
-  # start another workflow. It therefore hands over itself, in this same run.
-  #
-  # The analysis key is carried through unchanged:
-  #   architecture-jactiv-611 -> dev-jactiv-611
-  #
-  # `needs: merge` rather than a step inside it, so a failed merge cannot leave a
-  # development branch pointing at a design that never landed on develop.
-  # ═══════════════════════════════════════════════════════════════
-  next-stage:
-    name: Start Development
-    needs: [identify, merge]
-    runs-on: ubuntu-latest
-    steps:
       - name: Create dev-<key> from develop
         env:
           # A ref created with GITHUB_TOKEN does NOT trigger workflows, so the PAT is
@@ -2020,12 +2009,6 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/checkout@v4
-        with:
-          ref: develop
-          sparse-checkout: .github/scripts
-          fetch-depth: 1
-
       - name: Observe - Development begins
         # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
         # a rate limit or a transient 5xx would otherwise take a good stage down with it.
@@ -2038,6 +2021,20 @@ jobs:
             task="Building the automation"
 
   # ═══════════════════════════════════════════════════════════════
+  # 6. Merge
+  # No human gate on the SDD - see the note in the header.
+  # ═══════════════════════════════════════════════════════════════
+  # 7. Start Development
+  # This stage merges its own PR, so nothing external will notice and cut the next
+  # branch for it - a merge performed with GITHUB_TOKEN raises no event that can
+  # start another workflow. It therefore hands over itself, in this same run.
+  #
+  # The analysis key is carried through unchanged:
+  #   architecture-jactiv-611 -> dev-jactiv-611
+  #
+  # `needs: merge` rather than a step inside it, so a failed merge cannot leave a
+  # development branch pointing at a design that never landed on develop.
+  # ═══════════════════════════════════════════════════════════════
   # Fault
   # Without this a crashed run leaves the stage on `in-progress` and the card
   # spins for ever. Runs only when a job above actually failed - a skipped job
@@ -2045,7 +2042,7 @@ jobs:
   # ═══════════════════════════════════════════════════════════════
   faulted:
     name: Record fault
-    needs: [guard, identify, read-pdd, generate-sdd, open-pr, merge, next-stage]
+    needs: [guard, identify, generate-sdd, open-pr]
     if: failure()
     runs-on: ubuntu-latest
     steps:

@@ -410,9 +410,12 @@ jobs:
             exist on disk. A DSD that describes the design instead of the delivery will
             fail it.
 
+            Do not use the TodoWrite tool - every call is a model round trip and it puts nothing in the output.
+
             ## Step 1 - read the code first, but only these files
 
-            Read exactly these, in this order, and then stop reading:
+            Read exactly these, in this order, and then stop reading. Read each
+            ONCE - the last run re-read its own draft five times:
 
             1. `${{ env.WORK_DIR }}/manifest.json`
             2. `${{ env.WORK_DIR }}/code-inventory.txt` - the file list, for the
@@ -515,8 +518,14 @@ jobs:
             wc -c <the dsd path>
             ```
 
-            If it is over 5,500 bytes, cut prose - not table rows - and write it again.
-            One re-write of a 5 KB document costs 26 seconds; shipping 8 KB costs 51.
+            Rewrite ONLY if it is over 7,500 bytes, and rewrite AT MOST ONCE. The
+            first version is the one that ships if it is anywhere under that line.
+
+            Why the wide gap: the last run aimed at 5,000, was told to rewrite above
+            5,500, landed at 6,918, rewrote to 5,564, rewrote to 5,534, rewrote to
+            5,425 - four writes of the same document, three of them chasing sixty
+            bytes. A check that fires when you are close to the target produces a
+            loop, not a shorter document. Aim for 5 KB; anything under 7.5 KB is done.
 
             Two things a budget must never do: leave a table with a header and no data
             rows (the validator fails that), and drop a business exception or system

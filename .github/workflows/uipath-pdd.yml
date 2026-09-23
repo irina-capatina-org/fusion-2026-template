@@ -228,7 +228,11 @@ jobs:
               echo "Already text - copied as-is."
               ;;
             docx)
+              # `apt-get update` is most of the eleven seconds this used to cost, and
+              # the runner's package lists are fresh enough to install pandoc without
+              # it. Fall back to the full update only if the quick path fails.
               command -v pandoc >/dev/null 2>&1 \
+                || sudo apt-get install -y -qq --no-install-recommends pandoc >/dev/null 2>&1 \
                 || { sudo apt-get update -qq && sudo apt-get install -y -qq pandoc; }
               pandoc -f docx -t gfm --wrap=none \
                      --extract-media="$WORK_DIR/media" \
@@ -414,22 +418,23 @@ jobs:
             alone took 163 seconds - nearly the whole stage. Every character you do not
             write is time the demo gets back.
 
-            Whole document: aim for **18 KB, hard ceiling 21 KB**. Per section, measured
+            Whole document: aim for **15 KB, hard ceiling 17 KB**. Do NOT re-measure
+            and rewrite - write it once, under the ceiling. Per section, measured
             against the last run so you can see where the weight actually is:
 
             | Section | Last run | Budget | What changes |
             | --- | --- | --- | --- |
             | 1-2. Document Control, Introduction | 1.1 KB | 1.0 KB | Already right. |
-            | 3. Process Overview | 1.3 KB | 1.3 KB | Already right. One table, every row present. |
+            | 3. Process Overview | 1.2 KB | 1.0 KB | Already right. One table, every row present. |
             | 4. Scope | 1.5 KB | **0.9 KB** | Two bullet lists. One line per item, no rationale paragraphs. |
             | 5. To-Be Process (High Level) | 1.5 KB | **0.9 KB** | The target intent in a short paragraph plus bullets. Section 6 carries the detail - do not pre-narrate it here. |
-            | 6. Detailed Process Steps | 5.4 KB | 5.4 KB | **Do NOT squeeze this one.** It is the core of the document and the SDD's execution flow is built from it. |
+            | 6. Detailed Process Steps | 3.4 KB | 3.4 KB | **Do NOT squeeze this one.** It is the core of the document and the SDD's execution flow is built from it. |
             | 7. Applications and Systems | 1.1 KB | 1.1 KB | Already right. |
-            | 8. Business Rules | 1.6 KB | 1.6 KB | Every BR-xx stays. Traceability is validated. |
+            | 8. Business Rules | 1.5 KB | 1.5 KB | Every BR-xx stays. Traceability is validated. |
             | 9. Business Exceptions | 0.7 KB | 0.7 KB | Already right. |
             | 10. System Errors | 1.5 KB | 1.2 KB | One table row per error. |
-            | 11. Data Definitions | 2.9 KB | 2.9 KB | **Do NOT squeeze.** The SDD's input and output schemas come from here. |
-            | 12. Assumptions, Dependencies, Open Questions | 4.6 KB | **1.4 KB** | One line each, 12 max. This was the second-largest section in the last PDD and almost all of it was context nobody reads. |
+            | 11. Data Definitions | 2.9 KB | 2.6 KB | **Do NOT squeeze.** The SDD's input and output schemas come from here. |
+            | 12. Assumptions, Dependencies, Open Questions | 2.2 KB | **1.4 KB** | One line each, 12 max. This was the second-largest section in the last PDD and almost all of it was context nobody reads. |
             | 13. Success Criteria | 1.7 KB | **0.8 KB** | One testable line each, 8 max. |
 
             The budget is spent on 6, 8 and 11 - the sections the SDD and the build are
