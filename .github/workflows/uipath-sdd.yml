@@ -85,6 +85,13 @@ env:
   BASE_BRANCH: develop
   ASSIGNEE: irina-capatina-uipath
   AGENT_MODEL: claude-sonnet-4-6
+  # The document is WRITTEN by Haiku and REPAIRED by Sonnet. Writing a document is
+  # output tokens, and Haiku streams them two to three times faster; the validator
+  # decides whether the result is good enough, and if it is not, the repair pass -
+  # still on Sonnet - fixes it. So the fast model does the bulk work and the strong
+  # model is the safety net, and a bad day for Haiku costs one repair, not a demo.
+  # To revert: point WRITER_MODEL back at claude-sonnet-4-6. One line.
+  WRITER_MODEL: claude-haiku-4-5-20251001
   # ── Live-demo guardrail ────────────────────────────────────────────────────
   # Pinning the PRODUCT removes the one genuinely non-deterministic decision in this
   # workflow. The pin is enforced by the Verify step below, not just asked for in the
@@ -1503,7 +1510,7 @@ jobs:
         uses: anthropics/claude-code-base-action@beta
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: ${{ env.AGENT_MODEL }}
+          model: ${{ env.WRITER_MODEL }}
           timeout_minutes: '40'
           allowed_tools: "Read,Write,Edit,Glob,Grep,Bash,Skill"
           prompt: |

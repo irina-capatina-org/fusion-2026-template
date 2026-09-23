@@ -319,11 +319,11 @@ jobs:
             volume figure and concrete example value it contains must land somewhere in the
             PDD.
 
-            Images extracted from the document are under ${{ env.WORK_DIR }}/media when it
-            exists - Read the PNG/JPEG ones for field names and sample values, which
-            belong in the step table of section 5. Skip `.emf` / `.wmf`: they cannot be
-            rendered, so note in section 10 that a figure was unreadable rather than
-            guessing at it.
+            Do NOT open the images under ${{ env.WORK_DIR }}/media. They are Cartographer's
+            diagrams; the text of the document carries everything they show, and reading
+            them cost two vision turns per run for nothing the business rules did not
+            already say. If the text references a figure whose content matters and is
+            absent from the text, say so in section 10 - never guess at a picture.
 
             Also read `README.md` for repo and naming context. If the document references an
             appendix or attachment whose content is not actually present, record that in
@@ -421,7 +421,7 @@ jobs:
             alone took 163 seconds - nearly the whole stage. Every character you do not
             write is time the demo gets back.
 
-            Whole document: aim for **about 15 KB**. This is a target to write TOWARD in
+            Whole document: aim for **about 10 KB**. This is a target to write TOWARD in
             one pass, not a line to check against afterwards: there is no ceiling, no
             measuring, and no second write. Whatever you produce first is what ships.
             Per section, measured
@@ -429,16 +429,16 @@ jobs:
 
             | Section | Last run | Budget | What changes |
             | --- | --- | --- | --- |
-            | 1-2. Document Control, Introduction | 1.1 KB | 1.0 KB | Already right. |
-            | 3. Process Overview | 1.2 KB | 1.0 KB | Already right. One table, every row present. |
-                        | 4. To-Be Process (High Level) | 1.5 KB | **0.9 KB** | The target intent in a short paragraph plus bullets. Section 6 carries the detail - do not pre-narrate it here. |
-            | 4. Detailed Process Steps | 3.4 KB | 3.4 KB | **Do NOT squeeze this one.** It is the core of the document and the SDD's execution flow is built from it. |
-            | 4. Applications and Systems | 1.1 KB | 1.1 KB | Already right. |
-            | 4. Business Rules | 1.5 KB | 1.5 KB | Every BR-xx stays. Traceability is validated. |
-            | 4. Business Exceptions | 0.7 KB | 0.7 KB | Already right. |
-            | 4. System Errors | 1.5 KB | 1.2 KB | One table row per error. |
-                        | 4. Assumptions, Dependencies, Open Questions | 2.2 KB | **1.4 KB** | One line each, 12 max. This was the second-largest section in the last PDD and almost all of it was context nobody reads. |
-            | 11. Success Criteria | 1.7 KB | **0.8 KB** | One testable line each, 8 max. |
+            | 1-2. Document Control, Introduction | 1.1 KB | 0.6 KB | Two small tables. No prose beyond the objective sentence. |
+            | 3. Process Overview | 1.2 KB | 0.8 KB | One table, every row present, each value one line. |
+            | 4. To-Be Process (High Level) | 0.9 KB | 0.5 KB | One short paragraph plus bullets. Section 5 carries the detail. |
+            | 5. Detailed Process Steps | 3.4 KB | **2.8 KB** | **Every step row stays** - the SDD's execution flow is built from this table. Shorten the remarks cells, never drop a row. |
+            | 6. Applications and Systems | 0.8 KB | 0.6 KB | One row per system. |
+            | 7. Business Rules | 1.5 KB | **1.3 KB** | **Every BR-xx row stays** - traceability is validated. Trim the rule wording, not the rules. |
+            | 8. Business Exceptions | 0.7 KB | 0.6 KB | One row per exception; IDs are validated downstream. |
+            | 9. System Errors | 1.2 KB | 0.8 KB | One row per error; IDs are validated downstream. |
+            | 10. Assumptions, Dependencies, Open Questions | 1.9 KB | **1.0 KB** | One line each, 12 max. The architecture step reads only the titles. |
+            | 11. Success Criteria | 0.8 KB | 0.5 KB | One testable line each, 6 max. |
 
             The budget is spent on 5 and 7 - the sections the SDD and the build are
             built from. It is not spent on restating the source document, on explaining

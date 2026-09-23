@@ -52,6 +52,13 @@ env:
   RELEASE_BRANCH: main
   ASSIGNEE: irina-capatina-uipath
   AGENT_MODEL: claude-sonnet-4-6
+  # The document is WRITTEN by Haiku and REPAIRED by Sonnet. Writing a document is
+  # output tokens, and Haiku streams them two to three times faster; the validator
+  # decides whether the result is good enough, and if it is not, the repair pass -
+  # still on Sonnet - fixes it. So the fast model does the bulk work and the strong
+  # model is the safety net, and a bad day for Haiku costs one repair, not a demo.
+  # To revert: point WRITER_MODEL back at claude-sonnet-4-6. One line.
+  WRITER_MODEL: claude-haiku-4-5-20251001
   CLI_VERSION: '1.202.0'
   # Floor for the whole document, not per section: validate-dsd.sh no longer has a
   # section contract to scale against. Below this it is a stub, not a page to show.
@@ -370,7 +377,7 @@ jobs:
         uses: anthropics/claude-code-base-action@beta
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: ${{ env.AGENT_MODEL }}
+          model: ${{ env.WRITER_MODEL }}
           timeout_minutes: '45'
           allowed_tools: "Read,Write,Edit,Glob,Grep,Bash,Skill"
           prompt: |
