@@ -53,17 +53,17 @@ env:
   BASE_BRANCH: develop
   ASSIGNEE: irina-capatina-uipath
   AGENT_MODEL: claude-sonnet-4-6
-  # 1.202.1, not 1.202.0 - and the difference is not cosmetic. The agent runs inside
-  # claude-code-base-action, which puts ITS OWN Node 18 first on PATH, whatever the
-  # runner or setup-node provides. 1.202.0 fails to start on Node 18
-  # (`SyntaxError: 'node:util' does not provide an export named 'styleText'`); 1.202.1
-  # runs. Pinned at 1.202.0 the developer agent could not run `uip`, found a Node 22
-  # by path, hand-wrote the solution's resource files, and the solution feed rejected
-  # the package as corrupted (HTTP 400, errorCode 1201). Every run before the pin was
-  # silently auto-updating to 1.202.1 on first use, which is why it "never failed
-  # before". The pin stays - a demo must not change CLI mid-week - but at a version
-  # that runs on the agent's Node. Before changing this number, run `uip --version`
-  # under Node 18.
+  # Consumed by claude-code-base-action, which sets the AGENT's Node from this
+  # variable and falls back to 18.x without it (`node-version: ${{ env.NODE_VERSION ||
+  # '18.x' }}` in its action.yml). @uipath/cli needs Node 20 (`util.styleText`). This
+  # line was once deleted as "stale config with no consumers"; the developer agent
+  # then got Node 18, could not start `uip`, hand-built a solution and patched the CLI
+  # to make it run, and the solution feed rejected the package. Do not remove it.
+  NODE_VERSION: '20'
+  # Exact pin, so the CLI cannot change between rehearsal and stage. 1.202.1 is the
+  # version every successful run used. NOTE: the CLI needs Node 20 - see NODE_VERSION.
+  # A run once failed with `'node:util' does not provide an export named 'styleText'`;
+  # that was the agent's Node, not the CLI version.
   CLI_VERSION: '1.202.1'
   # Design inputs and the derived task list live here. Must NOT start with a dot:
   # actions/upload-artifact@v4 silently skips hidden files.
@@ -301,7 +301,9 @@ jobs:
       # Node 22, where a CLI that cannot start on 18 looks perfectly healthy.
       - uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          # The SAME expression the base action uses for the agent's Node, so this job's
+          # `uip --version` proof below runs on exactly what the agent will get.
+          node-version: ${{ env.NODE_VERSION || '18.x' }}
 
       - name: Install UiPath CLI and skills
         id: skills
@@ -342,7 +344,7 @@ jobs:
       - name: Prove the CLI starts on the agent's Node
         run: |
           set -uo pipefail
-          echo "node: $(node --version)   (the agent's shell has the same major)"
+          echo "node: $(node --version)   (the agent gets NODE_VERSION='${NODE_VERSION:-<unset -> 18.x>}' - same as this)"
           if ! OUT=$(uip --version 2>&1); then
             echo "$OUT" | head -5
             echo "::error::@uipath/cli ${CLI_VERSION} does not start under $(node --version), which is the Node the developer agent runs on. Change CLI_VERSION to a release that does (1.202.1 is proven) - do NOT let the agent work around it."

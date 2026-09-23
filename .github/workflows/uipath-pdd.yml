@@ -37,6 +37,13 @@ env:
   BASE_BRANCH: develop
   ASSIGNEE: irina-capatina-uipath
   AGENT_MODEL: claude-sonnet-4-6
+  # Consumed by claude-code-base-action, which sets the AGENT's Node from this
+  # variable and falls back to 18.x without it (`node-version: ${{ env.NODE_VERSION ||
+  # '18.x' }}` in its action.yml). @uipath/cli needs Node 20 (`util.styleText`). This
+  # line was once deleted as "stale config with no consumers"; the developer agent
+  # then got Node 18, could not start `uip`, hand-built a solution and patched the CLI
+  # to make it run, and the solution feed rejected the package. Do not remove it.
+  NODE_VERSION: '20'
   MIN_PDD_BYTES: '4000'
   # THE section contract, defined once. The analyst prompt renders this list, the
   # repair prompt renders it, the agent's self-check counts it, and
