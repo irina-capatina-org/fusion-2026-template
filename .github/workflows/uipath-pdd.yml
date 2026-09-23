@@ -301,13 +301,13 @@ jobs:
 
             Images extracted from the document are under ${{ env.WORK_DIR }}/media when it
             exists - Read the PNG/JPEG ones for field names and sample values, which
-            belong in section 11 Data Definitions. Skip `.emf` / `.wmf`: they cannot be
-            rendered, so note in section 12 that a figure was unreadable rather than
+            belong in the step table of section 5. Skip `.emf` / `.wmf`: they cannot be
+            rendered, so note in section 10 that a figure was unreadable rather than
             guessing at it.
 
             Also read `README.md` for repo and naming context. If the document references an
             appendix or attachment whose content is not actually present, record that in
-            section 12 as a missing input - do not invent what it might have said.
+            section 10 as a missing input - do not invent what it might have said.
 
             ## Step 2 - write the PDD
 
@@ -320,16 +320,14 @@ jobs:
                 ## 1. Document Control
                 ## 2. Introduction
                 ## 3. Process Overview
-                ## 4. Scope
-                ## 5. To-Be Process (High Level)
-                ## 6. Detailed Process Steps
-                ## 7. Applications and Systems
-                ## 8. Business Rules
-                ## 9. Business Exceptions
-                ## 10. System Errors
-                ## 11. Data Definitions
-                ## 12. Assumptions, Dependencies and Open Questions
-                ## 13. Success Criteria
+                ## 4. To-Be Process (High Level)
+                ## 5. Detailed Process Steps
+                ## 6. Applications and Systems
+                ## 7. Business Rules
+                ## 8. Business Exceptions
+                ## 9. System Errors
+                ## 10. Assumptions, Dependencies and Open Questions
+                ## 11. Success Criteria
 
             What each section must contain:
 
@@ -355,50 +353,45 @@ jobs:
                Trigger and schedule, Volume (items per day / peak), Average handling time
                (manual vs automated target), FTE effort, Estimated exception rate,
                Input data, Output data.
-            4. Scope - two bullet lists, "In scope" and "Out of scope". Out of scope defines the
-               SDD boundary, so be explicit about adjacent work that is NOT included.
-            5. To-Be Process (High Level) - the target process intent, what becomes automated
+            4. To-Be Process (High Level) - the target process intent, what becomes automated
                and what stays human. Business-level, not technical design. Re-engineer for
                automation rather than transcribing how the work is done today, and name the
                manual steps that disappear.
-            6. Detailed Process Steps - the core section. A markdown table with columns
+            5. Detailed Process Steps - the core section. A markdown table with columns
                `Step | Action | Application | Expected Result | Remarks`. Number steps
                hierarchically (1.1, 1.2, 1.5.A ...). Mark the per-item loop boundaries and every
                decision point explicitly in the Action or Remarks cell. Aim for real granularity:
                one row per action a robot would perform, not one row per phase.
-            7. Applications and Systems - table: `Application | Interface type (web/desktop/API/
+            6. Applications and Systems - table: `Application | Interface type (web/desktop/API/
                terminal/email) | Access method | Login method | Credential handling | Comments`.
                For email, state the protocol signal (IMAP / Exchange / O365 Graph / SMTP) or mark
                it `[SME REVIEW]` - never default to O365. For document storage, never assume
                SharePoint.
-            8. Business Rules - table `ID | Rule | Source | Applies at step`.
+            7. Business Rules - table `ID | Rule | Source | Applies at step`.
                YOUR rule IDs are `BR-01`, `BR-02`, ... `BR-nn`: the letters BR, a hyphen,
                and EXACTLY TWO digits, zero-padded. Never `BR-1`, never `BR-003`. Use that
                one form every single time you refer to one of YOUR rules - in the ID column,
-               in step remarks, in section 9, in section 12, in prose, in parentheses,
+               in step remarks, in section 8, in section 10, in prose, in parentheses,
                anywhere. Two widths for the same rule turn one rule into two for every stage
                that reads this document: they match IDs as exact strings, so the SDD hunts
                for rules that do not exist and the review stage reviews phantoms. The
-               validator rejects a section 8 ID column that mixes widths.
+               validator rejects a section 7 ID column that mixes widths.
                The SME document usually numbers its own rules, and often differently
                (`BR-001`, `R5`, `Rule 3`). Quote that number EXACTLY as the source wrote it,
                and ONLY inside a `Source` cell - that is what makes the rule traceable. Never
                carry a source number into prose or into any other column: write
-               `contradicts BR-07` in section 12, not `contradicts BR-007`, even when you are
+               `contradicts BR-07` in section 10, not `contradicts BR-007`, even when you are
                discussing the sentence the source numbered BR-007. Source cell = their
                numbering, everywhere else = yours.
                Extract rules buried in prose and in step remarks. Every rule must be traceable to
                a sentence in the source; a rule you cannot trace does not belong here.
-            9. Business Exceptions - table `ID | Name | Trigger step | Trigger condition | Action`,
+            8. Business Exceptions - table `ID | Name | Trigger step | Trigger condition | Action`,
                 IDs B1, B2... Preserve any catch-all handler as the last row.
-            10. System Errors - table `ID | Name | Trigger condition | Severity | Retry policy |
+            9. System Errors - table `ID | Name | Trigger condition | Severity | Retry policy |
                 Action`, IDs S1, S2... If the source has none, add the common infrastructure
                 errors (application unresponsive, element not found, network timeout, credential
                 expiry, unhandled exception) and mark each `[DEFAULT]`.
-            11. Data Definitions - table `Field | Type | Source | Target | Validation | Required`.
-                Include every field name mentioned anywhere in the source, plus any value-mapping
-                tables reproduced in full.
-            12. Assumptions, Dependencies and Open Questions - numbered list, ONE LINE
+            10. Assumptions, Dependencies and Open Questions - numbered list, ONE LINE
                 each, at most 12 lines. Format each as
                 `**OQ-nn - <short title>.** <one sentence>` for a question, or
                 `**<short title>.** <one sentence>` for an assumption or dependency.
@@ -406,7 +399,7 @@ jobs:
                 a safe engineering default you applied. The architecture stage reads the
                 OQ titles from this list, so the TITLE carries the meaning - do not write a
                 paragraph of context under each one, and do not restate the source.
-            13. Success Criteria - the measurable acceptance criteria: what must be
+            11. Success Criteria - the measurable acceptance criteria: what must be
                 demonstrably true for sign-off, one testable line each, at most 8 lines.
                 No benefit estimates - hours saved, error reduction, cycle time - nothing
                 downstream reads them.
@@ -418,31 +411,31 @@ jobs:
             alone took 163 seconds - nearly the whole stage. Every character you do not
             write is time the demo gets back.
 
-            Whole document: aim for **15 KB, hard ceiling 17 KB**. Do NOT re-measure
-            and rewrite - write it once, under the ceiling. Per section, measured
+            Whole document: aim for **about 15 KB**. This is a target to write TOWARD in
+            one pass, not a line to check against afterwards: there is no ceiling, no
+            measuring, and no second write. Whatever you produce first is what ships.
+            Per section, measured
             against the last run so you can see where the weight actually is:
 
             | Section | Last run | Budget | What changes |
             | --- | --- | --- | --- |
             | 1-2. Document Control, Introduction | 1.1 KB | 1.0 KB | Already right. |
             | 3. Process Overview | 1.2 KB | 1.0 KB | Already right. One table, every row present. |
-            | 4. Scope | 1.5 KB | **0.9 KB** | Two bullet lists. One line per item, no rationale paragraphs. |
-            | 5. To-Be Process (High Level) | 1.5 KB | **0.9 KB** | The target intent in a short paragraph plus bullets. Section 6 carries the detail - do not pre-narrate it here. |
-            | 6. Detailed Process Steps | 3.4 KB | 3.4 KB | **Do NOT squeeze this one.** It is the core of the document and the SDD's execution flow is built from it. |
-            | 7. Applications and Systems | 1.1 KB | 1.1 KB | Already right. |
-            | 8. Business Rules | 1.5 KB | 1.5 KB | Every BR-xx stays. Traceability is validated. |
-            | 9. Business Exceptions | 0.7 KB | 0.7 KB | Already right. |
-            | 10. System Errors | 1.5 KB | 1.2 KB | One table row per error. |
-            | 11. Data Definitions | 2.9 KB | 2.6 KB | **Do NOT squeeze.** The SDD's input and output schemas come from here. |
-            | 12. Assumptions, Dependencies, Open Questions | 2.2 KB | **1.4 KB** | One line each, 12 max. This was the second-largest section in the last PDD and almost all of it was context nobody reads. |
-            | 13. Success Criteria | 1.7 KB | **0.8 KB** | One testable line each, 8 max. |
+                        | 4. To-Be Process (High Level) | 1.5 KB | **0.9 KB** | The target intent in a short paragraph plus bullets. Section 6 carries the detail - do not pre-narrate it here. |
+            | 4. Detailed Process Steps | 3.4 KB | 3.4 KB | **Do NOT squeeze this one.** It is the core of the document and the SDD's execution flow is built from it. |
+            | 4. Applications and Systems | 1.1 KB | 1.1 KB | Already right. |
+            | 4. Business Rules | 1.5 KB | 1.5 KB | Every BR-xx stays. Traceability is validated. |
+            | 4. Business Exceptions | 0.7 KB | 0.7 KB | Already right. |
+            | 4. System Errors | 1.5 KB | 1.2 KB | One table row per error. |
+                        | 4. Assumptions, Dependencies, Open Questions | 2.2 KB | **1.4 KB** | One line each, 12 max. This was the second-largest section in the last PDD and almost all of it was context nobody reads. |
+            | 11. Success Criteria | 1.7 KB | **0.8 KB** | One testable line each, 8 max. |
 
-            The budget is spent on 6, 8 and 11 - the sections the SDD and the build are
+            The budget is spent on 5 and 7 - the sections the SDD and the build are
             built from. It is not spent on restating the source document, on explaining
             your reasoning, or on context under an open question.
 
             Two things the budget does NOT license. Do not drop a required section to
-            make room - all thirteen are mandatory and the validator fails a missing one.
+            make room - all eleven are mandatory and the validator fails a missing one.
             Do not thin a table to hit a number: every step, field, business rule,
             exception and error the source names must appear, and it is the PROSE around
             the tables that gives way.
@@ -456,7 +449,7 @@ jobs:
               Step 3 self-check and the validator both grade the file, not how you got there.
             - NEVER invent a business rule, threshold, volume figure, system name, URL, person or
               credential. If it is not in the source and not a stated engineering default, it is
-              an `[SME REVIEW]` line in section 12.
+              an `[SME REVIEW]` line in section 10.
             - Inference that follows directly from the source IS allowed and expected - label it.
               A reasonable inferred step is better than an empty section, as long as it is marked
               so the SME can correct it.
@@ -474,13 +467,18 @@ jobs:
             - Do NOT run git commit, git push, or gh. The workflow handles that.
             - Write exactly one file: ${{ needs.identify.outputs.pdd_file }}.
 
-            ## Step 3 - self-check before you finish
+            ## Step 3 - self-check before you finish - ONE command, nothing else
 
-            Confirm all 16 headings are present:
+            Confirm all 11 numbered headings are present:
 
                 grep -c '^## [0-9]' ${{ needs.identify.outputs.pdd_file }}
 
-            That must print 16. If it does not, fix the file and check again.
+            That must print 11. If it does not, add the missing heading and stop.
+            Do NOT run `wc -c`. Do NOT trim, tidy or rewrite the file for any other
+            reason - the validator has a size FLOOR (4 KB) and no ceiling, so a document
+            a few hundred bytes over the target is finished, not a defect. The run before
+            this one wrote the whole PDD a second time to remove 309 bytes; that rewrite
+            cost 84 seconds and changed nothing the pipeline reads.
 
       # Document History is the one heading an agent reliably drops: it is the only
       # UNNUMBERED heading in a 17-heading contract, so a model marching from the H1
@@ -664,11 +662,9 @@ jobs:
           full PDD, ready to be turned into a solution design.
 
           **Review checklist**
-          - [ ] Scope (section 4) matches what we actually want automated
-          - [ ] Detailed process steps (section 7) are complete and in the right order
-          - [ ] Business rules (section 8) are correct and none are missing
-          - [ ] Every `[SME REVIEW]` item in section 12 is answered or accepted
-          - [ ] Data definitions (section 11) cover every field the process touches
+          - [ ] Detailed process steps (section 5) are complete and in the right order
+          - [ ] Business rules (section 7) are correct and none are missing
+          - [ ] Every `[SME REVIEW]` item in section 10 is answered or accepted
 
           Merging this PR approves the PDD and advances the case to solution design.
           EOF_BODY

@@ -1241,7 +1241,9 @@ jobs:
           Read every PDD in the manifest. The document you write must account for ALL of
           the current PDD's content: every step in `Detailed Process Steps`, every
           `BR-xx` in `Business Rules`, every row of `Business Exceptions` and of
-          `System Errors`, and every field in `Data Definitions`. Sections are named
+          `System Errors`. Field-level detail comes from the step table and the reference
+          implementation, not from a Data Definitions section - the PDD no longer has one.
+          Sections are named
           here rather than numbered because the PDD has been renumbered once and a
           stale number sends you to the wrong section in silence. A PDD business rule
           that appears nowhere in the SDD is a hole in the design.
